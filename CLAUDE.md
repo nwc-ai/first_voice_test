@@ -25,7 +25,6 @@ Barge-in is supported: if the user speaks while the AI is talking, the AI stops 
 - GPU: **NVIDIA RTX 5090, 32GB VRAM**
 - CUDA: 13.0
 - GitHub org: `nwc-ai`
-- Main project: `/home/taha/devproject` (repo: `nwc-ai/nwc-copilot`)
 
 ---
 

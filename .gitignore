@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+venv/
+
+# Model checkpoints — too large for GitHub (FRCRN is 153MB)
+checkpoints/
+
+# Logs and temp files
+*.log

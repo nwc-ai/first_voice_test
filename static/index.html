@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>المساعد الصوتي — Silma</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', Tahoma, sans-serif;
+      background: #0f0f0f; color: #f0f0f0;
+      display: flex; flex-direction: column; align-items: center;
+      justify-content: center; min-height: 100vh; gap: 20px; padding: 20px;
+    }
+    h1 { font-size: 1.3rem; color: #888; font-weight: 300; }
+    #status {
+      font-size: 1rem; color: #aaa; min-height: 28px; text-align: center;
+      padding: 6px 16px; border-radius: 20px; background: #1a1a1a;
+    }
+    #status.listening  { color: #4ad94a; background: #0d1f0d; }
+    #status.speaking   { color: #4a90d9; background: #0d1420; }
+    #status.processing { color: #d9a84a; background: #1f160d; }
+    .box {
+      width: 100%; max-width: 580px; min-height: 70px;
+      border-radius: 12px; padding: 14px 18px; font-size: 1.05rem; line-height: 1.7;
+    }
+    #transcript-box { background: #1a1a1a; border: 1px solid #2a2a2a; color: #ccc; }
+    #response-box   { background: #111e11; border: 1px solid #1a3a1a; color: #90e090; }
+    .box .label { font-size: 0.72rem; color: #555; margin-bottom: 4px; }
+    #connect-btn {
+      width: 88px; height: 88px; border-radius: 50%;
+      background: #1a1a2e; border: 3px solid #4a4a8a;
+      color: #fff; font-size: 2.2rem; cursor: pointer;
+      transition: all 0.2s; display: flex; align-items: center; justify-content: center;
+    }
+    #connect-btn.connected {
+      background: #0d2a0d; border-color: #4ad94a; animation: breathe 2s infinite;
+    }
+    #connect-btn.ai-speaking { background: #0d1a2e; border-color: #4a90d9; }
+    #connect-btn.user-speaking { background: #2a0d0d; border-color: #d94a4a; }
+    @keyframes breathe {
+      0%,100% { box-shadow: 0 0 0 0 rgba(74,217,74,0.3); }
+      50%      { box-shadow: 0 0 0 14px rgba(74,217,74,0); }
+    }
+    #hint { font-size: 0.78rem; color: #444; text-align: center; }
+    #connect-btn:disabled { opacity: 0.35; cursor: not-allowed; animation: none; }
+  </style>
+</head>
+<body>
+  <h1>المساعد الصوتي — Silma TTS</h1>
+  <div id="status">اضغط للاتصال</div>
+
+  <div class="box" id="transcript-box">
+    <div class="label">أنت:</div>
+    <div id="transcript-text"></div>
+  </div>
+
+  <div class="box" id="response-box">
+    <div class="label">المساعد:</div>
+    <div id="response-text"></div>
+  </div>
+
+  <button id="connect-btn">🎙️</button>
+  <div id="hint">اضغط للاتصال — سيستمع تلقائياً بعد ذلك</div>
+
+<script>
+// ── Constants ────────────────────────────────────────────────────────────────
+const WS_URL     = `ws://${location.host}/ws`;
+const CHUNK_SIZE = 512;     // must match server VAD
+const SAMPLE_RATE = 16000;
+
+// ── State ────────────────────────────────────────────────────────────────────
+let ws          = null;
+let audioCtx    = null;
+let workletNode = null;
+let micStream   = null;
+let connected   = false;
+
+let audioQueue  = [];
+let isPlaying   = false;
+let currentSrc  = null;
+
+// ── DOM ───────────────────────────────────────────────────────────────────────
+const statusEl     = document.getElementById('status');
+const transcriptEl = document.getElementById('transcript-text');
+const responseEl   = document.getElementById('response-text');
+const connectBtn   = document.getElementById('connect-btn');
+const hintEl       = document.getElementById('hint');
+
+function setStatus(text, cls) {
+  statusEl.textContent = text;
+  statusEl.className   = cls || '';
+}
+
+// ── AudioWorklet inline (no separate .js file needed) ────────────────────────
+const WORKLET_CODE = `
+class MicSender extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this._buf = new Float32Array(${CHUNK_SIZE});
+    this._pos = 0;
+  }
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (!ch) return true;
+    for (let i = 0; i < ch.length; i++) {
+      this._buf[this._pos++] = ch[i];
+      if (this._pos === ${CHUNK_SIZE}) {
+        this.port.postMessage(this._buf.slice(0));
+        this._pos = 0;
+      }
+    }
+    return true;
+  }
+}
+registerProcessor('mic-sender', MicSender);
+`;
+
+// ── Connect / disconnect ─────────────────────────────────────────────────────
+connectBtn.addEventListener('click', async () => {
+  if (connected) {
+    disconnect();
+  } else {
+    await connect();
+  }
+});
+
+async function connect() {
+  setStatus('جاري الاتصال...', '');
+
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+  } catch (e) {
+    setStatus('⚠️ لا يمكن الوصول إلى الميكروفون: ' + e.message, '');
+    return;
+  }
+
+  // AudioContext at 16kHz — browser resamples automatically
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+  if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+  // Load inline worklet via Blob URL
+  const blob      = new Blob([WORKLET_CODE], { type: 'application/javascript' });
+  const workletUrl = URL.createObjectURL(blob);
+  await audioCtx.audioWorklet.addModule(workletUrl);
+  URL.revokeObjectURL(workletUrl);
+
+  const source  = audioCtx.createMediaStreamSource(micStream);
+  workletNode   = new AudioWorkletNode(audioCtx, 'mic-sender');
+  // NOT connected to destination — prevents echo
+  source.connect(workletNode);
+
+  ws = new WebSocket(WS_URL);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    connected = true;
+    connectBtn.textContent = '⏹️';
+    // Don't set status here — wait for 'ready' or 'loading' from server
+    // to avoid a flash when models are still loading
+
+    // Stream mic chunks to server
+    workletNode.port.onmessage = (e) => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(e.data.buffer);
+      }
+    };
+  };
+
+  ws.onclose  = () => { disconnect(false); };
+  ws.onerror  = () => { setStatus('⚠️ خطأ في الاتصال', ''); };
+  ws.onmessage = handleMessage;
+}
+
+function disconnect(stopServer = true) {
+  connected = false;
+  connectBtn.textContent = '🎙️';
+  connectBtn.className   = '';
+  hintEl.textContent     = 'اضغط للاتصال — سيستمع تلقائياً بعد ذلك';
+  setStatus('اضغط للاتصال', '');
+
+  clearAudioQueue();
+  if (workletNode)  { workletNode.port.onmessage = null; workletNode.disconnect(); workletNode = null; }
+  if (micStream)    { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+  if (audioCtx)     { audioCtx.close(); audioCtx = null; }
+  if (ws && stopServer) { ws.close(); ws = null; }
+}
+
+// ── WebSocket message handler ─────────────────────────────────────────────────
+function handleMessage(event) {
+  // Binary = MP3 audio
+  if (event.data instanceof ArrayBuffer) {
+    queueMp3(event.data);
+    return;
+  }
+
+  const msg = JSON.parse(event.data);
+
+  if (msg.event === 'loading') {
+    setStatus('جاري تحميل النماذج...', 'processing');
+    connectBtn.disabled = true;
+    return;
+  }
+
+  if (msg.event === 'ready') {
+    connectBtn.disabled  = false;
+    connectBtn.className = 'connected';
+    hintEl.textContent   = 'يستمع... تحدث بشكل طبيعي';
+    setStatus('يستمع...', 'listening');
+    return;
+  }
+
+  if (msg.event === 'speech_start') {
+    // Barge-in: user started speaking — stop AI audio immediately
+    clearAudioQueue();
+    responseEl.textContent = '';
+    connectBtn.className   = 'connected user-speaking';
+    setStatus('تتحدث...', 'speaking');
+  }
+
+  if (msg.event === 'transcript') {
+    transcriptEl.textContent = msg.text;
+    connectBtn.className     = 'connected';
+    setStatus('جاري التفكير...', 'processing');
+  }
+
+  if (msg.event === 'token') {
+    responseEl.textContent += msg.text;
+  }
+
+  if (msg.event === 'tts_end') {
+    connectBtn.className = 'connected';
+    setStatus('يستمع...', 'listening');
+  }
+}
+
+// ── Audio playback queue ──────────────────────────────────────────────────────
+async function queueMp3(arrayBuffer) {
+  if (!audioCtx) return;
+  connectBtn.className = 'connected ai-speaking';
+  setStatus('يتكلم...', 'speaking');
+
+  try {
+    const decoded = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
+    audioQueue.push(decoded);
+    if (!isPlaying) drainQueue();
+  } catch (e) {
+    console.error('MP3 decode error:', e);
+    drainQueue();
+  }
+}
+
+function drainQueue() {
+  if (audioQueue.length === 0 || !audioCtx) {
+    isPlaying  = false;
+    currentSrc = null;
+    return;
+  }
+  isPlaying = true;
+  const buf = audioQueue.shift();
+  currentSrc = audioCtx.createBufferSource();
+  currentSrc.buffer  = buf;
+  currentSrc.onended = drainQueue;
+  currentSrc.connect(audioCtx.destination);
+  currentSrc.start();
+}
+
+function clearAudioQueue() {
+  audioQueue = [];
+  isPlaying  = false;
+  if (currentSrc) {
+    try { currentSrc.stop(); } catch (_) {}
+    currentSrc = null;
+  }
+}
+</script>
+</body>
+</html>
