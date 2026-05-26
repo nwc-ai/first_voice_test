@@ -20,4 +20,7 @@ if ! curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
     echo "Ollama ready."
 fi
 
+# Reduce CUDA memory fragmentation on shared GPU servers
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 exec /home/taha/first_voice_test/.venv/bin/python /home/taha/first_voice_test/server.py

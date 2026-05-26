@@ -64,10 +64,10 @@ MODEL       = "qwen2.5:7b"
 SYSTEM_PROMPT = (
     "You are a voice assistant that supports Arabic and English ONLY. "
     "ABSOLUTE RULES — never break these: "
-    "1. If the user speaks Arabic → reply in Arabic only. "
-    "2. If the user speaks English → reply in English only. "
-    "3. NEVER output Chinese, Japanese, Korean, or any CJK characters under any circumstance. "
-    "4. NEVER mix languages. NEVER include a single Chinese/Japanese/Korean character. "
+    "1. If the user speaks Arabic → reply in Arabic only using Arabic script. "
+    "2. If the user speaks English → reply in English only."
+    "3. NEVER use Chinese, Japanese, Korean, Cyrillic, Vietnamese, or any non-Arabic/Latin script. "
+    "4. NEVER mix scripts or languages in a single response. "
     "5. Keep answers short, spoken-word style, no markdown, no symbols."
 )
 
@@ -187,25 +187,36 @@ def make_stt_processor(on_speech_start: Any):
     return process_chunk
 
 
-LANG_PROB_THRESHOLD    = 0.5   # discard if Whisper isn't confident about the language
-LANG_PROB_THRESHOLD_AR = 0.25  # Arabic commonly confused with Urdu/Farsi — use looser gate
+LANG_PROB_THRESHOLD    = 0.25   # discard if Whisper isn't confident about the language
+LANG_PROB_THRESHOLD_AR = 0.10  # Arabic misfires as Urdu/Punjabi/Farsi — only block pure noise
 WORD_CONF_THRESHOLD    = 0.3   # discard if mean per-word confidence is too low
 ALLOWED_LANGS          = {"ar", "en"}
 
-# Whisper mistakes Arabic for these languages due to shared Arabic script — remap them all to ar.
-_ARABIC_SCRIPT_REMAP = {"ur", "fa", "ps", "ug", "prs", "ckb", "sd"}
+# Whisper mistakes Arabic for these languages — remap them all to ar.
+# Includes Arabic-script langs (ur/fa/ps/ug/sd) AND Punjabi (pa) which Whisper
+# also confuses with Arabic despite different script.
+_ARABIC_SCRIPT_REMAP = {"ur", "fa", "ps", "ug", "prs", "ckb", "sd", "pa"}
 MIN_TEXT_CHARS      = 3
 MAX_TEXT_CHARS      = 500
 
-_CJK_RE = re.compile(
-    r"[一-鿿㐀-䶿豈-﫿"
-    r"　-〿゠-ヿ぀-ゟ가-힯]+",
+# Strips CJK, full-width punctuation (？！), and Cyrillic from LLM tokens.
+_UNWANTED_SCRIPT_RE = re.compile(
+    r"[一-鿿"          # CJK unified ideographs
+    r"㐀-䶿"           # CJK extension A
+    r"豈-﫿"           # CJK compatibility ideographs
+    r"　-〿"           # CJK symbols & punctuation
+    r"゠-ヿ"           # katakana
+    r"぀-ゟ"           # hiragana
+    r"가-힯"           # hangul syllables
+    r"＀-￯"           # fullwidth/halfwidth forms incl. ？！
+    r"Ѐ-ӿ"           # Cyrillic
+    r"Ԁ-ԯ]+",        # Cyrillic supplement
     re.UNICODE,
 )
 
 async def _filter_cjk(token_gen: Any):
     async for token in token_gen:
-        cleaned = _CJK_RE.sub("", token)
+        cleaned = _UNWANTED_SCRIPT_RE.sub("", token)
         if cleaned:
             yield cleaned
 
@@ -238,19 +249,29 @@ def _denoise_blocking(audio: Any) -> Any:
     return audio
 
 
+_TRANSCRIBE_KWARGS: dict[str, Any] = dict(
+    beam_size=5,
+    vad_filter=True,
+    vad_parameters={"min_silence_duration_ms": 300},
+    word_timestamps=True,
+)
+
 def _transcribe_blocking(audio: Any) -> tuple[str, str]:
-    segments, info = _whisper_model.transcribe(
-        audio,
-        beam_size=5,
-        vad_filter=True,
-        vad_parameters={"min_silence_duration_ms": 300},
-        word_timestamps=True,
-    )
+    # First pass: auto language detection
+    segments, info = _whisper_model.transcribe(audio, **_TRANSCRIBE_KWARGS)
     lang      = info.language
     lang_prob = info.language_probability
+
     if lang in _ARABIC_SCRIPT_REMAP:
-        print(f"  whisper: remapped {lang} → ar")
+        # Whisper confused Arabic with an Arabic-script language and transcribed
+        # in Urdu/Farsi text. Re-run with language="ar" forced so we get proper
+        # Arabic script output instead of Urdu Nastaliq.
+        print(f"  whisper: remapped {lang} → ar, re-transcribing in Arabic")
         lang = "ar"
+        segments, _ = _whisper_model.transcribe(
+            audio, language="ar", **_TRANSCRIBE_KWARGS
+        )
+
     threshold = LANG_PROB_THRESHOLD_AR if lang == "ar" else LANG_PROB_THRESHOLD
     print(f"  whisper: lang={lang} lang_prob={lang_prob:.2f}")
     if lang_prob < threshold:
@@ -265,6 +286,7 @@ def _transcribe_blocking(audio: Any) -> tuple[str, str]:
             print(f"  → dropped: word_conf {mean_conf:.2f} < {WORD_CONF_THRESHOLD}")
             return "", lang
     text = " ".join(s.text.strip() for s in segments).strip()
+    torch.cuda.empty_cache()   # release Whisper's activation memory
     return text, lang
 
 
@@ -408,6 +430,7 @@ async def websocket_endpoint(ws: WebSocket):
                     import traceback; traceback.print_exc()
                 finally:
                     ai_active = False
+                    torch.cuda.empty_cache()   # release Silma TTS activation memory
         except Exception as e:
             print(f"respond_loop: {e}")
 

@@ -1,0 +1,14 @@
+fastapi==0.136.1
+uvicorn==0.47.0
+httpx==0.28.1
+numpy==1.26.4
+soundfile==0.12.1
+lameenc==1.8.2
+faster-whisper==1.1.1
+silma-tts==1.0.5
+clearvoice==0.1.2
+
+# PyTorch — must match CUDA 13.0 on this machine
+# Install separately (see setup guide), not via pip install -r
+# torch==2.11.0+cu130
+# torchaudio==2.11.0+cu130
