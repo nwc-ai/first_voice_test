@@ -60,15 +60,23 @@ import tts_silma_v1  # type: ignore[import-untyped]
 
 STATIC_DIR  = os.path.join(os.path.dirname(__file__), "static")
 OLLAMA_URL  = "http://localhost:11434/api/generate"
-MODEL       = "qwen2.5:7b"
+MODEL       = "qwen3.5:9b"
 SYSTEM_PROMPT = (
-    "You are a voice assistant that supports Arabic and English ONLY. "
+    "You are a voice assistant that supports Arabic dialects and English ONLY. "
     "ABSOLUTE RULES — never break these: "
-    "1. If the user speaks Arabic → reply in Arabic only using Arabic script. "
-    "2. If the user speaks English → reply in English only."
-    "3. NEVER use Chinese, Japanese, Korean, Cyrillic, Vietnamese, or any non-Arabic/Latin script. "
-    "4. NEVER mix scripts or languages in a single response. "
-    "5. Keep answers short, spoken-word style, no markdown, no symbols."
+    "1. If the user speaks English → reply in English only. "
+    "2. If the user speaks Arabic → detect their exact dialect and reply in that SAME dialect: "
+    "   Najdi (نجدي): use وش/إيش, أبغى, زين, الحين, ماله, يبيلك — "
+    "   Hijazi (حجازي): use إيش, وين, كيف, بدي, تعال, ما عندي — "
+    "   Egyptian (مصري): use إيه, عايز, دلوقتي, مش, إزيك — "
+    "   Levantine (شامي): use شو, هيك, بدي, هلق, كتير — "
+    "   Moroccan (مغربي): use واش, بغيت, دابا, مزيان, كيداير — "
+    "   Gulf/Khaleeji (خليجي): use شلونك, وايد, يبه, زين, ما أدري. "
+    "3. If the user mixes Arabic and English (code-switching) → reply in the same natural mix, matching their Arabic dialect. "
+    "4. If Arabic dialect is unclear → use Modern Standard Arabic. "
+    "5. NEVER mix two Arabic dialects in one response. "
+    "6. NEVER use Chinese, Japanese, Korean, Cyrillic, Vietnamese or any non-Arabic/Latin script. "
+    "7. Keep answers short, conversational, no markdown, no symbols."
 )
 
 # VAD tuning (matches real architecture)
@@ -192,6 +200,13 @@ LANG_PROB_THRESHOLD_AR = 0.10  # Arabic misfires as Urdu/Punjabi/Farsi — only 
 WORD_CONF_THRESHOLD    = 0.3   # discard if mean per-word confidence is too low
 ALLOWED_LANGS          = {"ar", "en"}
 
+# Detects code-switching: text contains both Arabic script and Latin words.
+_ARABIC_CHARS_RE = re.compile(r'[؀-ۿ]')
+_LATIN_WORDS_RE  = re.compile(r'[a-zA-Z]{2,}')
+
+def _is_mixed(text: str) -> bool:
+    return bool(_ARABIC_CHARS_RE.search(text)) and bool(_LATIN_WORDS_RE.search(text))
+
 # Whisper mistakes Arabic for these languages — remap them all to ar.
 # Includes Arabic-script langs (ur/fa/ps/ug/sd) AND Punjabi (pa) which Whisper
 # also confuses with Arabic despite different script.
@@ -298,6 +313,7 @@ async def ollama_token_gen(prompt: str, system: str):
         "system": system,
         "prompt": prompt,
         "stream": True,
+        "think":  False,   # disable Qwen3.5 thinking mode
     }
     async with httpx.AsyncClient(timeout=120) as client:
         async with client.stream("POST", OLLAMA_URL, json=payload) as resp:
@@ -327,13 +343,20 @@ async def websocket_endpoint(ws: WebSocket):
 
     cancel_event:    asyncio.Event                      = asyncio.Event()
     utterance_queue: asyncio.Queue[Optional[tuple[str, str]]] = asyncio.Queue()
-    ai_active = False  # True while LLM+TTS is running — gates barge-in cancellation
+    ai_active   = False  # True while LLM+TTS pipeline is running
+    ai_speaking = False  # True only after first audio chunk has been sent to browser
+                         # Barge-in cancels only when AI is speaking, not while thinking
+
+    async def _on_first_audio():
+        nonlocal ai_speaking
+        ai_speaking = True
 
     async def on_speech_start():
         """Called by VAD when speech onset is confirmed."""
-        # Only cancel an in-progress response on true barge-in (AI is actively speaking).
-        # If AI is idle, the user is just starting a new utterance — don't interrupt anything.
-        if ai_active:
+        # Only cancel if AI is already playing audio (true barge-in).
+        # While AI is still thinking (ai_active but not ai_speaking), let the
+        # LLM finish so the user actually gets a response.
+        if ai_speaking:
             cancel_event.set()
         try:
             await ws.send_json({"event": "speech_start"})
@@ -355,10 +378,12 @@ async def websocket_endpoint(ws: WebSocket):
 
                 audio = await process_chunk(data)
                 if audio is not None:
-                    # Only drain stale utterances if the AI is mid-response (barge-in).
-                    # If AI is idle, queue the utterance normally so nothing is lost.
-                    if ai_active:
+                    if ai_speaking:
+                        # True barge-in: AI is actively playing audio — cancel it.
                         cancel_event.set()
+                    if ai_active:
+                        # AI is busy (thinking or speaking) — drain queue so the
+                        # latest utterance wins when the current turn finishes.
                         while not utterance_queue.empty():
                             utterance_queue.get_nowait()
 
@@ -367,7 +392,11 @@ async def websocket_endpoint(ws: WebSocket):
 
                     if not text:
                         continue
-                    if lang not in ALLOWED_LANGS:
+                    # Promote to "mixed" if text contains both Arabic and Latin —
+                    # overrides Whisper's single-language tag before the ALLOWED_LANGS check.
+                    if _is_mixed(text):
+                        lang = "mixed"
+                    if lang not in ALLOWED_LANGS and lang != "mixed":
                         print(f"STT [{lang}] rejected: {text!r}")
                         continue
                     if len(text) < MIN_TEXT_CHARS or len(text) > MAX_TEXT_CHARS:
@@ -387,7 +416,7 @@ async def websocket_endpoint(ws: WebSocket):
 
     # ── respond_loop: takes utterances, runs LLM + TTS ───────────────────────
     async def respond_loop():
-        nonlocal ai_active
+        nonlocal ai_active, ai_speaking
         try:
             while True:
                 item = await utterance_queue.get()
@@ -396,7 +425,8 @@ async def websocket_endpoint(ws: WebSocket):
 
                 text, lang = item
                 cancel_event.clear()
-                ai_active = True
+                ai_active   = True
+                ai_speaking = False
 
                 if _INJECTION_RE.search(text):
                     print(f"Injection attempt blocked: {text!r}")
@@ -408,12 +438,24 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.send_json({"event": "transcript", "text": text, "lang": lang})
                 print(f"LLM start: {text!r}")
 
-                lang_names = {"ar": "Arabic", "en": "English"}
-                lang_instruction = (
-                    f"IMPORTANT: The user spoke in {lang_names.get(lang, 'Arabic')}. "
-                    f"You MUST reply in {lang_names.get(lang, 'Arabic')} only. "
-                    f"Do not use any other language."
-                )
+                if lang == "mixed":
+                    lang_instruction = (
+                        "The user is mixing Arabic and English (code-switching). "
+                        "Reply naturally in the SAME mix of Arabic and English they used. "
+                        "For the Arabic parts, match their dialect "
+                        "(Najdi, Hijazi, Egyptian, Levantine, Moroccan, or Gulf/Khaleeji). "
+                        "Do NOT force a reply into all-Arabic or all-English."
+                    )
+                elif lang == "ar":
+                    lang_instruction = (
+                        "The user spoke Arabic. Detect their exact dialect "
+                        "(Najdi, Hijazi, Egyptian, Levantine, Moroccan, or Gulf/Khaleeji) "
+                        "from their vocabulary and reply in that EXACT same dialect. "
+                        "Najdi vs Hijazi: Najdi uses وش/أبغى/الحين; Hijazi uses وين/بدي/كيف. "
+                        "Do NOT use Fusha/MSA unless the dialect is completely unclear."
+                    )
+                else:
+                    lang_instruction = "The user spoke English. Reply in English only."
                 prompt_with_lang = f"{lang_instruction}\n\nUser: {text}"
 
                 try:
@@ -421,6 +463,7 @@ async def websocket_endpoint(ws: WebSocket):
                         token_gen=_filter_cjk(ollama_token_gen(prompt_with_lang, SYSTEM_PROMPT)),
                         ws=ws,
                         cancel_event=cancel_event,
+                        on_first_audio=_on_first_audio,
                     )
                     print("LLM/TTS done.")
                 except asyncio.CancelledError:
@@ -429,7 +472,8 @@ async def websocket_endpoint(ws: WebSocket):
                     print(f"LLM/TTS error: {e}")
                     import traceback; traceback.print_exc()
                 finally:
-                    ai_active = False
+                    ai_active   = False
+                    ai_speaking = False
                     torch.cuda.empty_cache()   # release Silma TTS activation memory
         except Exception as e:
             print(f"respond_loop: {e}")
