@@ -81,7 +81,7 @@ SYSTEM_PROMPT = (
 
 # VAD tuning (matches real architecture)
 MIN_SPEECH_CHUNKS  = 4   # 4 × 32 ms ≈ 128 ms to confirm speech onset
-MAX_SILENCE_CHUNKS = 25  # 25 × 32 ms ≈ 800 ms silence to end utterance
+MAX_SILENCE_CHUNKS = 40  # 40 × 32 ms ≈ 1.28 s silence to end utterance
 SAMPLE_RATE        = 16000
 
 # Module-level model singletons — loaded once at startup
@@ -314,6 +314,15 @@ async def ollama_token_gen(prompt: str, system: str):
         "prompt": prompt,
         "stream": True,
         "think":  False,   # disable Qwen3.5 thinking mode
+        "options": {
+            # Qwen3.5 non-thinking conversational mode recommended params.
+            # Without these, think:False produces drifting/malformed sentences.
+            "temperature":       0.7,
+            "top_p":             0.8,
+            "top_k":             20,
+            "presence_penalty":  1.5,   # prevents repetition loops
+            "num_predict":       300,   # cap response length for voice (no essays)
+        },
     }
     async with httpx.AsyncClient(timeout=120) as client:
         async with client.stream("POST", OLLAMA_URL, json=payload) as resp:
