@@ -2,7 +2,7 @@
 test_local.py — Full pipeline test for tts_silma_v1.py
 =====================================================
 No microphone needed. This script:
-  1. Sends a hardcoded question to Ollama (qwen2.5:7b) as the LLM
+  1. Sends a hardcoded question to Ollama (qwen3.5:27b) as the LLM
   2. Streams the LLM tokens through tts_silma_v1.py
   3. Saves each synthesized sentence as an MP3 file in ./test_output/
   4. Prints timing info so you can see how fast each step is
@@ -24,7 +24,7 @@ import tts_silma_v1
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "test_output")
 OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL = "qwen2.5:7b"
+MODEL = "qwen3.5:27b"
 
 # The question we "ask" the AI — simulates what a user would say
 TEST_PROMPT = "اشرح لي ما هو الذكاء الاصطناعي في جملتين بالعربية"
@@ -67,6 +67,9 @@ async def ollama_token_gen(prompt: str):
         "model": MODEL,
         "prompt": prompt,
         "stream": True,
+        # Same as server.py's qwen3.5 config: thinking OFF for voice — with it on,
+        # the model spends its token budget reasoning and emits no spoken text.
+        "think": False,
     }
     async with httpx.AsyncClient(timeout=120) as client:
         async with client.stream("POST", OLLAMA_URL, json=payload) as response:

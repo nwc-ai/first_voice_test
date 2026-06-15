@@ -44,10 +44,42 @@
     }
     #hint { font-size: 0.78rem; color: #444; text-align: center; }
     #connect-btn:disabled { opacity: 0.35; cursor: not-allowed; animation: none; }
+
+    /* Model + TTS selectors */
+    .selector-row {
+      display: flex; align-items: center; gap: 10px;
+      width: 100%; max-width: 580px;
+    }
+    .selector-row label {
+      font-size: 0.82rem; color: #aaa; white-space: nowrap;
+      font-weight: 600; direction: ltr; min-width: 46px;
+    }
+    .selector-row select {
+      flex: 1; background: #1e1e2e; border: 1px solid #4a4a8a;
+      color: #e0e0ff; border-radius: 8px; padding: 8px 12px;
+      font-size: 0.88rem; cursor: pointer; outline: none;
+      direction: ltr; text-align: left; appearance: auto;
+    }
+    .selector-row select:hover  { border-color: #7a7aff; }
+    .selector-row select:disabled { opacity: 0.4; cursor: not-allowed; }
+    .reload-btn {
+      background: #1a1a2e; border: 1px solid #3a3a6a; color: #888;
+      border-radius: 6px; padding: 6px 10px; cursor: pointer; font-size: 1rem;
+    }
+    .reload-btn:hover { border-color: #7a7aff; color: #aaf; }
   </style>
 </head>
 <body>
   <h1>المساعد الصوتي — Silma TTS</h1>
+
+  <div id="model-row" class="selector-row">
+    <label>LLM:</label>
+    <select id="model-select">
+      <option>Loading...</option>
+    </select>
+    <button id="reload-btn" class="reload-btn" title="Reload model list">↻</button>
+  </div>
+
   <div id="status">اضغط للاتصال</div>
 
   <div class="box" id="transcript-box">
@@ -65,20 +97,70 @@
 
 <script>
 // ── Constants ────────────────────────────────────────────────────────────────
-const WS_URL     = `ws://${location.host}/ws`;
-const CHUNK_SIZE = 512;     // must match server VAD
+const CHUNK_SIZE  = 512;
 const SAMPLE_RATE = 16000;
 
 // ── State ────────────────────────────────────────────────────────────────────
 let ws          = null;
-let audioCtx    = null;
+let audioCtx    = null;   // 16 kHz context — mic capture only
+let playCtx     = null;   // native-rate context — playback only. Decoding the 24 kHz
+                          // TTS audio in the 16 kHz mic context would resample it
+                          // down and cut everything above 8 kHz (muffled voice).
 let workletNode = null;
 let micStream   = null;
 let connected   = false;
+let serverReady = false;  // gate mic chunks until the server says 'ready' — no point
+                          // streaming audio into a server still loading models
 
-let audioQueue  = [];
-let isPlaying   = false;
-let currentSrc  = null;
+// Playback: sources are scheduled sample-accurately on playCtx's clock.
+let activeSources = [];
+let nextStartTime = 0;
+let playGen       = 0;                   // bumped on clear — invalidates in-flight decodes
+let decodeChain   = Promise.resolve();   // serializes decodes so sentences play in order
+let isPlaying     = false;
+
+// Client-side barge-in (works on SPEAKERS): detect the user talking over the AI
+// directly on the mic data and stop playback locally + instantly. Server-side VAD
+// can't do this reliably because the speaker echo + echo-canceller suppress your
+// voice during double-talk. We learn the residual-echo level while the AI plays and
+// fire only when the mic clearly rises above it for ~160 ms. Stopping the AI also
+// removes the echo, so the server then transcribes your words cleanly.
+let echoBaseline = 0;   // EMA of mic RMS while AI plays and user is quiet
+let bargeHot     = 0;   // consecutive chunks the user is clearly above the echo
+let bargeArmed   = 0;   // playback chunks seen (establish baseline before arming)
+const BARGE_FLOOR  = 0.02;  // ignore near-silence / faint room noise
+const BARGE_FACTOR = 4.0;   // user must exceed the echo baseline by this factor
+const BARGE_STOP   = 5;     // consecutive chunks (~160 ms) to confirm and stop
+const BARGE_ARM    = 5;     // chunks (~160 ms) to learn the echo baseline first
+function resetBargeDetector() { echoBaseline = 0; bargeHot = 0; bargeArmed = 0; }
+function detectBargeIn(buf) {
+  if (!isPlaying || activeSources.length === 0) return;   // only while AI is audible
+  let s = 0; for (let i = 0; i < buf.length; i++) { const v = buf[i]; s += v * v; }
+  const rms = Math.sqrt(s / buf.length);
+  if (bargeArmed < BARGE_ARM) {                            // learn the echo floor first
+    bargeArmed++;
+    echoBaseline = echoBaseline === 0 ? rms : echoBaseline * 0.7 + rms * 0.3;
+    return;
+  }
+  if (rms > Math.max(BARGE_FLOOR, echoBaseline * BARGE_FACTOR)) {
+    if (++bargeHot >= BARGE_STOP) {
+      console.log('[barge-in] user spoke over AI — stopping playback locally');
+      clearAudioQueue();        // stop now, no server round trip
+      sendControl('barge_in');  // tell server to cancel the in-progress turn
+      resetBargeDetector();
+    }
+  } else {
+    bargeHot = 0;
+    echoBaseline = echoBaseline * 0.95 + rms * 0.05;       // keep tracking the echo
+  }
+}
+
+// Watchdog: the server pings every 3s. If NOTHING arrives for 10s the socket
+// is half-dead (UI stays green but mic audio goes nowhere) → auto-reconnect.
+let lastMsgTime   = 0;
+let watchdogTimer = null;
+let reconnectDelay = 500;   // exponential backoff: 0.5s → 1s → 2s … capped at 10s
+let wantReconnect  = false; // true while the user wants a session (cleared by ⏹️)
 
 // ── DOM ───────────────────────────────────────────────────────────────────────
 const statusEl     = document.getElementById('status');
@@ -86,13 +168,44 @@ const transcriptEl = document.getElementById('transcript-text');
 const responseEl   = document.getElementById('response-text');
 const connectBtn   = document.getElementById('connect-btn');
 const hintEl       = document.getElementById('hint');
+const modelSelect  = document.getElementById('model-select');
+const reloadBtn    = document.getElementById('reload-btn');
 
 function setStatus(text, cls) {
   statusEl.textContent = text;
   statusEl.className   = cls || '';
 }
 
-// ── AudioWorklet inline (no separate .js file needed) ────────────────────────
+// ── Load model list from server ───────────────────────────────────────────────
+async function loadModels() {
+  modelSelect.innerHTML = '<option disabled>Loading...</option>';
+  reloadBtn.disabled = true;
+  try {
+    const res  = await fetch('/models');
+    const data = await res.json();
+    const prev = modelSelect.value;
+    modelSelect.innerHTML = '';
+    const list = (data.models && data.models.length > 0) ? data.models : [data.default];
+    list.forEach(name => {
+      const opt       = document.createElement('option');
+      opt.value       = name;
+      opt.textContent = name;
+      if (name === prev || name === data.default) opt.selected = true;
+      modelSelect.appendChild(opt);
+    });
+    console.log('[models] loaded:', list.length, 'models');
+  } catch (e) {
+    modelSelect.innerHTML = '<option value="">Error loading — click ↻ to retry</option>';
+    console.error('[models] fetch failed:', e);
+  } finally {
+    reloadBtn.disabled = false;
+  }
+}
+
+reloadBtn.addEventListener('click', loadModels);
+loadModels();
+
+// ── AudioWorklet inline ──────────────────────────────────────────────────────
 const WORKLET_CODE = `
 class MicSender extends AudioWorkletProcessor {
   constructor() {
@@ -118,14 +231,14 @@ registerProcessor('mic-sender', MicSender);
 
 // ── Connect / disconnect ─────────────────────────────────────────────────────
 connectBtn.addEventListener('click', async () => {
-  if (connected) {
-    disconnect();
-  } else {
-    await connect();
-  }
+  if (connected) { wantReconnect = false; disconnect(); } else { await connect(); }
 });
 
+let connecting = false;   // guards against overlapping connect() calls
+
 async function connect() {
+  if (connecting || connected) return;   // never run two connects at once
+  connecting = true;
   setStatus('جاري الاتصال...', '');
 
   try {
@@ -135,146 +248,228 @@ async function connect() {
     });
   } catch (e) {
     setStatus('⚠️ لا يمكن الوصول إلى الميكروفون: ' + e.message, '');
+    connecting = false;
     return;
   }
 
-  // AudioContext at 16kHz — browser resamples automatically
   audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
   if (audioCtx.state === 'suspended') await audioCtx.resume();
+  playCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (playCtx.state === 'suspended') await playCtx.resume();
 
-  // Load inline worklet via Blob URL
   const blob      = new Blob([WORKLET_CODE], { type: 'application/javascript' });
   const workletUrl = URL.createObjectURL(blob);
   await audioCtx.audioWorklet.addModule(workletUrl);
   URL.revokeObjectURL(workletUrl);
 
-  const source  = audioCtx.createMediaStreamSource(micStream);
-  workletNode   = new AudioWorkletNode(audioCtx, 'mic-sender');
-  // NOT connected to destination — prevents echo
+  const source = audioCtx.createMediaStreamSource(micStream);
+  workletNode  = new AudioWorkletNode(audioCtx, 'mic-sender');
   source.connect(workletNode);
 
-  ws = new WebSocket(WS_URL);
-  ws.binaryType = 'arraybuffer';
+  // Pass selected model as a query param
+  const selectedModel = encodeURIComponent(modelSelect.value || '');
+  const WS_PROTO = location.protocol === 'https:' ? 'wss://' : 'ws://';
+  const WS_URL = `${WS_PROTO}${location.host}/ws?model=${selectedModel}`;
+  wantReconnect = true;
 
-  ws.onopen = () => {
-    connected = true;
+  // Socket-scoped handlers: `sock` is captured locally so a STALE socket's
+  // late onclose/onerror can NEVER tear down a newer session. (That race —
+  // old socket's onclose killing the new mic stream — caused the "stays green
+  // but deaf" state.)
+  const sock = new WebSocket(WS_URL);
+  sock.binaryType = 'arraybuffer';
+  ws = sock;
+
+  // Lock selector while connected
+  modelSelect.disabled = true;
+
+  sock.onopen = () => {
+    if (sock !== ws) { try { sock.close(); } catch (_) {} return; }  // superseded
+    connected  = true;
+    connecting = false;
     connectBtn.textContent = '⏹️';
-    // Don't set status here — wait for 'ready' or 'loading' from server
-    // to avoid a flash when models are still loading
-
-    // Stream mic chunks to server
     workletNode.port.onmessage = (e) => {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(e.data.buffer);
-      }
+      // Client-side barge-in runs on every mic chunk (even before serverReady is
+      // irrelevant here — it only fires while AI audio is playing).
+      detectBargeIn(e.data);
+      // serverReady gate: don't stream mic audio into a server that is still
+      // loading models — it would pile up unread in the socket buffer.
+      if (serverReady && ws === sock && sock.readyState === WebSocket.OPEN) sock.send(e.data.buffer);
     };
+    // Start the dead-connection watchdog (server pings every 3s).
+    lastMsgTime = Date.now();
+    watchdogTimer = setInterval(() => {
+      // 20s (server pings every 3s). Raised from 10s so a brief SSH-tunnel/network
+      // stall during a long reply can't falsely declare the connection dead.
+      if (connected && Date.now() - lastMsgTime > 20000) {
+        console.warn('[watchdog] no server message for >20s — reconnecting');
+        setStatus('انقطع الاتصال — إعادة الاتصال...', 'processing');
+        disconnect();
+        scheduleReconnect();
+      }
+    }, 2500);
   };
 
-  ws.onclose  = () => { disconnect(false); };
-  ws.onerror  = () => { setStatus('⚠️ خطأ في الاتصال', ''); };
-  ws.onmessage = handleMessage;
+  sock.onclose  = (ev) => {
+    // Log the close code so an automatic disconnect is no longer a mystery:
+    // 1000=normal, 1001=tab navigated away, 1005=no code, 1006=abnormal (network/
+    // tunnel drop, no close frame), 1011=server error. Check the console after a drop.
+    console.warn('[ws] closed — code=', ev.code, 'reason=', ev.reason || '(none)', 'wasClean=', ev.wasClean);
+    if (sock !== ws) return;
+    disconnect(false);
+    // Unexpected close (server restart, network blip, tunnel drop) — retry with backoff.
+    if (wantReconnect) {
+      setStatus('انقطع الاتصال — إعادة الاتصال...', 'processing');
+      scheduleReconnect();
+    }
+  };
+  sock.onerror  = () => { if (sock === ws) setStatus('⚠️ خطأ في الاتصال', ''); };
+  sock.onmessage = (e) => { if (sock === ws) handleMessage(e); };
+  connecting = false;
+}
+
+function scheduleReconnect() {
+  setTimeout(() => connect(), reconnectDelay);
+  reconnectDelay = Math.min(reconnectDelay * 2, 10000);
 }
 
 function disconnect(stopServer = true) {
-  connected = false;
+  connected   = false;
+  connecting  = false;
+  serverReady = false;
+  if (watchdogTimer) { clearInterval(watchdogTimer); watchdogTimer = null; }
   connectBtn.textContent = '🎙️';
   connectBtn.className   = '';
+  connectBtn.disabled    = false;   // re-enable even if we dropped mid-'loading'
   hintEl.textContent     = 'اضغط للاتصال — سيستمع تلقائياً بعد ذلك';
   setStatus('اضغط للاتصال', '');
+  modelSelect.disabled = false;
 
   clearAudioQueue();
-  if (workletNode)  { workletNode.port.onmessage = null; workletNode.disconnect(); workletNode = null; }
-  if (micStream)    { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
-  if (audioCtx)     { audioCtx.close(); audioCtx = null; }
-  if (ws && stopServer) { ws.close(); ws = null; }
+  if (workletNode) { workletNode.port.onmessage = null; workletNode.disconnect(); workletNode = null; }
+  if (micStream)   { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+  if (audioCtx)    { audioCtx.close(); audioCtx = null; }
+  if (playCtx)     { playCtx.close(); playCtx = null; }
+  // Always close + detach the socket we are abandoning, so its late events
+  // can't fire into a future session.
+  const sock = ws;
+  ws = null;
+  if (sock) {
+    sock.onopen = sock.onclose = sock.onerror = sock.onmessage = null;
+    try { sock.close(); } catch (_) {}
+  }
 }
 
 // ── WebSocket message handler ─────────────────────────────────────────────────
 function handleMessage(event) {
-  // Binary = MP3 audio
-  if (event.data instanceof ArrayBuffer) {
-    queueMp3(event.data);
-    return;
-  }
+  lastMsgTime = Date.now();   // any server message (incl. ping/audio) feeds the watchdog
+
+  if (event.data instanceof ArrayBuffer) { queueMp3(event.data); return; }
 
   const msg = JSON.parse(event.data);
+
+  if (msg.event === 'ping') return; // keepalive — ignore silently
 
   if (msg.event === 'loading') {
     setStatus('جاري تحميل النماذج...', 'processing');
     connectBtn.disabled = true;
     return;
   }
-
   if (msg.event === 'ready') {
+    serverReady          = true;
+    reconnectDelay       = 500;   // healthy session — reset the backoff
     connectBtn.disabled  = false;
     connectBtn.className = 'connected';
     hintEl.textContent   = 'يستمع... تحدث بشكل طبيعي';
     setStatus('يستمع...', 'listening');
     return;
   }
-
   if (msg.event === 'speech_start') {
-    // Barge-in: user started speaking — stop AI audio immediately
     clearAudioQueue();
-    responseEl.textContent = '';
+    // Don't clear the response box here: if the AI was still thinking, its
+    // answer keeps streaming — the box is cleared on the next transcript.
     connectBtn.className   = 'connected user-speaking';
     setStatus('تتحدث...', 'speaking');
   }
-
   if (msg.event === 'transcript') {
     transcriptEl.textContent = msg.text;
+    responseEl.textContent   = '';   // new turn starts now
     connectBtn.className     = 'connected';
     setStatus('جاري التفكير...', 'processing');
   }
-
   if (msg.event === 'token') {
     responseEl.textContent += msg.text;
   }
-
   if (msg.event === 'tts_end') {
-    connectBtn.className = 'connected';
-    setStatus('يستمع...', 'listening');
+    // Only reset to listening immediately if nothing is playing — otherwise
+    // the last source's onended handler resets the status when audio ends.
+    if (!isPlaying && activeSources.length === 0) {
+      connectBtn.className = 'connected';
+      setStatus('يستمع...', 'listening');
+    }
   }
 }
 
-// ── Audio playback queue ──────────────────────────────────────────────────────
-async function queueMp3(arrayBuffer) {
-  if (!audioCtx) return;
-  connectBtn.className = 'connected ai-speaking';
-  setStatus('يتكلم...', 'speaking');
+// ── Audio playback: ordered decode, gapless sample-accurate scheduling ────────
+const SEAM_OVERLAP = 0.05;  // swallow LAME encoder padding between sentence MP3s
 
-  try {
-    const decoded = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
-    audioQueue.push(decoded);
-    if (!isPlaying) drainQueue();
-  } catch (e) {
-    console.error('MP3 decode error:', e);
-    drainQueue();
+function sendControl(event) {
+  // Tells the server the real client-side playback state, so barge-in stays
+  // strict while the AI is still audible (even after the server turn ended).
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try { ws.send(JSON.stringify({ event })); } catch (_) {}
   }
 }
 
-function drainQueue() {
-  if (audioQueue.length === 0 || !audioCtx) {
-    isPlaying  = false;
-    currentSrc = null;
-    return;
-  }
-  isPlaying = true;
-  const buf = audioQueue.shift();
-  currentSrc = audioCtx.createBufferSource();
-  currentSrc.buffer  = buf;
-  currentSrc.onended = drainQueue;
-  currentSrc.connect(audioCtx.destination);
-  currentSrc.start();
+function queueMp3(arrayBuffer) {
+  const gen = playGen;
+  // Chain decodes: decodeAudioData resolves out of order for different-length
+  // MP3s, which would scramble sentence order without this serialization.
+  decodeChain = decodeChain.then(async () => {
+    if (gen !== playGen || !playCtx) return;   // cleared/disconnected meanwhile
+    let decoded;
+    try {
+      decoded = await playCtx.decodeAudioData(arrayBuffer.slice(0));
+    } catch (e) { console.error('MP3 decode error:', e); return; }
+    if (gen !== playGen || !playCtx) return;
+
+    const now = playCtx.currentTime;
+    if (nextStartTime < now + 0.03) nextStartTime = now + 0.03;
+    const src = playCtx.createBufferSource();
+    src.buffer = decoded;
+    src.connect(playCtx.destination);
+    src.start(nextStartTime);
+    nextStartTime += Math.max(decoded.duration - SEAM_OVERLAP, 0.01);
+
+    if (activeSources.length === 0) {
+      sendControl('playback_start');
+      resetBargeDetector();   // re-learn the echo baseline at the start of each reply
+    }
+    activeSources.push(src);
+    isPlaying = true;
+    connectBtn.className = 'connected ai-speaking';
+    setStatus('يتكلم...', 'speaking');
+
+    src.onended = () => {
+      activeSources = activeSources.filter(s => s !== src);
+      if (activeSources.length === 0) {
+        isPlaying = false;
+        sendControl('playback_done');
+        if (connected) { connectBtn.className = 'connected'; setStatus('يستمع...', 'listening'); }
+      }
+    };
+  }).catch(e => console.error('playback error:', e));
 }
 
 function clearAudioQueue() {
-  audioQueue = [];
-  isPlaying  = false;
-  if (currentSrc) {
-    try { currentSrc.stop(); } catch (_) {}
-    currentSrc = null;
-  }
+  playGen++;                        // invalidate decodes still in flight
+  decodeChain = Promise.resolve();
+  const wasPlaying = activeSources.length > 0;
+  activeSources.forEach(s => { s.onended = null; try { s.stop(); } catch (_) {} });
+  activeSources = [];
+  nextStartTime = 0;
+  isPlaying     = false;
+  if (wasPlaying) sendControl('playback_done');
 }
 </script>
 </body>
