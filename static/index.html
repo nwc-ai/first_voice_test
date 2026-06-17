@@ -80,6 +80,14 @@
     <button id="reload-btn" class="reload-btn" title="Reload model list">↻</button>
   </div>
 
+  <div id="tts-row" class="selector-row">
+    <label>TTS:</label>
+    <select id="tts-select">
+      <option value="silma">silma</option>
+    </select>
+    <button id="tts-reload-btn" class="reload-btn" title="Reload TTS engines">↻</button>
+  </div>
+
   <div id="status">اضغط للاتصال</div>
 
   <div class="box" id="transcript-box">
@@ -170,6 +178,8 @@ const connectBtn   = document.getElementById('connect-btn');
 const hintEl       = document.getElementById('hint');
 const modelSelect  = document.getElementById('model-select');
 const reloadBtn    = document.getElementById('reload-btn');
+const ttsSelect    = document.getElementById('tts-select');
+const ttsReloadBtn = document.getElementById('tts-reload-btn');
 
 function setStatus(text, cls) {
   statusEl.textContent = text;
@@ -204,6 +214,34 @@ async function loadModels() {
 
 reloadBtn.addEventListener('click', loadModels);
 loadModels();
+
+// ── Load available TTS engines (only ones whose service is running) ─────────────
+async function loadTtsBackends() {
+  ttsReloadBtn.disabled = true;
+  try {
+    const res  = await fetch('/tts-backends');
+    const data = await res.json();
+    const prev = ttsSelect.value;
+    const list = (data.backends && data.backends.length > 0) ? data.backends : ['silma'];
+    ttsSelect.innerHTML = '';
+    list.forEach(name => {
+      const opt       = document.createElement('option');
+      opt.value       = name;
+      opt.textContent = name;
+      if (name === prev || (prev === '' && name === data.default)) opt.selected = true;
+      ttsSelect.appendChild(opt);
+    });
+    console.log('[tts] engines:', list.join(', '));
+  } catch (e) {
+    ttsSelect.innerHTML = '<option value="silma">silma</option>';
+    console.error('[tts] fetch failed:', e);
+  } finally {
+    ttsReloadBtn.disabled = false;
+  }
+}
+
+ttsReloadBtn.addEventListener('click', loadTtsBackends);
+loadTtsBackends();
 
 // ── AudioWorklet inline ──────────────────────────────────────────────────────
 const WORKLET_CODE = `
@@ -266,10 +304,11 @@ async function connect() {
   workletNode  = new AudioWorkletNode(audioCtx, 'mic-sender');
   source.connect(workletNode);
 
-  // Pass selected model as a query param
+  // Pass selected model + TTS engine as query params
   const selectedModel = encodeURIComponent(modelSelect.value || '');
+  const selectedTts   = encodeURIComponent(ttsSelect.value || 'silma');
   const WS_PROTO = location.protocol === 'https:' ? 'wss://' : 'ws://';
-  const WS_URL = `${WS_PROTO}${location.host}/ws?model=${selectedModel}`;
+  const WS_URL = `${WS_PROTO}${location.host}/ws?model=${selectedModel}&tts=${selectedTts}`;
   wantReconnect = true;
 
   // Socket-scoped handlers: `sock` is captured locally so a STALE socket's
@@ -280,8 +319,9 @@ async function connect() {
   sock.binaryType = 'arraybuffer';
   ws = sock;
 
-  // Lock selector while connected
+  // Lock selectors while connected
   modelSelect.disabled = true;
+  ttsSelect.disabled   = true;
 
   sock.onopen = () => {
     if (sock !== ws) { try { sock.close(); } catch (_) {} return; }  // superseded
@@ -344,6 +384,7 @@ function disconnect(stopServer = true) {
   hintEl.textContent     = 'اضغط للاتصال — سيستمع تلقائياً بعد ذلك';
   setStatus('اضغط للاتصال', '');
   modelSelect.disabled = false;
+  ttsSelect.disabled   = false;
 
   clearAudioQueue();
   if (workletNode) { workletNode.port.onmessage = null; workletNode.disconnect(); workletNode = null; }

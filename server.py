@@ -59,12 +59,36 @@ from fastapi.staticfiles import StaticFiles
 
 sys.path.insert(0, os.path.dirname(__file__))
 import tts_silma_v1  # type: ignore[import-untyped]
+import tts_http_client  # remote TTS engines (OmniVoice, Qwen-TTS) over HTTP
 import time as _time
 import datetime
 
 STATIC_DIR      = os.path.join(os.path.dirname(__file__), "static")
 OLLAMA_URL      = "http://localhost:11434/api/generate"   # used only for the startup warm-up
 OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"       # conversation turns (carries history)
+
+# TTS backends. "silma" is in-process (value None). The others are standalone
+# microservices, each in its OWN folder + venv (isolated deps), exposing
+# POST /synthesize {text,lang} -> WAV bytes. Start only the one you're testing.
+TTS_BACKENDS: dict[str, Optional[str]] = {
+    "silma":     None,                       # in-process tts_silma_v1
+    "qwen":      "http://localhost:8772",     # ~/tts_qwen_service  (qwen3-TTS-KSA)
+    "omnivoice": "http://localhost:8771",     # ~/tts_omnivoice_service (k2-fsa/OmniVoice)
+}
+DEFAULT_TTS = "silma"
+
+# How long Ollama keeps a model resident after use. Finite (NOT -1) so that when
+# you switch LLMs or run a separate TTS service, an idle model can be evicted to
+# free VRAM. "-1" pinned the 27B at 19 GB permanently → CUDA OOM for STT/TTS.
+LLM_KEEP_ALIVE = "10m"
+
+# Pre-load the default LLM at startup to kill the first-request cold load.
+# OFF by default: warming the 27B pins ~19 GB at boot, which collides with a
+# separate TTS service (Qwen/OmniVoice) and starves STT → CUDA OOM. Enable only
+# for the qwen3.5:27b + in-process Silma setup with NO TTS service running:
+#     WARM_LLM=1 bash start_server.sh
+WARM_LLM = os.environ.get("WARM_LLM", "0") == "1"
+
 MAX_HISTORY_TURNS = 3   # rolling memory: keep only the last N user+assistant pairs per connection.
                         # Lowered 6 → 3 — less context re-sent each turn = faster qwen3.5:27b prefill,
                         # while still covering normal follow-ups ("what about X", "وش يعني؟").
@@ -180,7 +204,7 @@ async def _warm_llm(model: str = MODEL) -> None:
                 "model":      model,
                 "prompt":     "hi",
                 "stream":     False,
-                "keep_alive": -1,
+                "keep_alive": LLM_KEEP_ALIVE,
                 "options":    {"num_predict": 1},
             })
             resp.raise_for_status()
@@ -193,7 +217,10 @@ async def _warm_llm(model: str = MODEL) -> None:
 async def lifespan(app: FastAPI):
     async def _load_and_signal():
         await asyncio.to_thread(_load_all_blocking)
-        await _warm_llm()          # pin the 27B before announcing 'ready' — no cold first turn
+        if WARM_LLM:
+            await _warm_llm()      # opt-in only — warming the 27B pins ~19 GB (see WARM_LLM)
+        else:
+            print("LLM warm-up skipped (WARM_LLM=0) — first request cold-loads the model.")
         _models_ready.set()
         print("All models loaded — server ready.")
 
@@ -226,6 +253,25 @@ async def list_models() -> dict[str, Any]:
             return {"models": models, "default": MODEL}
     except Exception:
         return {"models": [MODEL], "default": MODEL}
+
+
+@app.get("/tts-backends")
+async def list_tts_backends() -> dict[str, Any]:
+    """Return selectable TTS engines. 'silma' is always available (in-process);
+    remote engines are listed only if their service answers /health, so the UI
+    never offers an engine that isn't running."""
+    available = ["silma"]
+    async with httpx.AsyncClient(timeout=2) as client:
+        for name, url in TTS_BACKENDS.items():
+            if url is None:
+                continue
+            try:
+                r = await client.get(f"{url}/health")
+                if r.status_code == 200:
+                    available.append(name)
+            except Exception:
+                pass  # service not running — omit it
+    return {"backends": available, "default": DEFAULT_TTS}
 
 
 @app.get("/logs")
@@ -772,7 +818,10 @@ async def ollama_chat_token_gen(
         "model":      model,
         "messages":   messages,
         "stream":     True,
-        "keep_alive": -1,   # pin the model in VRAM — a 27B reload after idle costs many seconds
+        "keep_alive": LLM_KEEP_ALIVE,   # finite, NOT -1: lets Ollama evict an idle model
+                                        # (e.g. the 27B) to free VRAM when you switch to a
+                                        # smaller LLM + a separate TTS service. -1 pinned
+                                        # 19 GB forever and starved STT/TTS (CUDA OOM).
         "options":    cfg["options"],
         **cfg["extra"],
     }
@@ -831,11 +880,13 @@ class _LockedWS:
 
 
 @app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket, model: str = MODEL):
+async def websocket_endpoint(ws: WebSocket, model: str = MODEL, tts: str = DEFAULT_TTS):
     await ws.accept()
     ws = _LockedWS(ws)  # all subsequent sends are serialized
     active_model = model if model else MODEL
-    print(f"Browser connected. Model: {active_model}  TTS: silma")
+    active_tts = tts if tts in TTS_BACKENDS else DEFAULT_TTS
+    tts_service_url = TTS_BACKENDS.get(active_tts)   # None → in-process Silma
+    print(f"Browser connected. Model: {active_model}  TTS: {active_tts}")
 
     # Keepalive starts BEFORE the model-loading wait: a cold start takes minutes
     # and the browser watchdog reconnects after 10 s of silence — pings must
@@ -1095,13 +1146,23 @@ async def websocket_endpoint(ws: WebSocket, model: str = MODEL):
                         # model producing tokens nobody will hear.
                         await inner.aclose()
 
+                async def _run_tts(tgen: Any) -> None:
+                    # Route to the selected TTS backend: in-process Silma, or a
+                    # remote engine over HTTP. Both honor the same WS contract.
+                    if tts_service_url is None:
+                        await tts_silma_v1.stream_tts_to_ws(  # type: ignore[no-untyped-call]
+                            token_gen=tgen, ws=ws, cancel_event=cancel_event,
+                            on_first_audio=_on_first_audio_timed,
+                        )
+                    else:
+                        await tts_http_client.stream_tts_to_ws(
+                            token_gen=tgen, ws=ws, cancel_event=cancel_event,
+                            on_first_audio=_on_first_audio_timed,
+                            service_url=tts_service_url, lang=lang,
+                        )
+
                 try:
-                    await tts_silma_v1.stream_tts_to_ws(  # type: ignore[no-untyped-call]
-                        token_gen=_collecting_token_gen(),
-                        ws=ws,
-                        cancel_event=cancel_event,
-                        on_first_audio=_on_first_audio_timed,
-                    )
+                    await _run_tts(_collecting_token_gen())
                     t_done = _time.monotonic()
 
                     final_response = "".join(response_tokens).strip()
@@ -1113,12 +1174,7 @@ async def websocket_endpoint(ws: WebSocket, model: str = MODEL):
                         print(f"  [warn] empty LLM response — sending fallback")
                         # stream_tts_to_ws emits the token event itself — sending
                         # it here too rendered the fallback text twice in the UI.
-                        await tts_silma_v1.stream_tts_to_ws(  # type: ignore[no-untyped-call]
-                            token_gen=_single_token(fallback),
-                            ws=ws,
-                            cancel_event=cancel_event,
-                            on_first_audio=_on_first_audio_timed,
-                        )
+                        await _run_tts(_single_token(fallback))
                     elif not cancel_event.is_set():
                         # Commit the completed turn to rolling memory — CLEAN user text
                         # (not the wrapped prompt) so per-turn instructions never accumulate.

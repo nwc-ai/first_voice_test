@@ -1,0 +1,9 @@
+# Qwen3-TTS-KSA service deps — ISOLATED from the main pipeline.
+# qwen-tts 0.1.1 pins transformers==4.57.3 (main venv has 4.57.6) — the reason
+# this lives in its own venv. torch/torchaudio are installed separately in
+# setup.sh from the CUDA-13 wheel index (RTX 5090 / sm_120 needs the cu130 build).
+qwen-tts==0.1.1
+fastapi==0.136.1
+uvicorn==0.47.0
+soundfile==0.12.1
+pydantic>=2

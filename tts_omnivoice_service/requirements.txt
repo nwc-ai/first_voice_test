@@ -1,0 +1,9 @@
+# OmniVoice service deps — ISOLATED venv. torch/torchaudio installed separately
+# in setup.sh from the CUDA-13 wheel index (RTX 5090 / sm_120 needs the cu130 build;
+# OmniVoice's README suggests 2.8.0+cu128, but the 2.11.0+cu130 build that the rest
+# of this box runs is newer and works on Blackwell).
+omnivoice
+fastapi==0.136.1
+uvicorn==0.47.0
+soundfile==0.12.1
+pydantic>=2
