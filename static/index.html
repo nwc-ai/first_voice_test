@@ -21,7 +21,8 @@
     #status.speaking   { color: #4a90d9; background: #0d1420; }
     #status.processing { color: #d9a84a; background: #1f160d; }
     .box {
-      width: 100%; max-width: 580px; min-height: 70px;
+      width: 100%; max-width: 580px; min-height: 70px; max-height: 220px;
+      overflow-y: auto;
       border-radius: 12px; padding: 14px 18px; font-size: 1.05rem; line-height: 1.7;
     }
     #transcript-box { background: #1a1a1a; border: 1px solid #2a2a2a; color: #ccc; }
@@ -84,12 +85,12 @@
 
   <div class="box" id="transcript-box">
     <div class="label">أنت:</div>
-    <div id="transcript-text"></div>
+    <div id="transcript-text" dir="auto"></div>
   </div>
 
   <div class="box" id="response-box">
     <div class="label">المساعد:</div>
-    <div id="response-text"></div>
+    <div id="response-text" dir="auto"></div>
   </div>
 
   <button id="connect-btn">🎙️</button>
@@ -108,9 +109,10 @@ let playCtx     = null;   // native-rate context — playback only. Decoding the
                           // down and cut everything above 8 kHz (muffled voice).
 let workletNode = null;
 let micStream   = null;
-let connected   = false;
-let serverReady = false;  // gate mic chunks until the server says 'ready' — no point
-                          // streaming audio into a server still loading models
+let connected      = false;
+let serverReady    = false;  // gate mic chunks until the server says 'ready' — no point
+                             // streaming audio into a server still loading models
+let responseBuffer = '';     // accumulates response tokens — avoids O(n) textContent += per token
 
 // Playback: sources are scheduled sample-accurately on playCtx's clock.
 let activeSources = [];
@@ -125,35 +127,13 @@ let isPlaying     = false;
 // voice during double-talk. We learn the residual-echo level while the AI plays and
 // fire only when the mic clearly rises above it for ~160 ms. Stopping the AI also
 // removes the echo, so the server then transcribes your words cleanly.
-let echoBaseline = 0;   // EMA of mic RMS while AI plays and user is quiet
-let bargeHot     = 0;   // consecutive chunks the user is clearly above the echo
-let bargeArmed   = 0;   // playback chunks seen (establish baseline before arming)
-const BARGE_FLOOR  = 0.02;  // ignore near-silence / faint room noise
-const BARGE_FACTOR = 4.0;   // user must exceed the echo baseline by this factor
-const BARGE_STOP   = 5;     // consecutive chunks (~160 ms) to confirm and stop
-const BARGE_ARM    = 5;     // chunks (~160 ms) to learn the echo baseline first
-function resetBargeDetector() { echoBaseline = 0; bargeHot = 0; bargeArmed = 0; }
-function detectBargeIn(buf) {
-  if (!isPlaying || activeSources.length === 0) return;   // only while AI is audible
-  let s = 0; for (let i = 0; i < buf.length; i++) { const v = buf[i]; s += v * v; }
-  const rms = Math.sqrt(s / buf.length);
-  if (bargeArmed < BARGE_ARM) {                            // learn the echo floor first
-    bargeArmed++;
-    echoBaseline = echoBaseline === 0 ? rms : echoBaseline * 0.7 + rms * 0.3;
-    return;
-  }
-  if (rms > Math.max(BARGE_FLOOR, echoBaseline * BARGE_FACTOR)) {
-    if (++bargeHot >= BARGE_STOP) {
-      console.log('[barge-in] user spoke over AI — stopping playback locally');
-      clearAudioQueue();        // stop now, no server round trip
-      sendControl('barge_in');  // tell server to cancel the in-progress turn
-      resetBargeDetector();
-    }
-  } else {
-    bargeHot = 0;
-    echoBaseline = echoBaseline * 0.95 + rms * 0.05;       // keep tracking the echo
-  }
-}
+// Barge-in is handled SERVER-SIDE by the Silero VAD: when the user actually
+// speaks over the AI, the server detects real speech (not breathing/noise) and
+// sends a `speech_start` event, which stops playback (see the onmessage handler).
+// The old client-side RMS energy detector was REMOVED — on a quiet headset mic it
+// had no echo baseline, so its gate collapsed to the tiny BARGE_FLOOR and ordinary
+// breathing/noise (rms ~0.02-0.07) falsely tripped it, cutting the AI off mid-reply.
+// Silero discriminates speech from noise far better than raw loudness ever could.
 
 // Watchdog: the server pings every 3s. If NOTHING arrives for 10s the socket
 // is half-dead (UI stays green but mic audio goes nowhere) → auto-reconnect.
@@ -161,6 +141,7 @@ let lastMsgTime   = 0;
 let watchdogTimer = null;
 let reconnectDelay = 500;   // exponential backoff: 0.5s → 1s → 2s … capped at 10s
 let wantReconnect  = false; // true while the user wants a session (cleared by ⏹️)
+let reconnectTimer = null;  // setTimeout handle — tracked so we can cancel it
 
 // ── DOM ───────────────────────────────────────────────────────────────────────
 const statusEl     = document.getElementById('status');
@@ -176,33 +157,15 @@ function setStatus(text, cls) {
   statusEl.className   = cls || '';
 }
 
-// ── Load model list from server ───────────────────────────────────────────────
+// ── LLM is LOCKED to qwen3.5:27b ────────────────────────────────────────────────
+// The server enforces this (ignores any model param); the UI shows it as the only,
+// fixed option so it can't be changed to a second LLM (which would OOM the GPU).
 async function loadModels() {
-  modelSelect.innerHTML = '<option disabled>Loading...</option>';
-  reloadBtn.disabled = true;
-  try {
-    const res  = await fetch('/models');
-    const data = await res.json();
-    const prev = modelSelect.value;
-    modelSelect.innerHTML = '';
-    const list = (data.models && data.models.length > 0) ? data.models : [data.default];
-    list.forEach(name => {
-      const opt       = document.createElement('option');
-      opt.value       = name;
-      opt.textContent = name;
-      if (name === prev || name === data.default) opt.selected = true;
-      modelSelect.appendChild(opt);
-    });
-    console.log('[models] loaded:', list.length, 'models');
-  } catch (e) {
-    modelSelect.innerHTML = '<option value="">Error loading — click ↻ to retry</option>';
-    console.error('[models] fetch failed:', e);
-  } finally {
-    reloadBtn.disabled = false;
-  }
+  modelSelect.innerHTML = '<option value="qwen3.5:27b">qwen3.5:27b</option>';
+  modelSelect.value = 'qwen3.5:27b';
 }
 
-reloadBtn.addEventListener('click', loadModels);
+reloadBtn.style.display = 'none';   // nothing to reload — model is fixed
 loadModels();
 
 // ── AudioWorklet inline ──────────────────────────────────────────────────────
@@ -289,9 +252,7 @@ async function connect() {
     connecting = false;
     connectBtn.textContent = '⏹️';
     workletNode.port.onmessage = (e) => {
-      // Client-side barge-in runs on every mic chunk (even before serverReady is
-      // irrelevant here — it only fires while AI audio is playing).
-      detectBargeIn(e.data);
+      // Mic chunks stream to the server, which runs VAD/STT and handles barge-in.
       // serverReady gate: don't stream mic audio into a server that is still
       // loading models — it would pile up unread in the socket buffer.
       if (serverReady && ws === sock && sock.readyState === WebSocket.OPEN) sock.send(e.data.buffer);
@@ -311,13 +272,17 @@ async function connect() {
   };
 
   sock.onclose  = (ev) => {
-    // Log the close code so an automatic disconnect is no longer a mystery:
-    // 1000=normal, 1001=tab navigated away, 1005=no code, 1006=abnormal (network/
-    // tunnel drop, no close frame), 1011=server error. Check the console after a drop.
     console.warn('[ws] closed — code=', ev.code, 'reason=', ev.reason || '(none)', 'wasClean=', ev.wasClean);
     if (sock !== ws) return;
     disconnect(false);
-    // Unexpected close (server restart, network blip, tunnel drop) — retry with backoff.
+    if (ev.code === 4001) {
+      // Server sent "superseded" — another tab or reconnect took over this session.
+      // Do NOT reconnect; the other tab is now active. Just show a quiet status.
+      wantReconnect = false;
+      setStatus('الجلسة نشطة في نافذة أخرى', '');
+      return;
+    }
+    // Any other unexpected close (server restart, network blip, tunnel drop) — retry.
     if (wantReconnect) {
       setStatus('انقطع الاتصال — إعادة الاتصال...', 'processing');
       scheduleReconnect();
@@ -325,19 +290,24 @@ async function connect() {
   };
   sock.onerror  = () => { if (sock === ws) setStatus('⚠️ خطأ في الاتصال', ''); };
   sock.onmessage = (e) => { if (sock === ws) handleMessage(e); };
-  connecting = false;
+  // NOTE: connecting is reset to false inside sock.onopen (on success) or inside
+  // disconnect() (on failure/close). Do NOT reset it here — this function returns
+  // before onopen fires, so resetting here creates a window where a second connect()
+  // call can slip through while the first socket is still being established.
 }
 
 function scheduleReconnect() {
-  setTimeout(() => connect(), reconnectDelay);
+  if (reconnectTimer) return;  // already pending — don't double-schedule
   reconnectDelay = Math.min(reconnectDelay * 2, 10000);
+  reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, reconnectDelay);
 }
 
 function disconnect(stopServer = true) {
   connected   = false;
   connecting  = false;
   serverReady = false;
-  if (watchdogTimer) { clearInterval(watchdogTimer); watchdogTimer = null; }
+  if (watchdogTimer)  { clearInterval(watchdogTimer);  watchdogTimer  = null; }
+  if (reconnectTimer) { clearTimeout(reconnectTimer);  reconnectTimer = null; }
   connectBtn.textContent = '🎙️';
   connectBtn.className   = '';
   connectBtn.disabled    = false;   // re-enable even if we dropped mid-'loading'
@@ -392,13 +362,18 @@ function handleMessage(event) {
     setStatus('تتحدث...', 'speaking');
   }
   if (msg.event === 'transcript') {
+    clearAudioQueue();               // stop any lingering audio from the previous turn
     transcriptEl.textContent = msg.text;
-    responseEl.textContent   = '';   // new turn starts now
+    responseBuffer           = '';
+    responseEl.textContent   = '';
     connectBtn.className     = 'connected';
     setStatus('جاري التفكير...', 'processing');
   }
   if (msg.event === 'token') {
-    responseEl.textContent += msg.text;
+    responseBuffer += msg.text;
+    responseEl.textContent = responseBuffer;
+    const box = document.getElementById('response-box');
+    box.scrollTop = box.scrollHeight;
   }
   if (msg.event === 'tts_end') {
     // Only reset to listening immediately if nothing is playing — otherwise
@@ -413,11 +388,11 @@ function handleMessage(event) {
 // ── Audio playback: ordered decode, gapless sample-accurate scheduling ────────
 const SEAM_OVERLAP = 0.05;  // swallow LAME encoder padding between sentence MP3s
 
-function sendControl(event) {
+function sendControl(event, extra) {
   // Tells the server the real client-side playback state, so barge-in stays
   // strict while the AI is still audible (even after the server turn ended).
   if (ws && ws.readyState === WebSocket.OPEN) {
-    try { ws.send(JSON.stringify({ event })); } catch (_) {}
+    try { ws.send(JSON.stringify(Object.assign({ event }, extra || {}))); } catch (_) {}
   }
 }
 
@@ -443,7 +418,6 @@ function queueMp3(arrayBuffer) {
 
     if (activeSources.length === 0) {
       sendControl('playback_start');
-      resetBargeDetector();   // re-learn the echo baseline at the start of each reply
     }
     activeSources.push(src);
     isPlaying = true;

@@ -58,7 +58,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 sys.path.insert(0, os.path.dirname(__file__))
-import tts_silma_v1  # type: ignore[import-untyped]
+import tts_omnivoice_v1  # type: ignore[import-untyped]  # in-process OmniVoice TTS
 import time as _time
 import datetime
 
@@ -68,6 +68,12 @@ OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"       # conversation turns (
 MAX_HISTORY_TURNS = 3   # rolling memory: keep only the last N user+assistant pairs per connection.
                         # Lowered 6 → 3 — less context re-sent each turn = faster qwen3.5:27b prefill,
                         # while still covering normal follow-ups ("what about X", "وش يعني؟").
+
+# qwen3.5 context window (KV cache size). Default 8192 keeps VRAM low for the in-process
+# stack; raise it (e.g. LLM_NUM_CTX=16384) as the team's prompts/reasoning grow — the
+# q8_0 KV cache in start_server.sh makes a bigger context affordable. Used by BOTH the
+# warm-up and the chat requests so the model loads once at this size (no reload).
+LLM_NUM_CTX = int(os.environ.get("LLM_NUM_CTX", "8192"))
 LOG_DIR      = os.path.join(os.path.dirname(__file__), "logs")
 PERF_LOG     = os.path.join(LOG_DIR, "interactions.jsonl")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -79,6 +85,25 @@ def _write_log(entry: dict[str, Any]) -> None:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception as e:
         print(f"  [log] write error: {e}")
+
+
+# ── TEMP DIAGNOSTIC: trace what stops AI playback mid-reply ──────────────────
+# Captures which barge-in path fires (server VAD vs client detector vs disconnect)
+# and the measured noise level, to logs/barge_diag.log. REMOVE once the cause is fixed.
+_BARGE_DIAG = os.path.join(LOG_DIR, "barge_diag.log")
+def _diag(msg: str) -> None:
+    try:
+        with open(_BARGE_DIAG, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.datetime.now().isoformat(timespec='milliseconds')} {msg}\n")
+    except Exception:
+        pass
+# Single-connection enforcement: only one active WebSocket session at a time.
+# When a new browser connects, the old session is closed with code 4001 ("superseded")
+# so the old tab knows NOT to reconnect — prevents the ping-pong loop where each
+# reconnect kills the just-established session, triggering another reconnect.
+_active_ws_task: Optional[asyncio.Task] = None
+_active_ws_ref:  Optional[Any]          = None   # raw WebSocket for the close-4001 signal
+
 MODEL       = "qwen3.5:27b"   # default model — warmed at startup so the first turn isn't a cold load.
                               # ALLaM stays selectable in the browser dropdown for sub-2s responses.
 SYSTEM_PROMPT = (
@@ -138,9 +163,9 @@ _denoiser:      Any = None   # ClearVoice FRCRN — None if failed to load
 def _load_all_blocking():
     global _vad_model, _whisper_model, _denoiser
 
-    print("Loading Silma TTS...")
-    tts_silma_v1.load_models()
-    print("Silma TTS ready.")
+    print("Loading OmniVoice TTS...")
+    tts_omnivoice_v1.load_models()
+    print("OmniVoice TTS ready.")
 
     print("Loading Silero VAD...")
     _vad_model, _ = torch.hub.load(  # type: ignore[misc]
@@ -152,7 +177,9 @@ def _load_all_blocking():
 
     print("Loading faster-whisper large-v3...")
     from faster_whisper import WhisperModel  # type: ignore[import-untyped]
-    _whisper_model = WhisperModel("large-v3", device="cuda", compute_type="float16")
+    # int8_float16: ~1.5 GB less VRAM than float16, still large-v3, negligible accuracy
+    # impact — frees headroom for the in-process OmniVoice + qwen3.5 on one 32 GB GPU.
+    _whisper_model = WhisperModel("large-v3", device="cuda", compute_type="int8_float16")
     print("faster-whisper ready.")
 
     print("Loading FRCRN denoiser...")
@@ -181,7 +208,10 @@ async def _warm_llm(model: str = MODEL) -> None:
                 "prompt":     "hi",
                 "stream":     False,
                 "keep_alive": -1,
-                "options":    {"num_predict": 1},
+                # MUST match the chat requests' num_ctx — otherwise warm-up loads the model
+                # at the default 32k context and the first chat request forces a costly
+                # reload (and, while pinned, risks a double-load OOM).
+                "options":    {"num_predict": 1, "num_ctx": LLM_NUM_CTX},
             })
             resp.raise_for_status()
         print(f"LLM warmed: {model}")
@@ -575,28 +605,34 @@ _INJECTION_RE = re.compile(
 )
 
 
-_FRCRN_MIN_FREE_MB = 200   # skip denoising if less than this much VRAM is free
+_FRCRN_MIN_FREE_MB  = 150   # skip denoising if less than this much VRAM is free after cache flush
+_FRCRN_MAX_SAMPLES  = SAMPLE_RATE * 4   # skip denoising for clips longer than 4 s —
+                                         # FRCRN VRAM scales with length; longer clips
+                                         # OOM on this GPU (qwen3.5:27b + OmniVoice loaded).
+                                         # Whisper large-v3 handles longer clips fine without it.
 
 def _denoise_blocking(audio: Any) -> Any:
     global _denoiser
     if _denoiser is None:
         return audio
-    # Proactive check: if VRAM is too fragmented/full (e.g. qwen3.5:27b loaded),
-    # skip denoising for this utterance rather than OOMing or waiting 39s on CPU.
+    if len(audio) > _FRCRN_MAX_SAMPLES:
+        return audio   # long clip — skip denoising, pass straight to Whisper
     if torch.cuda.is_available():
+        # Flush PyTorch's reserved pool BEFORE checking so mem_get_info() reflects
+        # truly available VRAM, not memory still held from the last TTS synthesis.
+        torch.cuda.empty_cache()
         free_bytes, _ = torch.cuda.mem_get_info()
         if free_bytes < _FRCRN_MIN_FREE_MB * 1024 * 1024:
             return audio
     try:
-        # FRCRN expects (batch, samples) — reshape 1D audio before passing in
         result = _denoiser(audio.reshape(1, -1))  # type: ignore[call-overload]
         if isinstance(result, np.ndarray) and result.size > 0:
             return result.squeeze()
     except Exception as e:
         print(f"Denoiser error (passing audio through): {e}")
         if "out of memory" in str(e).lower():
-            # Flush the failed CUDA allocation so Whisper can still get memory.
             try:
+                gc.collect()
                 torch.cuda.empty_cache()
             except Exception:
                 pass
@@ -654,7 +690,6 @@ def _transcribe_blocking(audio: Any) -> tuple[str, str]:
             print(f"  whisper: remapped {lang} → en (Latin script only)")
             lang = "en"
 
-    torch.cuda.empty_cache()   # release Whisper's activation memory
     return text, lang
 
 
@@ -680,7 +715,12 @@ MODEL_CONFIGS: dict[str, dict[str, Any]] = {
             "top_p":            0.8,
             "top_k":            20,
             "presence_penalty": 1.5,
-            "num_predict":      300,
+            "num_predict":      300,   # 300 was truncating mid-sentence on longer answers (~170 Arabic words)
+            # Context window (default 8192 via LLM_NUM_CTX). The default-32768 KV cache
+            # OOM'd with OmniVoice in-process on one 32 GB GPU; 8192 fits the prompt
+            # (system + 3-turn memory + reply ≈ 2.5k tokens) with room to spare. Raise via
+            # the LLM_NUM_CTX env var as prompts grow (q8_0 KV cache makes it affordable).
+            "num_ctx":          LLM_NUM_CTX,
             "stop":             _STOP_SEQUENCES,
         },
     },
@@ -832,10 +872,31 @@ class _LockedWS:
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket, model: str = MODEL):
+    global _active_ws_task, _active_ws_ref
     await ws.accept()
+    # Single-connection policy: supersede the previous session (if any).
+    old_task   = _active_ws_task
+    old_ws_raw = _active_ws_ref
+    _active_ws_task = asyncio.current_task()
+    _active_ws_ref  = ws          # raw, before _LockedWS wrap
+    if old_task and not old_task.done():
+        # Send close code 4001 ("superseded") to the old tab BEFORE cancelling.
+        # The old browser sees 4001 in onclose and does NOT reconnect — breaks
+        # the ping-pong loop that happens when task.cancel() alone is used.
+        async def _close_old():
+            if old_ws_raw:
+                try:
+                    await old_ws_raw.close(code=4001, reason="superseded")
+                except Exception:
+                    pass
+            if not old_task.done():
+                old_task.cancel()
+        asyncio.create_task(_close_old())
     ws = _LockedWS(ws)  # all subsequent sends are serialized
-    active_model = model if model else MODEL
-    print(f"Browser connected. Model: {active_model}  TTS: silma")
+    # LLM is LOCKED to qwen3.5:27b — ignore any browser-supplied model. (Prevents a
+    # second LLM, e.g. ALLaM, loading alongside the pinned 27B and OOMing the GPU.)
+    active_model = MODEL
+    print(f"Browser connected. Model: {active_model}  TTS: omnivoice")
 
     # Keepalive starts BEFORE the model-loading wait: a cold start takes minutes
     # and the browser watchdog reconnects after 10 s of silence — pings must
@@ -881,6 +942,10 @@ async def websocket_endpoint(ws: WebSocket, model: str = MODEL):
         # Only cancel if AI is already playing audio (true barge-in).
         # While AI is still thinking (ai_active but not ai_speaking), let the
         # LLM finish so the user actually gets a response.
+        if ai_speaking or client_playing:
+            _diag(f"[SERVER-VAD] speech_start fired while AI AUDIBLE "
+                  f"(ai_speaking={ai_speaking}, client_playing={client_playing}) "
+                  f"-> client clearAudioQueue() STOPS PLAYBACK")
         if ai_speaking:
             cancel_event.set()
         try:
@@ -904,6 +969,8 @@ async def websocket_endpoint(ws: WebSocket, model: str = MODEL):
                     # 1001=tab closed/navigated away, 1006=abnormal (tunnel/network drop),
                     # 1011=server error. This is the missing piece for diagnosing auto-closes.
                     print(f"  receive_loop: websocket.disconnect code={msg.get('code')}")
+                    _diag(f"[WS-DISCONNECT] code={msg.get('code')} "
+                          f"(ai_active={ai_active}, ai_speaking={ai_speaking}, client_playing={client_playing})")
                     break
                 text_payload = msg.get("text")
                 if text_payload:
@@ -922,6 +989,12 @@ async def websocket_endpoint(ws: WebSocket, model: str = MODEL):
                         # detection that works on speakers) and already stopped playback.
                         # Cancel any in-progress turn; the user's utterance is captured by
                         # the normal VAD/STT path next (now echo-free, so it's clean).
+                        try:
+                            _bp = json.loads(text_payload)
+                        except Exception:
+                            _bp = {}
+                        _diag(f"[CLIENT-BARGE] barge_in received {_bp} "
+                              f"(ai_active={ai_active}, ai_speaking={ai_speaking}, client_playing={client_playing})")
                         if ai_active or ai_speaking:
                             cancel_event.set()
                         client_playing = False
@@ -934,6 +1007,7 @@ async def websocket_endpoint(ws: WebSocket, model: str = MODEL):
                 if audio is not None:
                     if ai_speaking:
                         # True barge-in: AI is actively playing audio — cancel it.
+                        _diag("[SERVER-UTTERANCE] full utterance completed while ai_speaking -> cancel turn")
                         cancel_event.set()
                     if ai_active:
                         # AI is busy (thinking or speaking) — drain queue so the
@@ -979,6 +1053,7 @@ async def websocket_endpoint(ws: WebSocket, model: str = MODEL):
             if "disconnect" not in str(e).lower():
                 print(f"receive_loop: {e}")
         finally:
+            cancel_event.set()                  # stop in-progress LLM/TTS immediately
             await utterance_queue.put(None)     # sentinel — stops respond_loop
 
     # ── respond_loop: takes utterances, runs LLM + TTS ───────────────────────
@@ -1096,7 +1171,7 @@ async def websocket_endpoint(ws: WebSocket, model: str = MODEL):
                         await inner.aclose()
 
                 try:
-                    await tts_silma_v1.stream_tts_to_ws(  # type: ignore[no-untyped-call]
+                    await tts_omnivoice_v1.stream_tts_to_ws(  # type: ignore[no-untyped-call]
                         token_gen=_collecting_token_gen(),
                         ws=ws,
                         cancel_event=cancel_event,
@@ -1105,15 +1180,16 @@ async def websocket_endpoint(ws: WebSocket, model: str = MODEL):
                     t_done = _time.monotonic()
 
                     final_response = "".join(response_tokens).strip()
-                    if not final_response:
+                    if not final_response and not cancel_event.is_set():
                         # LLM produced no visible text (e.g. thinking-only response) —
                         # send a fallback so the user knows the model heard them.
                         # Not stored in history (it isn't a real answer).
+                        # Guard: skip fallback if barge-in fired — the user already
+                        # spoke again and hearing "I didn't catch that" over their
+                        # next utterance is confusing.
                         fallback = "I didn't catch that. Could you please repeat?" if lang != "ar" else "عذراً، لم أفهم. ممكن تعيد؟"
                         print(f"  [warn] empty LLM response — sending fallback")
-                        # stream_tts_to_ws emits the token event itself — sending
-                        # it here too rendered the fallback text twice in the UI.
-                        await tts_silma_v1.stream_tts_to_ws(  # type: ignore[no-untyped-call]
+                        await tts_omnivoice_v1.stream_tts_to_ws(  # type: ignore[no-untyped-call]
                             token_gen=_single_token(fallback),
                             ws=ws,
                             cancel_event=cancel_event,
@@ -1125,9 +1201,13 @@ async def websocket_endpoint(ws: WebSocket, model: str = MODEL):
                         # Barge-in (cancelled, partial answer) is intentionally NOT stored.
                         history.append({"role": "user", "content": text})
                         history.append({"role": "assistant", "content": final_response})
-                        if len(history) > MAX_HISTORY_TURNS * 2:
+                        if len(history) >= MAX_HISTORY_TURNS * 2:
                             del history[: len(history) - MAX_HISTORY_TURNS * 2]
 
+                    if final_response:
+                        # OmniVoice (unlike Silma) prints nothing during synthesis, so log
+                        # the assistant's reply here for terminal visibility (also in logs/).
+                        print(f"  response [{lang}]: {final_response}")
                     print("LLM/TTS done.")
 
                     llm_ttft_ms    = int((t_first_token  - t_llm_start) * 1000) if t_first_token  else None
@@ -1164,15 +1244,27 @@ async def websocket_endpoint(ws: WebSocket, model: str = MODEL):
                 finally:
                     ai_active   = False
                     ai_speaking = False
-                    torch.cuda.empty_cache()
+                    # Release PyTorch's reserved-but-unallocated VRAM (OmniVoice scratch
+                    # tensors) back to the OS so the next utterance's denoiser and Whisper
+                    # have room. Model weights stay in VRAM — only the allocator slack is freed.
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
         except Exception as e:
             print(f"respond_loop: {e}")
 
     try:
         await asyncio.gather(receive_loop(), respond_loop())
+    except asyncio.CancelledError:
+        pass   # normal: this session was cancelled by single-connection enforcement
+               # (a new tab or reconnect superseded us). Cleanup runs in finally.
     finally:
         keepalive_task.cancel()
         cancel_event.set()
+        if _active_ws_task is asyncio.current_task():
+            _active_ws_task = None
+            _active_ws_ref  = None
         print("Browser disconnected.")
 
 
