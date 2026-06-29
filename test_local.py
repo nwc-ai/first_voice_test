@@ -1,9 +1,9 @@
 """
-test_local.py — Full pipeline test for tts_silma_v1.py
-=====================================================
+test_local.py — Full pipeline test for tts_omnivoice_v1.py
+===========================================================
 No microphone needed. This script:
   1. Sends a hardcoded question to Ollama (qwen3.5:27b) as the LLM
-  2. Streams the LLM tokens through tts_silma_v1.py
+  2. Streams the LLM tokens through tts_omnivoice_v1.py
   3. Saves each synthesized sentence as an MP3 file in ./test_output/
   4. Prints timing info so you can see how fast each step is
 
@@ -18,9 +18,9 @@ import time
 
 import httpx
 
-# Add project root to path so we can import tts_silma_v1
+# Add project root to path so we can import tts_omnivoice_v1
 sys.path.insert(0, os.path.dirname(__file__))
-import tts_silma_v1
+import tts_omnivoice_v1
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "test_output")
 OLLAMA_URL = "http://localhost:11434/api/generate"
@@ -97,10 +97,10 @@ async def run_test():
     print(f"Question: {TEST_PROMPT}")
     print()
 
-    # Step 1: Warm up the Silma model (loads it into GPU memory)
-    print("Loading Silma TTS model into GPU... (this takes ~15 seconds the first time)")
+    # Step 1: Warm up the OmniVoice model (loads it into GPU memory)
+    print("Loading OmniVoice TTS model into GPU... (this takes ~15 seconds the first time)")
     t0 = time.perf_counter()
-    await asyncio.to_thread(tts_silma_v1.load_models)
+    await asyncio.to_thread(tts_omnivoice_v1.load_models)
     print(f"Model loaded in {time.perf_counter() - t0:.1f}s\n")
 
     # Step 2: Run the full pipeline
@@ -120,7 +120,7 @@ async def run_test():
     print("LLM response (streaming):")
     print("-" * 40)
 
-    await tts_silma_v1.stream_tts_to_ws(
+    await tts_omnivoice_v1.stream_tts_to_ws(
         token_gen=ollama_token_gen(TEST_PROMPT),
         ws=ws,
         cancel_event=cancel_event,

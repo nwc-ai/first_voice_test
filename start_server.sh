@@ -1,6 +1,15 @@
 #!/bin/bash
 # Run this to start the voice server.
 # Usage: bash /home/taha/first_voice_test/start_server.sh
+#
+# Remote access (browser → server) is via an SSH port-forward tunnel. A 1006/1005
+# WebSocket close almost always means the TUNNEL dropped (laptop sleep, wifi change,
+# or an sshd idle timeout) — not an app bug; the browser auto-reconnects. Keep the
+# tunnel alive with SSH keepalives, e.g. from your laptop:
+#   ssh -L 8765:localhost:8765 \
+#       -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ExitOnForwardFailure=yes \
+#       taha@devserver
+# (or set ServerAliveInterval/ServerAliveCountMax under `Host devserver` in ~/.ssh/config).
 
 VENV=/home/taha/first_voice_test/.venv/lib/python3.12/site-packages/nvidia
 OLLAMA_NEW=/home/taha/.ollama_bin_new

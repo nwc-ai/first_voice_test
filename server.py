@@ -1,7 +1,7 @@
 """
 server.py — Real-architecture voice pipeline for first_voice_test
 =================================================================
-Matches the architecture in REALTIME_VOICE_ARCHITECTURE.md:
+Architecture (full in-process voice pipeline):
   - AudioWorklet: continuous 512-sample Float32 chunks at 16kHz
   - Silero VAD: server-side speech onset/end detection
   - Two loops: receive_loop (VAD+STT) + respond_loop (LLM+TTS)
@@ -104,8 +104,11 @@ def _diag(msg: str) -> None:
 _active_ws_task: Optional[asyncio.Task] = None
 _active_ws_ref:  Optional[Any]          = None   # raw WebSocket for the close-4001 signal
 
-MODEL       = "qwen3.5:27b"   # default model — warmed at startup so the first turn isn't a cold load.
-                              # ALLaM stays selectable in the browser dropdown for sub-2s responses.
+MODEL       = "qwen3.5:27b"   # the ONLY model — hard-locked in BOTH the UI (static/index.html
+                              # fixes the dropdown) and the server (active_model = MODEL ignores
+                              # the browser param). A second LLM alongside the pinned 27B + the
+                              # in-process OmniVoice would OOM the 32 GB GPU. Warmed at startup so
+                              # the first turn isn't a cold load.
 SYSTEM_PROMPT = (
     "You are a voice assistant that supports Arabic dialects and English ONLY. "
     "ABSOLUTE RULES — never break these: "
@@ -116,9 +119,10 @@ SYSTEM_PROMPT = (
     "2. If the user speaks Arabic → detect their exact dialect and reply in that SAME dialect: "
     "   Najdi (نجدي): use وش/إيش, أبغى, زين, الحين, ماله, يبيلك — "
     "   Hijazi (حجازي): use إيش, وين, كيف, بدي, تعال, ما عندي — "
+    "   Egyptian (مصري): use إزاي, عايز/عاوز, دلوقتي, مش, كده, علشان, ده/دي — "
     "   Gulf/Khaleeji (خليجي): use شلونك, وايد, يبه, زين, ما أدري. "
     "3. If the user mixes Arabic and English (code-switching) → reply in the same natural mix, matching their Arabic dialect. "
-    "4. If Arabic dialect is unclear → use Modern Standard Arabic. "
+    "4. If the specific Arabic dialect is unclear → DEFAULT to the Egyptian dialect (مصري), not Fusha. "
     "5. NEVER mix two Arabic dialects in one response. "
     "6. NEVER use Chinese, Japanese, Korean, Cyrillic, Vietnamese or any non-Arabic/Latin script. "
     "7. ALWAYS reply in complete, natural spoken sentences — never single words or bare fragments. "
@@ -128,7 +132,7 @@ SYSTEM_PROMPT = (
     "8. Use proper punctuation — REQUIRED for natural speech rhythm: "
     "   commas (،) for pauses, periods (.) to end sentences, "
     "   question marks (؟) for questions, exclamation marks (!) for emphasis. "
-    "9. NO markdown — no *, #, -, lists, or headers. Plain flowing sentences only. "
+    "9. NO markdown — no *, #, or headers."
     "10. NEVER start ANY response with filler openers like: Sure, Of course, Certainly, Absolutely, Great, Of course, Happy to help, I'd be happy to. "
     "    Jump straight into the answer. "
     "11. NEVER ask the user for clarification. NEVER say 'could you clarify' or 'which aspect'. "
@@ -244,18 +248,6 @@ async def index():
         os.path.join(STATIC_DIR, "index.html"),
         headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
     )
-
-
-@app.get("/models")
-async def list_models() -> dict[str, Any]:
-    try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            resp = await client.get("http://localhost:11434/api/tags")
-            resp.raise_for_status()
-            models: list[str] = [m["name"] for m in resp.json().get("models", [])]
-            return {"models": models, "default": MODEL}
-    except Exception:
-        return {"models": [MODEL], "default": MODEL}
 
 
 @app.get("/logs")
@@ -534,12 +526,14 @@ _WANTS_ENGLISH_RE = re.compile(
 )
 
 # Specific Arabic dialect requests, checked when the user asks for Arabic output.
-# First match wins; falls back to Fusha/MSA when no dialect is named.
+# First match wins; the caller defaults to Egyptian when no dialect is named.
 _DIALECT_PATTERNS: list[tuple[str, Any, str]] = [
     ("Najdi", re.compile(r"\bnajdi\b|نجدي|النجدية", re.IGNORECASE | re.UNICODE),
      "the Najdi dialect (use وش/إيش, أبغى, زين, الحين, ماله, يبيلك)"),
     ("Hijazi", re.compile(r"\bhi?jazi\b|\bhejazi\b|حجازي|الحجازية", re.IGNORECASE | re.UNICODE),
      "the Hijazi dialect (use إيش, وين, كيف, بدي, تعال, ما عندي)"),
+    ("Egyptian", re.compile(r"\begyptian\b|\bmasri\b|مصري|المصري|المصرية|مصرية", re.IGNORECASE | re.UNICODE),
+     "the Egyptian dialect (use إزاي, عايز/عاوز, دلوقتي, مش, كده, علشان, ده/دي)"),
     ("Gulf", re.compile(r"\bgulf\b|\bkhal[ei]+ji\b|\bkhaleeji\b|خليجي|الخليجية", re.IGNORECASE | re.UNICODE),
      "the Gulf/Khaleeji dialect (use شلونك, وايد, يبه, زين, ما أدري)"),
     ("Fusha", re.compile(r"\bfus-?ha\b|\bmsa\b|modern\s+standard|classical\s+arabic|الفصحى|فصحى",
@@ -548,11 +542,39 @@ _DIALECT_PATTERNS: list[tuple[str, Any, str]] = [
 ]
 
 def _requested_dialect(text: str) -> Optional[str]:
-    """Return a phrase describing the requested Arabic dialect, or None for default (Fusha)."""
+    """Return a phrase describing the requested Arabic dialect, or None when none is named (caller defaults to Egyptian)."""
     for _name, pattern, phrase in _DIALECT_PATTERNS:
         if pattern.search(text):
             return phrase
     return None
+
+# Najdi vs Hijazi DISTINGUISHING markers (from the shared Saudi-slang glossary) — used to detect
+# which dialect the user actually SPOKE, so the reply commits to the same one instead of guessing.
+# Words shared by both dialects (وين، ليش، بعدين، خلاص، يلا، بس، مرة) carry no signal and are
+# deliberately excluded. Whole-word matching only (no substrings). Hamza/no-hamza variants included
+# because both users and STT vary on it.
+_NAJDI_MARKERS    = {"وش", "أبغى", "ابغى", "الحين", "زين", "ماله", "يبيلك", "صج", "عاد", "هيه", "أدري", "ادري"}
+_HIJAZI_MARKERS   = {"إيش", "ايش", "أبي", "ابي", "دحين", "هلا", "تمام", "إيوه", "أيوه", "ايوه", "مشكور", "كيفك"}
+# Egyptian (Cairene/Delta) markers — مش/ده/دي (negation + demonstratives), إزاي, عايز, دلوقتي, كده,
+# علشان. Distinct from the Saudi dialects and very reliable; Egyptian is the most data-rich dialect.
+_EGYPTIAN_MARKERS = {"إزاي", "ازاي", "إزيك", "ازيك", "عايز", "عاوز", "عايزة", "دلوقتي", "دلوقت", "مش",
+                     "كده", "كدا", "علشان", "عشان", "ده", "دي", "دول", "النهاردة", "إمبارح", "امبارح", "أهو"}
+_AR_WORD_SPLIT_RE = re.compile(r"[^؀-ۿ]+")  # split on any run of non-Arabic-letter chars
+
+def _detect_dialect(text: str) -> Optional[str]:
+    """Lexically classify spoken Arabic as 'Najdi' / 'Hijazi' / 'Egyptian' by counting distinguishing
+    marker words. Returns None when unclear OR tied (caller defaults to Egyptian) — short utterances
+    rarely carry a marker and many words are shared, so 'unclear' is the common, intended case."""
+    words  = {w for w in _AR_WORD_SPLIT_RE.split(text) if w}
+    scores = {
+        "Najdi":    len(words & _NAJDI_MARKERS),
+        "Hijazi":   len(words & _HIJAZI_MARKERS),
+        "Egyptian": len(words & _EGYPTIAN_MARKERS),
+    }
+    top = max(scores.values())
+    if top == 0 or sum(1 for v in scores.values() if v == top) > 1:
+        return None   # no markers, or a tie between dialects → unclear → caller defaults to Egyptian
+    return max(scores, key=scores.get)
 
 # Whisper mistakes Arabic for these languages — remap them all to ar.
 # Includes Arabic-script langs (ur/fa/ps/ug/sd) AND Punjabi (pa) which Whisper
@@ -648,7 +670,20 @@ _TRANSCRIBE_KWARGS: dict[str, Any] = dict(
     vad_filter=True,
     vad_parameters={"min_silence_duration_ms": 300},
     word_timestamps=True,
+    # Decoder-level anti-hallucination, safe for en/ar/mixed (constrains repetition, NOT vocabulary):
+    # kills ASR stuck-loops ("ا ا ا", "هل هل هل") and run-on boilerplate at the source, complementing
+    # the post-hoc _REPETITION_RE filter in receive_loop. Verified params in faster-whisper 1.1.1.
+    no_repeat_ngram_size=3,
+    repetition_penalty=1.1,
 )
+
+# Dialect marker vocabulary fed to Whisper as `hotwords` ONLY on a forced-Arabic pass (never on
+# pass-1 auto-detect or English) — once we've committed to Arabic, this biases the decoder toward
+# Saudi-dialect spelling (وش/أبغى/الحين …) instead of MSA-normalizing it. Same marker set as
+# SYSTEM_PROMPT / _DIALECT_PATTERNS. NOTE: broadening this to a re-pass on ALL auto-detected Arabic,
+# and splitting WORD_CONF_THRESHOLD per-language, are deferred until the Phase-5 eval harness yields
+# labeled dialect data — lowering the gate blindly admits more (confident) hallucinations.
+_AR_HOTWORDS = "وش إيش أبغى أبي ليش وين الحين دحين هلا زين تمام عاد صج مرة مشكور كيفك ماله يبيلك ما أدري ما أعرف خلاص يلا بدي تعال شلون وايد يبه إزاي إزيك عايز عاوز دلوقتي مش كده علشان عشان ده دي دول النهاردة إمبارح"
 
 def _transcribe_blocking(audio: Any) -> tuple[str, str]:
     # First pass: auto language detection
@@ -660,10 +695,10 @@ def _transcribe_blocking(audio: Any) -> tuple[str, str]:
         # Whisper confused Arabic with an Arabic-script language and transcribed
         # in Urdu/Farsi text. Re-run with language="ar" forced so we get proper
         # Arabic script output instead of Urdu Nastaliq.
-        print(f"  whisper: remapped {lang} → ar, re-transcribing in Arabic")
+        print(f"  whisper: remapped {lang} → ar, re-transcribing in Arabic (dialect-biased)")
         lang = "ar"
         segments, _ = _whisper_model.transcribe(
-            audio, language="ar", **_TRANSCRIBE_KWARGS
+            audio, language="ar", hotwords=_AR_HOTWORDS, **_TRANSCRIBE_KWARGS
         )
 
     threshold = LANG_PROB_THRESHOLD_AR if lang == "ar" else LANG_PROB_THRESHOLD
@@ -699,8 +734,10 @@ def _transcribe_blocking(audio: Any) -> tuple[str, str]:
 # "extra" fields are merged directly into the Ollama payload (e.g. think:False).
 
 _STOP_SEQUENCES       = ["User:", "user:", "\nUser", "\nالمستخدم:", "Human:", "\nHuman"]
-_ALLAM_STOP_SEQUENCES = _STOP_SEQUENCES + ["<|im_end|>", "<|im_start|>", "<|endoftext|>"]
 
+# Only qwen3.5 (the locked model) and "default" (fallback if MODEL is ever renamed) remain.
+# The prior per-model configs (qwen3/qwen2.5/allam/silma/falcon) were removed with the
+# model-switching machinery — they live on the `multi-engine-snapshot` branch if needed.
 MODEL_CONFIGS: dict[str, dict[str, Any]] = {
     "qwen3.5": {
         # think:False — voice needs direct, fast answers. With thinking ON the
@@ -722,57 +759,6 @@ MODEL_CONFIGS: dict[str, dict[str, Any]] = {
             # the LLM_NUM_CTX env var as prompts grow (q8_0 KV cache makes it affordable).
             "num_ctx":          LLM_NUM_CTX,
             "stop":             _STOP_SEQUENCES,
-        },
-    },
-    "qwen3": {
-        "extra":   {"think": False},
-        "options": {
-            "temperature":      0.7,
-            "top_p":            0.8,
-            "top_k":            20,
-            "presence_penalty": 1.5,
-            "num_predict":      300,
-            "stop":             _STOP_SEQUENCES,
-        },
-    },
-    "qwen2.5": {
-        "extra":   {},
-        "options": {
-            "temperature": 0.7,
-            "top_p":       0.9,
-            "top_k":       40,
-            "num_predict": 300,
-            "stop":        _STOP_SEQUENCES,
-        },
-    },
-    "allam": {
-        "extra":   {},
-        "options": {
-            "temperature": 0.4,   # 0.6 → 0.4: ALLaM placed Dubai's Al Fahidi in Riyadh; lower temp grounds it
-            "top_p":       0.95,
-            "top_k":       50,
-            "num_predict": 300,
-            "stop":        _ALLAM_STOP_SEQUENCES,
-        },
-    },
-    "silma": {
-        "extra":   {},
-        "options": {
-            "temperature": 0.9,
-            "top_p":       0.95,
-            "top_k":       40,
-            "num_predict": 300,
-            "stop":        _STOP_SEQUENCES,
-        },
-    },
-    "falcon": {
-        "extra":   {},
-        "options": {
-            "temperature": 0.7,
-            "top_p":       0.9,
-            "top_k":       40,
-            "num_predict": 300,
-            "stop":        _STOP_SEQUENCES,
         },
     },
     "default": {
@@ -985,6 +971,10 @@ async def websocket_endpoint(ws: WebSocket, model: str = MODEL):
                     elif evt == "playback_done":
                         client_playing = False
                     elif evt == "barge_in":
+                        # NOTE: the CURRENT browser client never sends this — real barge-in
+                        # runs entirely via server Silero VAD → speech_start. Kept as a hook
+                        # for a future client-side barge-in detector (the old RMS one was
+                        # removed for false-tripping on breathing; see static/index.html).
                         # The browser detected the user talking over the AI (fast local
                         # detection that works on speakers) and already stopped playback.
                         # Cancel any in-progress turn; the user's utterance is captured by
@@ -1087,7 +1077,13 @@ async def websocket_endpoint(ws: WebSocket, model: str = MODEL):
                 wants_arabic = req_dialect is not None or bool(_WANTS_ARABIC_RE.search(text))
 
                 if wants_arabic:
-                    dialect = req_dialect or "Modern Standard Arabic (Fusha)"
+                    dialect = req_dialect or "the Egyptian dialect (مصري)"
+                    tts_voice = "egyptian" if ("Egyptian" in dialect or "مصري" in dialect) else "saudi"
+                    if   "Egyptian" in dialect or "مصري" in dialect: tts_language = "egyptian arabic"
+                    elif "Najdi" in dialect:                          tts_language = "najdi arabic"
+                    elif "Hijazi" in dialect:                         tts_language = "hijazi arabic"
+                    elif "Gulf" in dialect or "Khaleeji" in dialect:  tts_language = "gulf arabic"
+                    else:                                             tts_language = "standard arabic"
                     print(f"  [lang] explicit Arabic request → {dialect}")
                     lang_instruction = (
                         "The user EXPLICITLY asked you to reply in Arabic — honor this "
@@ -1095,28 +1091,64 @@ async def websocket_endpoint(ws: WebSocket, model: str = MODEL):
                         f"using {dialect}. Do NOT refuse and do NOT reply in English."
                     )
                 elif _WANTS_ENGLISH_RE.search(text):
+                    tts_voice = "saudi"
+                    tts_language = None
                     print("  [lang] explicit English request")
                     lang_instruction = (
                         "The user EXPLICITLY asked you to reply in English — honor this "
                         "regardless of the language they wrote in. Reply ONLY in English."
                     )
                 elif lang == "mixed":
+                    det = _detect_dialect(text)
+                    tts_voice = "egyptian" if det in (None, "Egyptian") else "saudi"
+                    tts_language = None   # mixed AR+EN: don't pin a dialect language (would mispronounce the English)
+                    dial = (f"For the Arabic parts, use the {det} dialect."
+                            if det else "For the Arabic parts, use the Egyptian dialect (مصري).")
+                    print(f"  [lang] mixed (Arabic part: {det or 'Egyptian (default)'})")
                     lang_instruction = (
                         "The user is mixing Arabic and English (code-switching). "
                         "Reply naturally in the SAME mix of Arabic and English they used. "
-                        "For the Arabic parts, match their dialect (Najdi, Hijazi, or Gulf/Khaleeji). "
-                        "Do NOT force a reply into all-Arabic or all-English."
+                        f"{dial} Do NOT force the reply into all-Arabic or all-English."
                     )
                 elif lang == "ar":
-                    lang_instruction = (
-                        "The user spoke Arabic. Detect their exact dialect "
-                        "(Najdi, Hijazi, or Gulf/Khaleeji) "
-                        "from their vocabulary and reply in that EXACT same dialect. "
-                        "Najdi vs Hijazi: Najdi uses وش/أبغى/الحين; Hijazi uses وين/بدي/كيف. "
-                        "Do NOT use Fusha/MSA unless the dialect is completely unclear."
-                    )
+                    # Server-side dialect decision (committed), not a vague "detect it yourself".
+                    det = _detect_dialect(text)
+                    tts_voice = "saudi" if det in ("Najdi", "Hijazi") else "egyptian"
+                    tts_language = {"Najdi": "najdi arabic", "Hijazi": "hijazi arabic",
+                                    "Egyptian": "egyptian arabic"}.get(det, "egyptian arabic")
+                    if det == "Najdi":
+                        print("  [lang] detected Najdi")
+                        lang_instruction = (
+                            "The user spoke the NAJDI dialect. Reply ONLY in natural spoken Najdi — "
+                            "use Najdi words: وش (not إيش)، أبغى (not أريد)، الحين (not الآن)، زين (not تمام)، "
+                            "ما أدري، مرة (= very). Do NOT drift to MSA/Fusha mid-reply."
+                        )
+                    elif det == "Hijazi":
+                        print("  [lang] detected Hijazi")
+                        lang_instruction = (
+                            "The user spoke the HIJAZI dialect. Reply ONLY in natural spoken Hijazi — "
+                            "use Hijazi words: إيش، أبي (= أريد)، دحين/هلا (= الآن)، تمام (= زين)، كيفك، أيوه. "
+                            "Do NOT drift to MSA/Fusha mid-reply."
+                        )
+                    elif det == "Egyptian":
+                        print("  [lang] detected Egyptian")
+                        lang_instruction = (
+                            "The user spoke the EGYPTIAN dialect (مصري). Reply ONLY in natural spoken Egyptian — "
+                            "use Egyptian words: إزاي (= كيف)، عايز/عاوز (= أريد)، دلوقتي (= الآن)، مش (= ليس)، "
+                            "كده، علشان، ده/دي (= هذا/هذه). Do NOT drift to MSA/Fusha mid-reply."
+                        )
+                    else:
+                        print("  [lang] Arabic, dialect unclear → Egyptian (default)")
+                        lang_instruction = (
+                            "The user spoke Arabic but the specific dialect is not clear. DEFAULT to the "
+                            "EGYPTIAN dialect (مصري) — natural spoken Egyptian: إزاي، عايز/عاوز، دلوقتي، مش، "
+                            "كده، علشان، ده/دي. Do NOT reply in formal MSA/Fusha."
+                        )
                 else:
+                    tts_voice = "saudi"
+                    tts_language = None
                     lang_instruction = "The user spoke English. Reply in English only."
+                print(f"  [voice] {tts_voice}  [tts-lang] {tts_language}")
                 # Per-turn wrapper: lang routing + style + anti-hallucination. This wraps ONLY
                 # the current user message; the clean `text` is what gets stored in history,
                 # so these instructions never accumulate across turns.
@@ -1126,8 +1158,9 @@ async def websocket_endpoint(ws: WebSocket, model: str = MODEL):
                     "Never reply with a single word or short fragment — always a full natural sentence. "
                     "Do NOT start with: Sure, Certainly, Of course, Absolutely, Great, Happy to help. "
                     "Do NOT ask for clarification — answer directly and completely. "
-                    "If you are not certain of a fact, say you are not sure rather than guessing. "
-                    "Do NOT invent names, dates, places, or events. "
+                    "If you are not certain of a fact, say so in the SAME dialect you are replying in "
+                    "(Najdi: «ما أدري بالضبط»، Hijazi: «ما أعرف بالضبط»، Egyptian: «مش متأكد بصراحة»، Fusha: «لست متأكداً») "
+                    "rather than guessing. Do NOT invent names, dates, places, or events. "
                     "No markdown.\n\n"
                     f"User: {text}"
                 )
@@ -1176,6 +1209,8 @@ async def websocket_endpoint(ws: WebSocket, model: str = MODEL):
                         ws=ws,
                         cancel_event=cancel_event,
                         on_first_audio=_on_first_audio_timed,
+                        voice=tts_voice,
+                        language=tts_language,
                     )
                     t_done = _time.monotonic()
 
@@ -1194,6 +1229,8 @@ async def websocket_endpoint(ws: WebSocket, model: str = MODEL):
                             ws=ws,
                             cancel_event=cancel_event,
                             on_first_audio=_on_first_audio_timed,
+                            voice=tts_voice,
+                            language=tts_language,
                         )
                     elif not cancel_event.is_set():
                         # Commit the completed turn to rolling memory — CLEAN user text

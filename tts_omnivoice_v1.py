@@ -7,12 +7,14 @@
 #
 # Structure, sentence-flushing, abbreviation/opener handling, MP3 encoding, the
 # sentence-queue + background synth worker, the on_first_audio / tts_end protocol,
-# and the 3-point cancellation are all carried over verbatim from the proven Silma
-# module (tts_silma_v1.py) — only the model load + the per-sentence synthesis call
-# are OmniVoice-specific.
+# and the 3-point cancellation are all carried over from the earlier Silma TTS module
+# (not in this repo — preserved on the `multi-engine-snapshot` branch); only the model
+# load + the per-sentence synthesis call are OmniVoice-specific.
 #
-# OmniVoice is a zero-shot voice-cloner: it needs a short reference clip + its
-# transcript to define the voice. We reuse the Saudi reference clip.
+# OmniVoice is a zero-shot voice-cloner: it needs a short reference clip + its transcript to define the
+# voice. A per-dialect voice registry (_VOICES) selects the clip per turn — Saudi (default) for
+# Najdi/Hijazi/Fusha/English, Egyptian (v2 clip) for Egyptian-routed turns — and server.py also passes an
+# OmniVoice `language=` dialect ID per turn to pin pronunciation.
 # =========================================================================================
 
 import asyncio
@@ -24,14 +26,14 @@ from typing import Any, AsyncIterator, Optional
 import numpy as np
 import torch
 
-# ── Sentence boundary constants (verbatim from tts_silma_v1.py) ──────────────────────────
+# ── Sentence boundary constants (carried over from the earlier Silma TTS module) ─────────
 HARD_BREAK = {'!', '?', '؟'}
 SOFT_BREAK = {'.', ',', '،', ';', ':'}
 SOFT_BREAK_MIN = 40
 FIRST_SOFT_MIN = 20  # the very first flush happens earlier — cuts time-to-first-audio
 _HEAD_PROBE_CHARS = 30  # leading text buffered before deciding whether to strip a filler opener
 
-# ── Arabic abbreviation / glued-digit expander (verbatim from tts_silma_v1.py) ───────────
+# ── Arabic abbreviation / glued-digit expander (carried over from the earlier Silma module) ──
 # Spelled-out forms read better aloud; runs on each sentence before synthesis.
 _ABBREV_RULES: list[tuple[re.Pattern, str]] = [
     (re.compile(r'(\d)\s*هـ(?=[\s،,.:؟!]|$)', re.UNICODE), r'\1 هجري'),
@@ -53,9 +55,31 @@ def _expand_abbreviations(text: str) -> str:
 
 SAMPLE_RATE = 24000  # OmniVoice output sample rate
 
-# Reference clip + its exact transcript define the cloned voice (Saudi male).
+# Saudi DEFAULT voice (registry key "saudi") — used for Najdi/Hijazi/Fusha/English. Egyptian voice below.
 _REF_AUDIO = os.path.join(os.path.dirname(__file__), "voices", "silma-tts-saudi-24k.wav")
 _REF_TEXT  = "الثقافة السعودية فيها عراقة وتاريخ عميق، وقيم إسلامية راسخة، وعادات وتقاليد قبلية أصيلة متوارثة."
+
+# Egyptian reference clip (user-provided) + its exact transcript — used for Egyptian-routed turns.
+_EGY_REF_AUDIO = os.path.join(os.path.dirname(__file__), "voices", "omnivoice-tts-egyptian-24k-v2.wav")
+_EGY_REF_TEXT  = "انا رحت اشتغل هناك، كان إمتى الكلام ده كان الكلام ده على ما اتذكر تقريبا في 2017 و السن هنا مش هيفرق قوي بس"
+
+# Voice registry: key → (reference clip, its exact transcript). OmniVoice CLONES the reference, so the
+# chosen clip IS the spoken voice. server.py picks the key per turn from the routed dialect (Egyptian-routed
+# → "egyptian", everything else → "saudi"). Add a new voice later by dropping a WAV + one entry here.
+DEFAULT_VOICE = "saudi"
+_VOICES: dict[str, tuple[str, str]] = {
+    "saudi":    (_REF_AUDIO, _REF_TEXT),
+    "egyptian": (_EGY_REF_AUDIO, _EGY_REF_TEXT),
+}
+
+def _resolve_voice(key: Optional[str]) -> tuple[str, str]:
+    """Map a voice key → (ref_audio, ref_text); fall back to the Saudi default for an unknown key or a
+    missing file, so a bad/typo'd key can never break synthesis."""
+    ref_audio, ref_text = _VOICES.get(key or DEFAULT_VOICE, _VOICES[DEFAULT_VOICE])
+    if not os.path.exists(ref_audio):
+        print(f"[tts] voice clip for '{key}' missing ({ref_audio}) — falling back to Saudi")
+        return _VOICES[DEFAULT_VOICE]
+    return ref_audio, ref_text
 
 _MODEL_ID = os.environ.get("OMNIVOICE_MODEL", "k2-fsa/OmniVoice")
 _DEVICE   = os.environ.get("OMNIVOICE_DEVICE", "cuda:0")
@@ -67,12 +91,13 @@ _model_lock = threading.Lock()
 
 def load_models():
     """Optional warm-up hook — call from FastAPI lifespan so the first user
-    does not pay the model load cost."""
-    if not os.path.exists(_REF_AUDIO):
-        raise FileNotFoundError(
-            f"OmniVoice reference audio not found: {_REF_AUDIO}\n"
-            f"Place the Saudi reference WAV at that path before starting the server."
-        )
+    does not pay the model load cost. Validates EVERY registry voice clip exists."""
+    for _key, (_ref_audio, _ref_text) in _VOICES.items():
+        if not os.path.exists(_ref_audio):
+            raise FileNotFoundError(
+                f"OmniVoice reference audio for voice '{_key}' not found: {_ref_audio}\n"
+                f"Place the reference WAV at that path before starting the server."
+            )
     _get_model()
 
 
@@ -117,16 +142,20 @@ def _strip_openers(text: str) -> str:
 
 # ── Blocking synthesis helpers (run via asyncio.to_thread) ───────────────────────────────
 
-def _synthesize_mp3_blocking(text: str) -> bytes:
+def _synthesize_mp3_blocking(text: str, ref_audio: str = _REF_AUDIO, ref_text: str = _REF_TEXT,
+                             language: Optional[str] = None) -> bytes:
     """OmniVoice inference + LAME MP3 encode in one blocking call (one to_thread dispatch).
-    Returns a complete MP3 container — browser decodeAudioData requires this."""
+    Returns a complete MP3 container — browser decodeAudioData requires this.
+    ref_audio/ref_text select the cloned voice (default = Saudi). `language` is an OmniVoice dialect
+    ID (e.g. "egyptian arabic" → arz) that pins pronunciation to one dialect; None = language-agnostic."""
     import lameenc
     model = _get_model()
     # OmniVoice.generate returns a list of float32 np.ndarray (T,) at 24 kHz.
     audio = model.generate(
         text=text,
-        ref_audio=_REF_AUDIO,
-        ref_text=_REF_TEXT,
+        ref_audio=ref_audio,
+        ref_text=ref_text,
+        language=language,
     )
     pcm_int16 = (np.clip(audio[0], -1.0, 1.0) * 32767).astype(np.int16)
     enc = lameenc.Encoder()
@@ -139,8 +168,9 @@ def _synthesize_mp3_blocking(text: str) -> bytes:
     return mp3
 
 
-async def _synthesize_mp3(text: str) -> bytes:
-    return await asyncio.to_thread(_synthesize_mp3_blocking, text)
+async def _synthesize_mp3(text: str, ref_audio: str = _REF_AUDIO, ref_text: str = _REF_TEXT,
+                          language: Optional[str] = None) -> bytes:
+    return await asyncio.to_thread(_synthesize_mp3_blocking, text, ref_audio, ref_text, language)
 
 
 # ── Public WebSocket API (identical signature to the Silma module) ───────────────────────
@@ -150,6 +180,8 @@ async def stream_tts_to_ws(
     ws,
     cancel_event: asyncio.Event,
     on_first_audio=None,
+    voice: Optional[str] = None,
+    language: Optional[str] = None,
 ) -> None:
     """
     Consume an async token generator, synthesise sentence-by-sentence with OmniVoice,
@@ -166,6 +198,7 @@ async def stream_tts_to_ws(
     Cancellation checked at three points: (a) token loop top, (b) before synth, (c) after synth.
     """
     sentence_queue: asyncio.Queue = asyncio.Queue()
+    ref_audio, ref_text = _resolve_voice(voice)   # pick the cloned voice for this whole turn
 
     async def synth_worker():
         nonlocal on_first_audio
@@ -176,7 +209,7 @@ async def stream_tts_to_ws(
             if cancel_event.is_set():                               # (b)
                 continue   # keep draining so the producer's sentinel is reached
             try:
-                audio_bytes = await _synthesize_mp3(_expand_abbreviations(sentence))
+                audio_bytes = await _synthesize_mp3(_expand_abbreviations(sentence), ref_audio, ref_text, language)
             except Exception as e:
                 print(f"[tts] synthesis failed, skipping sentence: {type(e).__name__}: {e}")
                 continue
