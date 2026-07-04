@@ -122,7 +122,7 @@ SYSTEM_PROMPT = (
     "   Egyptian (مصري): use إزاي, عايز/عاوز, دلوقتي, مش, كده, علشان, ده/دي — "
     "   Gulf/Khaleeji (خليجي): use شلونك, وايد, يبه, زين, ما أدري. "
     "3. If the user mixes Arabic and English (code-switching) → reply in the same natural mix, matching their Arabic dialect. "
-    "4. If the specific Arabic dialect is unclear → DEFAULT to the Egyptian dialect (مصري), not Fusha. "
+    "4. If the specific Arabic dialect is unclear → DEFAULT to Modern Standard Arabic (Fusha / الفصحى), not a regional dialect. "
     "5. NEVER mix two Arabic dialects in one response. "
     "6. NEVER use Chinese, Japanese, Korean, Cyrillic, Vietnamese or any non-Arabic/Latin script. "
     "7. ALWAYS reply in complete, natural spoken sentences — never single words or bare fragments. "
@@ -526,15 +526,19 @@ _WANTS_ENGLISH_RE = re.compile(
 )
 
 # Specific Arabic dialect requests, checked when the user asks for Arabic output.
-# First match wins; the caller defaults to Egyptian when no dialect is named.
+# First match wins; the caller defaults to Fusha (MSA) when no dialect is named.
+# The Arabic alternatives require a request prefix (بال… / …لهجة/لغة …) so a bare adjective or
+# proper noun ("المتحف المصري", "الثورة المصرية") is NOT mistaken for a dialect request — only an
+# explicit "رد بالمصري" / "باللهجة المصرية" is. English names still match on their own (\bgulf\b,
+# \begyptian\b, … are left permissive by design — the minimal, Arabic-only guard).
 _DIALECT_PATTERNS: list[tuple[str, Any, str]] = [
-    ("Najdi", re.compile(r"\bnajdi\b|نجدي|النجدية", re.IGNORECASE | re.UNICODE),
+    ("Najdi", re.compile(r"\bnajdi\b|بالنجدي(?:ة|ه)?|(?:لهجة|لغة)\s+ال?نجدي(?:ة|ه)?", re.IGNORECASE | re.UNICODE),
      "the Najdi dialect (use وش/إيش, أبغى, زين, الحين, ماله, يبيلك)"),
-    ("Hijazi", re.compile(r"\bhi?jazi\b|\bhejazi\b|حجازي|الحجازية", re.IGNORECASE | re.UNICODE),
+    ("Hijazi", re.compile(r"\bhi?jazi\b|\bhejazi\b|بالحجازي(?:ة|ه)?|(?:لهجة|لغة)\s+ال?حجازي(?:ة|ه)?", re.IGNORECASE | re.UNICODE),
      "the Hijazi dialect (use إيش, وين, كيف, بدي, تعال, ما عندي)"),
-    ("Egyptian", re.compile(r"\begyptian\b|\bmasri\b|مصري|المصري|المصرية|مصرية", re.IGNORECASE | re.UNICODE),
+    ("Egyptian", re.compile(r"\begyptian\b|\bmasri\b|بالمصري(?:ة|ه)?|(?:لهجة|لغة)\s+ال?مصري(?:ة|ه)?", re.IGNORECASE | re.UNICODE),
      "the Egyptian dialect (use إزاي, عايز/عاوز, دلوقتي, مش, كده, علشان, ده/دي)"),
-    ("Gulf", re.compile(r"\bgulf\b|\bkhal[ei]+ji\b|\bkhaleeji\b|خليجي|الخليجية", re.IGNORECASE | re.UNICODE),
+    ("Gulf", re.compile(r"\bgulf\b|\bkhal[ei]+ji\b|\bkhaleeji\b|بالخليجي(?:ة|ه)?|(?:لهجة|لغة)\s+ال?خليجي(?:ة|ه)?", re.IGNORECASE | re.UNICODE),
      "the Gulf/Khaleeji dialect (use شلونك, وايد, يبه, زين, ما أدري)"),
     ("Fusha", re.compile(r"\bfus-?ha\b|\bmsa\b|modern\s+standard|classical\s+arabic|الفصحى|فصحى",
                          re.IGNORECASE | re.UNICODE),
@@ -542,7 +546,7 @@ _DIALECT_PATTERNS: list[tuple[str, Any, str]] = [
 ]
 
 def _requested_dialect(text: str) -> Optional[str]:
-    """Return a phrase describing the requested Arabic dialect, or None when none is named (caller defaults to Egyptian)."""
+    """Return a phrase describing the requested Arabic dialect, or None when none is named (caller defaults to Fusha)."""
     for _name, pattern, phrase in _DIALECT_PATTERNS:
         if pattern.search(text):
             return phrase
@@ -556,14 +560,20 @@ def _requested_dialect(text: str) -> Optional[str]:
 _NAJDI_MARKERS    = {"وش", "أبغى", "ابغى", "الحين", "زين", "ماله", "يبيلك", "صج", "عاد", "هيه", "أدري", "ادري"}
 _HIJAZI_MARKERS   = {"إيش", "ايش", "أبي", "ابي", "دحين", "هلا", "تمام", "إيوه", "أيوه", "ايوه", "مشكور", "كيفك"}
 # Egyptian (Cairene/Delta) markers — مش/ده/دي (negation + demonstratives), إزاي, عايز, دلوقتي, كده,
-# علشان. Distinct from the Saudi dialects and very reliable; Egyptian is the most data-rich dialect.
+# علشان, plus the Egyptian interrogatives إيه (=what)، كام (=how much)، فين (=where) — all distinct from
+# the Saudi dialects (وش/إيش، كم، وين) and MSA (ماذا/كم/أين), and very reliable. Egyptian is the most
+# data-rich dialect. (إمتى is intentionally NOT added — it overlaps Hijazi.)
+# NOTE: bare "عشان" is deliberately EXCLUDED — it's shared across Najdi/Hijazi/Gulf/Egyptian, so it
+# carries no dialect signal and was tying real Najdi utterances to Egyptian (e.g. "وش ... عشان ..." →
+# 1-1 tie → unclear). "علشان" (with the ل) is kept as the Egyptian-leaning variant.
 _EGYPTIAN_MARKERS = {"إزاي", "ازاي", "إزيك", "ازيك", "عايز", "عاوز", "عايزة", "دلوقتي", "دلوقت", "مش",
-                     "كده", "كدا", "علشان", "عشان", "ده", "دي", "دول", "النهاردة", "إمبارح", "امبارح", "أهو"}
+                     "كده", "كدا", "علشان", "ده", "دي", "دول", "النهاردة", "إمبارح", "امبارح", "أهو",
+                     "إيه", "ايه", "كام", "فين"}
 _AR_WORD_SPLIT_RE = re.compile(r"[^؀-ۿ]+")  # split on any run of non-Arabic-letter chars
 
 def _detect_dialect(text: str) -> Optional[str]:
     """Lexically classify spoken Arabic as 'Najdi' / 'Hijazi' / 'Egyptian' by counting distinguishing
-    marker words. Returns None when unclear OR tied (caller defaults to Egyptian) — short utterances
+    marker words. Returns None when unclear OR tied (caller defaults to Fusha) — short utterances
     rarely carry a marker and many words are shared, so 'unclear' is the common, intended case."""
     words  = {w for w in _AR_WORD_SPLIT_RE.split(text) if w}
     scores = {
@@ -1077,7 +1087,7 @@ async def websocket_endpoint(ws: WebSocket, model: str = MODEL):
                 wants_arabic = req_dialect is not None or bool(_WANTS_ARABIC_RE.search(text))
 
                 if wants_arabic:
-                    dialect = req_dialect or "the Egyptian dialect (مصري)"
+                    dialect = req_dialect or "Modern Standard Arabic (Fusha)"
                     tts_voice = "egyptian" if ("Egyptian" in dialect or "مصري" in dialect) else "saudi"
                     if   "Egyptian" in dialect or "مصري" in dialect: tts_language = "egyptian arabic"
                     elif "Najdi" in dialect:                          tts_language = "najdi arabic"
@@ -1100,11 +1110,11 @@ async def websocket_endpoint(ws: WebSocket, model: str = MODEL):
                     )
                 elif lang == "mixed":
                     det = _detect_dialect(text)
-                    tts_voice = "egyptian" if det in (None, "Egyptian") else "saudi"
+                    tts_voice = "egyptian" if det == "Egyptian" else "saudi"
                     tts_language = None   # mixed AR+EN: don't pin a dialect language (would mispronounce the English)
                     dial = (f"For the Arabic parts, use the {det} dialect."
-                            if det else "For the Arabic parts, use the Egyptian dialect (مصري).")
-                    print(f"  [lang] mixed (Arabic part: {det or 'Egyptian (default)'})")
+                            if det else "For the Arabic parts, use Modern Standard Arabic (Fusha).")
+                    print(f"  [lang] mixed (Arabic part: {det or 'Fusha (default)'})")
                     lang_instruction = (
                         "The user is mixing Arabic and English (code-switching). "
                         "Reply naturally in the SAME mix of Arabic and English they used. "
@@ -1113,9 +1123,9 @@ async def websocket_endpoint(ws: WebSocket, model: str = MODEL):
                 elif lang == "ar":
                     # Server-side dialect decision (committed), not a vague "detect it yourself".
                     det = _detect_dialect(text)
-                    tts_voice = "saudi" if det in ("Najdi", "Hijazi") else "egyptian"
+                    tts_voice = "egyptian" if det == "Egyptian" else "saudi"
                     tts_language = {"Najdi": "najdi arabic", "Hijazi": "hijazi arabic",
-                                    "Egyptian": "egyptian arabic"}.get(det, "egyptian arabic")
+                                    "Egyptian": "egyptian arabic"}.get(det, "standard arabic")
                     if det == "Najdi":
                         print("  [lang] detected Najdi")
                         lang_instruction = (
@@ -1138,11 +1148,11 @@ async def websocket_endpoint(ws: WebSocket, model: str = MODEL):
                             "كده، علشان، ده/دي (= هذا/هذه). Do NOT drift to MSA/Fusha mid-reply."
                         )
                     else:
-                        print("  [lang] Arabic, dialect unclear → Egyptian (default)")
+                        print("  [lang] Arabic, dialect unclear → Fusha (default)")
                         lang_instruction = (
-                            "The user spoke Arabic but the specific dialect is not clear. DEFAULT to the "
-                            "EGYPTIAN dialect (مصري) — natural spoken Egyptian: إزاي، عايز/عاوز، دلوقتي، مش، "
-                            "كده، علشان، ده/دي. Do NOT reply in formal MSA/Fusha."
+                            "The user spoke Arabic but the specific dialect is not clear. DEFAULT to "
+                            "Modern Standard Arabic (Fusha / الفصحى) — reply in clear, natural formal Arabic. "
+                            "Do NOT use regional dialect words (Egyptian إزاي/عايز/دلوقتي، Najdi وش/أبغى، Hijazi إيش/أبي); keep it MSA."
                         )
                 else:
                     tts_voice = "saudi"

@@ -60,8 +60,8 @@ _REF_AUDIO = os.path.join(os.path.dirname(__file__), "voices", "silma-tts-saudi-
 _REF_TEXT  = "الثقافة السعودية فيها عراقة وتاريخ عميق، وقيم إسلامية راسخة، وعادات وتقاليد قبلية أصيلة متوارثة."
 
 # Egyptian reference clip (user-provided) + its exact transcript — used for Egyptian-routed turns.
-_EGY_REF_AUDIO = os.path.join(os.path.dirname(__file__), "voices", "omnivoice-tts-egyptian-24k-v2.wav")
-_EGY_REF_TEXT  = "انا رحت اشتغل هناك، كان إمتى الكلام ده كان الكلام ده على ما اتذكر تقريبا في 2017 و السن هنا مش هيفرق قوي بس"
+_EGY_REF_AUDIO = os.path.join(os.path.dirname(__file__), "voices", "omnivoice-tts-egyptian-24k-v3.wav")
+_EGY_REF_TEXT  = "في الغالب بتبقى أكتر من الطفل اللي اتولد في آخر السنة، وبالتالي أداؤه في اللعب هيكون أحسن، فده هيلفت نظر المدربين فهيهتموا بيه"
 
 # Voice registry: key → (reference clip, its exact transcript). OmniVoice CLONES the reference, so the
 # chosen clip IS the spoken voice. server.py picks the key per turn from the routed dialect (Egyptian-routed

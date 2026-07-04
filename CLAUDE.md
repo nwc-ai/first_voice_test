@@ -8,7 +8,7 @@ A standalone local Arabic/English voice assistant powered by:
 - **TTS**: OmniVoice (k2-fsa/OmniVoice, zero-shot voice cloning, 24kHz) — in-process, runs on GPU
 
 It is a **general assistant** that recognizes and replies in Saudi & Egyptian Arabic dialects + English,
-matching the speaker's dialect. **Egyptian is the default** Arabic dialect when the dialect is unclear.
+matching the speaker's dialect. **Fusha (MSA) is the default** Arabic dialect when the dialect is unclear.
 
 > Full code reference: see **ARCHITECTURE.md** (file-by-file, function-by-function).
 
@@ -28,8 +28,10 @@ Barge-in supported: user speaking while AI talks cancels the current turn immedi
 
 ## Dialects
 
-Recognized + replied-in: **Najdi, Hijazi, Egyptian, Fusha (MSA)**. **Egyptian is the default** when the
+Recognized + replied-in: **Najdi, Hijazi, Egyptian, Fusha (MSA)**. **Fusha (MSA) is the default** when the
 spoken dialect is unclear, or an Arabic reply is requested without naming a dialect. English input → English.
+(Fusha is routed through the Saudi voice clip with `language="standard arabic"`; there is no separate spoken-Fusha
+classifier — any Arabic that doesn't match a Najdi/Hijazi/Egyptian marker falls through to Fusha.)
 
 Each turn the server decides three things from the user's words:
 - **reply dialect** — a committed instruction to the LLM (`_detect_dialect` for spoken dialect,
@@ -86,7 +88,8 @@ first_voice_test/
 ├── static/index.html      ← browser UI (AudioWorklet mic, WebAudio playback)
 └── voices/
     ├── silma-tts-saudi-24k.wav            ← Saudi male — default voice (Najdi/Hijazi/Fusha/English)
-    ├── omnivoice-tts-egyptian-24k-v2.wav  ← Egyptian voice (ACTIVE)
+    ├── omnivoice-tts-egyptian-24k-v3.wav  ← Egyptian voice (ACTIVE)
+    ├── omnivoice-tts-egyptian-24k-v2.wav  ← Egyptian v2 (unused, superseded by v3)
     └── omnivoice-tts-egyptian-24k.wav     ← Egyptian v1 (unused, superseded by v2)
 ```
 
@@ -99,7 +102,7 @@ first_voice_test/
 - **qwen3.5:27b (locked)** — good Arabic+English, fits in VRAM alongside OmniVoice. Fixed in both the UI and
   the server (a second LLM would OOM the GPU). Prior switchable-model version is on the `multi-engine-snapshot` branch.
 - **Dialect = wording + voice + language**, decided per turn: committed LLM dialect instruction +
-  per-dialect voice clip + OmniVoice `language=` ID. **Egyptian is the default.**
+  per-dialect voice clip + OmniVoice `language=` ID. **Fusha (MSA) is the default** (Saudi clip + `standard arabic`).
 - **`language=` param** pins OmniVoice pronunciation per dialect — fixed the Saudi/Egyptian word-mixing.
 - **Per-dialect voice registry** (`_VOICES`): Egyptian→Egyptian clip, everything else→Saudi clip; extensible
   by dropping a WAV + one registry entry.
