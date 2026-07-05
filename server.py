@@ -586,10 +586,13 @@ def _detect_dialect(text: str) -> Optional[str]:
         return None   # no markers, or a tie between dialects → unclear → caller defaults to Egyptian
     return max(scores, key=scores.get)
 
-# Whisper mistakes Arabic for these languages — remap them all to ar.
-# Includes Arabic-script langs (ur/fa/ps/ug/sd) AND Punjabi (pa) which Whisper
-# also confuses with Arabic despite different script.
-_ARABIC_SCRIPT_REMAP = {"ur", "fa", "ps", "ug", "prs", "ckb", "sd", "pa"}
+# Whisper mistakes Arabic for these languages — blindly force them all to ar.
+# NOTE: "ur" (Urdu) was REMOVED from this blind set — it was the top cause of English being
+# force-transcribed into phonetic Arabic (Whisper mislabels accented English as Urdu). "ur" is now
+# handled by the probability-distribution branch in _transcribe_blocking (decides en vs ar from
+# info.all_language_probs) instead of unconditionally →ar. The rest are rarer, Arabic-script
+# confusions where forcing Arabic is still the right call.
+_ARABIC_SCRIPT_REMAP = {"fa", "ps", "ug", "prs", "ckb", "sd", "pa"}
 MIN_TEXT_CHARS      = 3
 MAX_TEXT_CHARS      = 500
 
@@ -700,16 +703,35 @@ def _transcribe_blocking(audio: Any) -> tuple[str, str]:
     segments, info = _whisper_model.transcribe(audio, **_TRANSCRIBE_KWARGS)
     lang      = info.language
     lang_prob = info.language_probability
+    _probs    = dict(info.all_language_probs or [])   # full first-pass LID distribution
 
     if lang in _ARABIC_SCRIPT_REMAP:
         # Whisper confused Arabic with an Arabic-script language and transcribed
-        # in Urdu/Farsi text. Re-run with language="ar" forced so we get proper
-        # Arabic script output instead of Urdu Nastaliq.
+        # in Farsi/Pashto text. Re-run with language="ar" forced so we get proper
+        # Arabic script output instead of the wrong script.
         print(f"  whisper: remapped {lang} → ar, re-transcribing in Arabic (dialect-biased)")
         lang = "ar"
         segments, _ = _whisper_model.transcribe(
             audio, language="ar", hotwords=_AR_HOTWORDS, **_TRANSCRIBE_KWARGS
         )
+    elif lang not in ALLOWED_LANGS:
+        # Detected something that is neither Arabic nor English (ur, nn, hi, …). Instead of
+        # blindly forcing Arabic (which mangles English into phonetic gibberish) or dropping it,
+        # let the LID probability distribution decide between our two real languages: whichever of
+        # en/ar Whisper ranked higher wins, then we re-decode forced to that language. Genuinely
+        # foreign speech leaves both en & ar near zero → falls through the confidence gate below.
+        p_en = _probs.get("en", 0.0)
+        p_ar = _probs.get("ar", 0.0)
+        if p_ar >= p_en:
+            print(f"  whisper: {lang} (P_en={p_en:.2f} P_ar={p_ar:.2f}) → ar (distribution)")
+            lang, lang_prob = "ar", p_ar
+            segments, _ = _whisper_model.transcribe(
+                audio, language="ar", hotwords=_AR_HOTWORDS, **_TRANSCRIBE_KWARGS
+            )
+        else:
+            print(f"  whisper: {lang} (P_en={p_en:.2f} P_ar={p_ar:.2f}) → en (distribution)")
+            lang, lang_prob = "en", p_en
+            segments, _ = _whisper_model.transcribe(audio, language="en", **_TRANSCRIBE_KWARGS)
 
     threshold = LANG_PROB_THRESHOLD_AR if lang == "ar" else LANG_PROB_THRESHOLD
     print(f"  whisper: lang={lang} lang_prob={lang_prob:.2f}")
