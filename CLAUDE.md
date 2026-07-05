@@ -44,6 +44,19 @@ Each turn the server decides three things from the user's words:
 
 STT is also biased toward dialect spelling via Whisper `hotwords` on the forced-Arabic re-pass.
 
+**Dialect-detection details:**
+- Spoken detection (`_detect_dialect`) is marker-based; distinctive Najdi/Hijazi/Egyptian words only.
+  Shared words (`عشان`، `وين`، `ليش` …) are excluded so they don't false-trigger. Egyptian markers include
+  the interrogatives `إيه`/`كام`/`فين`. No marker (or a tie) → Fusha default.
+- Explicit dialect requests (`_requested_dialect`) require a request prefix (`بال…` / `لهجة …` / English
+  "in <dialect>") so proper nouns like «المتحف المصري» / "the Egyptian Museum" aren't mistaken for a request.
+  (English names like `gulf`/`egyptian` are left permissive — a known, accepted gap.)
+
+**STT language pick (en vs ar):** Whisper auto-detects the spoken language. Arabic-script confusions
+(`fa`/`ps`/… — but NOT `ur`) still force Arabic, but any other non-en/ar guess (Urdu, Norwegian, …) is
+resolved by the language-probability distribution — the higher of P(en)/P(ar) wins — instead of blindly
+forcing Arabic. This stopped English being transcribed as phonetic Arabic.
+
 **Tashkeel/diacritization was evaluated and dropped** — the CATT diacritizer is MSA-trained and mangles
 Egyptian/dialect words; pronunciation is handled by `language=` + the reference voice instead.
 

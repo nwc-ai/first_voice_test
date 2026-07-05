@@ -583,7 +583,7 @@ def _detect_dialect(text: str) -> Optional[str]:
     }
     top = max(scores.values())
     if top == 0 or sum(1 for v in scores.values() if v == top) > 1:
-        return None   # no markers, or a tie between dialects → unclear → caller defaults to Egyptian
+        return None   # no markers, or a tie between dialects → unclear → caller defaults to Fusha
     return max(scores, key=scores.get)
 
 # Whisper mistakes Arabic for these languages — blindly force them all to ar.

@@ -13,7 +13,7 @@
 #
 # OmniVoice is a zero-shot voice-cloner: it needs a short reference clip + its transcript to define the
 # voice. A per-dialect voice registry (_VOICES) selects the clip per turn — Saudi (default) for
-# Najdi/Hijazi/Fusha/English, Egyptian (v2 clip) for Egyptian-routed turns — and server.py also passes an
+# Najdi/Hijazi/Fusha/English, Egyptian (v3 clip) for Egyptian-routed turns — and server.py also passes an
 # OmniVoice `language=` dialect ID per turn to pin pronunciation.
 # =========================================================================================
 

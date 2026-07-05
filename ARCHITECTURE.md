@@ -4,9 +4,9 @@ A complete, file-by-file, function-by-function reference for the local Arabic/En
 voice assistant. Nothing in the codebase is intentionally omitted. Line references use
 `file:line` and reflect the current working tree (branch `omnivoice-tts`).
 
-> **State note:** Most files have **uncommitted** changes on `omnivoice-tts` (see §14). This
-> document describes the system **as it currently runs**, including the uncommitted dialect /
-> Egyptian-as-default work.
+> **State note:** This document describes the system **as it currently runs** on branch `omnivoice-tts`.
+> The dialect routing, **Fusha-as-default**, the Egyptian **v3** voice, and the STT language-pick
+> refinement are all committed (HEAD = `ba71bbc`); only the docs may carry an uncommitted refresh (see §14).
 
 ---
 
@@ -36,7 +36,7 @@ WebSocket to a Python server that runs the entire pipeline **in one process on o
 (except the LLM, which runs in a separate Ollama process), and streams synthesized speech back.
 
 - **General-purpose assistant** (not domain-specific), tuned to **reply in the user's dialect**.
-- **Dialects:** Najdi, Hijazi, Egyptian, Fusha (MSA). **Egyptian is the default** when the
+- **Dialects:** Najdi, Hijazi, Egyptian, Fusha (MSA). **Fusha (MSA) is the default** when the
   dialect is unclear (see §11).
 - **Latency target:** time-to-first-audio ≈ 1–1.5 s (full turn typically 3–5 s).
 - **Barge-in:** speaking over the AI cancels its turn immediately.
@@ -127,7 +127,8 @@ first_voice_test/
 ├── ARCHITECTURE.md        # this document
 ├── .gitignore             # ignores __pycache__, .venv, checkpoints/, *.log
 ├── voices/
-│   └── silma-tts-saudi-24k.wav   # OmniVoice reference clip (Saudi male, 24 kHz mono, 7.64 s)
+│   ├── silma-tts-saudi-24k.wav             # Saudi male default clip (24 kHz mono, 7.64 s)
+│   └── omnivoice-tts-egyptian-24k-v3.wav   # active Egyptian clip (24 kHz mono, 8.0 s); v2/v1 unused
 ├── checkpoints/
 │   └── FRCRN_SE_16K/      # ClearVoice denoiser weights (last_best_checkpoint.pt, ~153 MB; gitignored)
 ├── logs/
@@ -204,7 +205,7 @@ The 1298-line core. Sections below follow the file top-to-bottom.
 - **`SYSTEM_PROMPT`** ([:112-144](server.py#L112)) — the full system message. 13 numbered rules
   (0–12): rule 0 language-override; rule 1 English→English; **rule 2 dialect map (Najdi/Hijazi/
   Egyptian/Gulf with example words)**; rule 3 code-switch mirroring; **rule 4 unclear → DEFAULT
-  Egyptian (not Fusha)**; rule 5 never mix two dialects; rule 6 no CJK/Cyrillic scripts; rule 7
+  Fusha/MSA (not a regional dialect)**; rule 5 never mix two dialects; rule 6 no CJK/Cyrillic scripts; rule 7
   full spoken sentences; rule 8 punctuation; rule 9 no markdown; rule 10 no filler openers; rule 11
   never ask for clarification; rule 12 spell out abbreviations (voice).
 - **VAD tuning ([:147-157](server.py#L147)):** `MIN_SPEECH_CHUNKS=4` (~128 ms onset),
@@ -275,22 +276,27 @@ The 1298-line core. Sections below follow the file top-to-bottom.
   **`repetition_penalty=1.1`**.
 - **`_AR_HOTWORDS` ([:686](server.py#L686))** — dialect marker vocabulary passed as Whisper
   `hotwords` **only on the forced-Arabic re-pass** (biases dialect spelling once Arabic is committed).
-- **`_transcribe_blocking(audio) → (text, lang)` ([:688-728](server.py#L688)):**
-  1. Pass-1 auto-detect (`_whisper_model.transcribe`).
-  2. If detected lang ∈ `_ARABIC_SCRIPT_REMAP` (`ur/fa/ps/ug/prs/ckb/sd/pa`), force a **dialect-biased
-     re-pass** with `language="ar"` + `hotwords=_AR_HOTWORDS`.
-  3. Gate on `lang_prob` (AR threshold lower) → drop if below.
-  4. Compute mean per-word confidence → drop if `< WORD_CONF_THRESHOLD`.
-  5. Join segment text; if lang isn't ar/en but text is pure Latin → remap to `en`.
+- **`_transcribe_blocking(audio) → (text, lang)` ([:701-738](server.py#L701)):**
+  1. Pass-1 auto-detect (`_whisper_model.transcribe`); also capture the full LID distribution
+     `info.all_language_probs`.
+  2. If detected lang ∈ `_ARABIC_SCRIPT_REMAP` (`fa/ps/ug/prs/ckb/sd/pa` — **`ur` was removed**), force a
+     **dialect-biased re-pass** with `language="ar"` + `hotwords=_AR_HOTWORDS`.
+  3. **Else if the guess is neither ar nor en** (`ur`, `nn`, `hi`, …): pick between our two real languages
+     from the distribution — whichever of **P(en)/P(ar)** is higher → re-decode forced to it. This stops
+     accented English (mislabeled as Urdu) being force-transcribed into phonetic Arabic; genuinely foreign
+     speech leaves both near zero → dropped by the gate below.
+  4. Gate on `lang_prob` (AR threshold lower) → drop if below.
+  5. Compute mean per-word confidence → drop if `< WORD_CONF_THRESHOLD`.
+  6. Join segment text; if lang still isn't ar/en but text is pure Latin → remap to `en`.
 
 ### 6.8 Dialect engine (constants/functions)
 Covered in depth in §11. Symbols: `_ARABIC_CHARS_RE`/`_LATIN_WORDS_RE` ([:507-508](server.py#L507)) which
 feed `_is_mixed` ([:510](server.py#L510)), `_WANTS_ARABIC_RE`/
-`_WANTS_ENGLISH_RE` ([:515-526](server.py#L515)), `_DIALECT_PATTERNS` ([:530-542](server.py#L530)),
-`_requested_dialect` ([:544-549](server.py#L544)), `_NAJDI_MARKERS`/`_HIJAZI_MARKERS`/
-`_EGYPTIAN_MARKERS` ([:556-561](server.py#L556)), `_AR_WORD_SPLIT_RE` ([:562](server.py#L562)),
-`_detect_dialect` ([:564-577](server.py#L564)), `_ARABIC_SCRIPT_REMAP` ([:582](server.py#L582)),
-`MIN_TEXT_CHARS=3`/`MAX_TEXT_CHARS=500` ([:583-584](server.py#L583)).
+`_WANTS_ENGLISH_RE` ([:515-526](server.py#L515)), `_DIALECT_PATTERNS` ([:534-546](server.py#L534)),
+`_requested_dialect` ([:548-553](server.py#L548)), `_NAJDI_MARKERS`/`_HIJAZI_MARKERS`/
+`_EGYPTIAN_MARKERS` ([:560-571](server.py#L560)), `_AR_WORD_SPLIT_RE` ([:572](server.py#L572)),
+`_detect_dialect` ([:574-587](server.py#L574)), `_ARABIC_SCRIPT_REMAP` ([:595](server.py#L595)),
+`MIN_TEXT_CHARS=3`/`MAX_TEXT_CHARS=500` ([:596-597](server.py#L596)).
 
 ### 6.9 LLM token streaming + filters
 - **`_UNWANTED_SCRIPT_RE` ([:587-599](server.py#L587))** — strips CJK (ideographs, ext-A, compat,
@@ -337,7 +343,7 @@ feed `_is_mixed` ([:510](server.py#L510)), `_WANTS_ARABIC_RE`/
   - **`respond_loop()` ([:1050-1272](server.py#L1050))** — pulls an utterance, clears `cancel_event`,
     sets `ai_active`; blocks injection attempts (`_INJECTION_RE`) with a transcript+`tts_end`; sends
     `transcript`; builds the **per-turn `lang_instruction`** (the dialect router — §11); wraps it in
-    `turn_content` ([:1139-1150](server.py#L1139)) with style + anti-hallucination + dialect-aware
+    `turn_content` ([:1187-1200](server.py#L1187)) with style + anti-hallucination + dialect-aware
     "say you're unsure" phrasing; assembles `messages = [system] + history + [turn]`; streams
     LLM→TTS via `_collecting_token_gen` (collects tokens, wraps `_filter_cjk`+`ollama_chat_token_gen`,
     propagates `aclose`) into `stream_tts_to_ws`. Then: empty-response fallback
@@ -364,7 +370,7 @@ for the earlier Silma module.
   rules for spoken Arabic: `1هـ→1 هجري`, `1م→1 ميلادي`, `ق.م→قبل الميلاد`, `1%→1 بالمئة`, `د.→دكتور`,
   `أ.→أستاذ`, `إلخ→وما إلى ذلك`, and digit/letter separation. Runs per sentence before synthesis.
 - **`SAMPLE_RATE=24000`; voice registry** — `_REF_AUDIO`/`_REF_TEXT` (Saudi **default** clip + transcript)
-  and `_EGY_REF_AUDIO`/`_EGY_REF_TEXT` (the **active Egyptian v2** clip + transcript) feed **`_VOICES`**
+  and `_EGY_REF_AUDIO`/`_EGY_REF_TEXT` (the **active Egyptian v3** clip + transcript) feed **`_VOICES`**
   (`{"saudi": …, "egyptian": …}`) with `DEFAULT_VOICE="saudi"`. **`_resolve_voice(key)`** maps a voice key
   → `(ref_audio, ref_text)`, falling back to Saudi on an unknown key or a missing file. OmniVoice CLONES the
   chosen clip, so the clip IS the spoken voice. `server.py` picks the key per turn from the routed dialect.
@@ -465,9 +471,9 @@ smoke test**, not a full end-to-end test.
   `[SERVER-UTTERANCE] …`, `[CLIENT-BARGE] …`, `[WS-DISCONNECT] code=…`. Gitignored (`*.log`). Temporary.
 - **`voices/`** — OmniVoice reference clips (24 kHz mono PCM-16): **`silma-tts-saudi-24k.wav`** (Saudi male,
   7.64 s — the **default** voice for Najdi/Hijazi/Fusha/English, transcript `_REF_TEXT`);
-  **`omnivoice-tts-egyptian-24k-v2.wav`** (Egyptian, 8.0 s — the **active** Egyptian voice, transcript
-  `_EGY_REF_TEXT`); **`omnivoice-tts-egyptian-24k.wav`** (Egyptian v1, **unused**, superseded by v2).
-  (Three older Saudi variants `-v2/-v2-trim/-v3` were git-rm'd, see §14.)
+  **`omnivoice-tts-egyptian-24k-v3.wav`** (Egyptian, 8.0 s — the **active** Egyptian voice, transcript
+  `_EGY_REF_TEXT`); **`omnivoice-tts-egyptian-24k-v2.wav`** and **`omnivoice-tts-egyptian-24k.wav`**
+  (Egyptian v2/v1, **unused**, superseded by v3).
 - **`checkpoints/FRCRN_SE_16K/`** — ClearVoice denoiser weights (`last_best_checkpoint.pt`, ~153 MB).
   Gitignored.
 
@@ -475,34 +481,40 @@ smoke test**, not a full end-to-end test.
 
 ## 11. Dialect engine deep-dive
 
-The system understands and replies in **Najdi, Hijazi, Egyptian, Fusha**; **Egyptian is the default**.
+The system understands and replies in **Najdi, Hijazi, Egyptian, Fusha**; **Fusha (MSA) is the default**.
 
-**Explicit requests — `_DIALECT_PATTERNS` + `_requested_dialect` ([server.py:530-549](server.py#L530)):**
-regex-matches a *named* dialect or language request (e.g. "in Najdi", "بالمصري", "in Fusha"). First
-match wins; returns a descriptive phrase or `None`.
+**Explicit requests — `_DIALECT_PATTERNS` + `_requested_dialect` ([server.py:534-553](server.py#L534)):**
+regex-matches a *named* dialect or language request (e.g. "in Najdi", "بالمصري", "in Fusha"). The Arabic
+tokens require a **request prefix** (`بال…` / `لهجة`/`لغة …`) so a bare adjective or proper noun
+(«المتحف المصري»، «الثورة المصرية») is NOT mistaken for a request; the English names (`\bgulf\b`,
+`\begyptian\b`, …) are left permissive by design (a known, accepted gap). First match wins; returns a
+descriptive phrase or `None`.
 
-**Spoken-dialect detection — `_detect_dialect(text)` ([server.py:564-577](server.py#L564)):** splits the
+**Spoken-dialect detection — `_detect_dialect(text)` ([server.py:574-587](server.py#L574)):** splits the
 transcript into Arabic-letter words (`_AR_WORD_SPLIT_RE`) and counts **distinguishing marker** hits:
 - `_NAJDI_MARKERS` = وش، أبغى/ابغى، الحين، زين، ماله، يبيلك، صج، عاد، هيه، أدري/ادري
 - `_HIJAZI_MARKERS` = إيش/ايش، أبي/ابي، دحين، هلا، تمام، إيوه/أيوه/ايوه، مشكور، كيفك
-- `_EGYPTIAN_MARKERS` = إزاي/ازاي، إزيك/ازيك، عايز/عاوز/عايزة، دلوقتي/دلوقت، مش، كده/كدا، علشان/عشان، ده، دي، دول، النهاردة، إمبارح/امبارح، أهو
+- `_EGYPTIAN_MARKERS` = إزاي/ازاي، إزيك/ازيك، عايز/عاوز/عايزة، دلوقتي/دلوقت، مش، كده/كدا، علشان، ده، دي، دول، النهاردة، إمبارح/امبارح، أهو، **إيه/ايه، كام، فين** (the Egyptian interrogatives, added to catch markerless-looking Egyptian; lifted Egyptian discrimination 58%→92% on the 100-Q test)
 
 Returns the strict-max dialect, or **`None` on no-marker or tie** (the common case for short
-utterances). Shared words (وين، ليش، بعدين، خلاص، يلا، بس، مرة) are deliberately excluded.
+utterances). Shared words are deliberately excluded — notably bare **`عشان`** (used across
+Najdi/Hijazi/Gulf/Egyptian; it was tying real Najdi utterances to Egyptian, so only `علشان` is kept), plus
+وين، ليش، بعدين، خلاص، يلا، بس، مرة.
 
-**Routing — the per-turn `lang_instruction` in `respond_loop` ([server.py:1079-1135](server.py#L1079)),
+**Routing — the per-turn `lang_instruction` in `respond_loop` ([server.py:1111-1182](server.py#L1111)),
 priority order:**
 1. **Explicit Arabic request** (`_requested_dialect` or `_WANTS_ARABIC_RE`) → reply in the named dialect,
-   or **Egyptian** if no dialect named ([:1079-1086](server.py#L1079)).
-2. **Explicit English request** (`_WANTS_ENGLISH_RE`) → English ([:1087-1092](server.py#L1087)).
-3. **`lang=="mixed"`** → mirror the AR/EN mix; Arabic parts in the detected dialect, else **Egyptian**
-   ([:1093-1102](server.py#L1093)).
-4. **`lang=="ar"`** → committed instruction for detected **Najdi / Hijazi / Egyptian**, else **Egyptian
-   default** ([:1103-1133](server.py#L1103)).
-5. **else (English)** → English ([:1134-1135](server.py#L1134)).
+   or **Fusha (MSA)** if no dialect named ([:1111-1124](server.py#L1111)).
+2. **Explicit English request** (`_WANTS_ENGLISH_RE`) → English ([:1125-1132](server.py#L1125)).
+3. **`lang=="mixed"`** → mirror the AR/EN mix; Arabic parts in the detected dialect, else **Fusha**
+   ([:1133-1144](server.py#L1133)).
+4. **`lang=="ar"`** → committed instruction for detected **Najdi / Hijazi / Egyptian**, else **Fusha
+   default** ([:1145-1181](server.py#L1145)).
+5. **else (English)** → English ([:1182](server.py#L1182)).
 
-So: clearly-detected Najdi/Hijazi/Egyptian win; English stays English; explicit Fusha (بالفصحى) is
-honored; **everything else Arabic defaults to Egyptian** (SYSTEM_PROMPT rule 4 reinforces this).
+So: clearly-detected Najdi/Hijazi/Egyptian win; English stays English; **everything else Arabic
+defaults to Fusha/MSA** (SYSTEM_PROMPT rule 4 reinforces this). Fusha is routed through the Saudi voice
+clip with `language="standard arabic"` — there is no separate spoken-Fusha classifier.
 STT recognition is biased toward dialect spelling via `_AR_HOTWORDS` on the forced-Arabic re-pass.
 
 **Per-dialect voice + pronunciation (in `respond_loop`, alongside `lang_instruction`):** each turn also
@@ -510,13 +522,13 @@ computes `tts_voice` and `tts_language`, both passed to `stream_tts_to_ws`:
 
 | Routed dialect | `tts_voice` (clip) | `tts_language` (OmniVoice `language=`) |
 |---|---|---|
-| Egyptian (detected) + unclear→Egyptian default | `egyptian` (Egyptian v2 clip) | `egyptian arabic` |
+| Egyptian (detected/requested) | `egyptian` (Egyptian **v3** clip) | `egyptian arabic` |
 | Najdi | `saudi` | `najdi arabic` |
 | Hijazi | `saudi` | `hijazi arabic` |
 | Gulf (explicit) | `saudi` | `gulf arabic` |
-| Fusha (explicit) | `saudi` | `standard arabic` |
+| **Fusha (default: unclear / no-marker / requested-no-dialect)** | `saudi` | `standard arabic` |
 | English | `saudi` | `None` |
-| Mixed AR+EN | per detected dialect | `None` (avoids mispronouncing the English) |
+| Mixed AR+EN | per detected dialect (else Saudi/Fusha) | `None` (avoids mispronouncing the English) |
 
 The `language=` ID pins OmniVoice's pronunciation to one dialect — this **fixed the Saudi/Egyptian
 word-mixing** where, with only a reference clip, some words came out in the wrong dialect.
@@ -565,7 +577,7 @@ word-mixing** where, with only a reference clip, some words came out in the wron
   mangles Egyptian/dialect words (e.g. `علطول`→`عُلْطُولُ`), which would re-MSA-ify dialect pronunciation.
   Production has zero tashkeel code; pronunciation is handled by the `language=` param + the reference voice.
   (The `catt_tashkeel` package may still sit unused in the venv.)
-- **Per-dialect accent IS implemented** — per-dialect reference clips (Egyptian v2 + Saudi) chosen by the
+- **Per-dialect accent IS implemented** — per-dialect reference clips (Egyptian v3 + Saudi) chosen by the
   voice registry, plus the OmniVoice `language=` ID per dialect (§11). Caveat: it depends on a good reference
   clip + the `language=` param; OmniVoice's zero-shot clone can still imperfectly capture an accent, so
   swapping a cleaner clip (one-line registry change) is the lever if a voice sounds off. (An earlier
@@ -577,22 +589,29 @@ word-mixing** where, with only a reference clip, some words came out in the wron
 
 ## 14. Current working-tree state
 
-Branch **`omnivoice-tts`**. Uncommitted (`git status`): modified `server.py`, `tts_omnivoice_v1.py`,
-`static/index.html`, `start_server.sh`, `requirements.txt`, `README.md`, `CLAUDE.md`,
-`test_local.py`, `logs/interactions.jsonl`; staged deletions of `voices/silma-tts-saudi-24k-v2.wav`,
-`-v2-trim.wav`, `-v3.wav`. Last commit: `09772ca feat: Switch TTS to OmniVoice with full pipeline fixes`.
+Branch **`omnivoice-tts`**. **HEAD = `ba71bbc`** ("Refine language detection and transcription handling for
+Arabic-script languages"). All **code** (`server.py`, `tts_omnivoice_v1.py`, `static/index.html`,
+`start_server.sh`) is **committed**; only the docs (`CLAUDE.md`, `README.md`, `SETUP.md`, this file) may
+carry an uncommitted refresh.
 
-**Notable uncommitted changes made in recent work:**
-- Dead-code/comment cleanup (removed unreachable `MODEL_CONFIGS`, `/models` endpoint, stale comments).
-- STT dialect recognition: `_AR_HOTWORDS` on the forced-Arabic re-pass + `no_repeat_ngram_size`/`repetition_penalty`.
-- Dialect engine: `_detect_dialect` (3-way Najdi/Hijazi/Egyptian) + committed per-turn routing; **Egyptian
-  added and made the DEFAULT**; dialect-aware abstention phrasing.
-- **Per-dialect voice registry** (`_VOICES`/`_resolve_voice`) + `voice=` param; added clips
-  `voices/omnivoice-tts-egyptian-24k-v2.wav` (active) and `…-egyptian-24k.wav` (v1, unused).
-- **Per-dialect `language=`** threaded through `stream_tts_to_ws` → `OmniVoice.generate()`;
-  `tts_voice`/`tts_language` computed per routing branch in `server.py` (fixes Saudi/Egyptian word-mixing).
+**Dialect / voice / STT work now in git (commits `2562aca` → `f3b1758` → `ba71bbc`):**
+- Dialect engine: `_detect_dialect` (3-way Najdi/Hijazi/Egyptian markers) + `_requested_dialect` (explicit
+  requests, Arabic tokens gated behind a `بال…`/`لهجة` request prefix so proper nouns don't false-trigger)
+  + committed per-turn routing; dialect-aware abstention phrasing.
+- **Fusha (MSA) is the DEFAULT** (unclear / no-marker / no-named-dialect / mixed-Arabic-part → Fusha),
+  reversing the earlier Egyptian-default; SYSTEM_PROMPT rule 4 reinforces it.
+- Egyptian markers refined: bare `عشان` removed (shared word); interrogatives `إيه/ايه/كام/فين` added
+  (Egyptian discrimination 58%→92% on a 100-question test).
+- **Per-dialect voice registry** (`_VOICES`/`_resolve_voice`) + `voice=` param; active Egyptian clip is
+  **`omnivoice-tts-egyptian-24k-v3.wav`** (v2/v1 unused). Per-dialect `language=` threaded through
+  `stream_tts_to_ws` → `OmniVoice.generate()` (fixes Saudi/Egyptian word-mixing).
+- **STT language pick**: `ur` removed from `_ARABIC_SCRIPT_REMAP`; non-en/ar guesses (ur/nn/hi/…) resolved
+  from the `info.all_language_probs` distribution (higher of P(en)/P(ar) wins) instead of blindly forcing
+  Arabic — stops accented English being transcribed as phonetic Arabic.
 - Tashkeel evaluated and **dropped** (CATT mangles dialect words).
-- Docs refreshed (`CLAUDE.md`, this `ARCHITECTURE.md`); `start_server.sh` SSH-keepalive note; `requirements.txt` branch note.
 
-Nothing is committed yet — all changes are reversible. (Note: a few `file:line` refs in §6–§12 may be off by
-~10–20 lines after the voice/language additions; symbol names are accurate.)
+The older switchable-LLM version lives on the `multi-engine-snapshot` branch.
+
+> **Line-ref note:** `file:line` refs in §6.7–§6.8 and §11 (dialect/STT) were re-synced to the current
+> tree. A few refs in §6.9–§6.10/§12 may be off by ~30 lines after the STT/marker insertions — symbol
+> names are authoritative; grep the symbol if a line number looks off.
