@@ -27,8 +27,8 @@ missing. Both active clips are committed in git under `voices/`:
 - `voices/silma-tts-saudi-24k.wav` — Saudi default voice (Najdi/Hijazi/Fusha/English)
 - `voices/omnivoice-tts-egyptian-24k-v3.wav` — active Egyptian voice
 
-(Older Egyptian clips `omnivoice-tts-egyptian-24k-v2.wav` and `…-egyptian-24k.wav` remain in the tree but
-are unused — the registry points only at v3.)
+(The superseded Egyptian v1/v2 clips were deleted from the tree on 2026-07-06 — recover from git history
+if ever needed.)
 
 ---
 
@@ -129,6 +129,8 @@ tunnel works; a raw remote IP over plain HTTP will be blocked by the browser. Us
 | `LLM_NUM_CTX` | `8192` | qwen3.5 context / KV-cache size (used by warm-up *and* chat — keep them equal) |
 | `OMNIVOICE_MODEL` | `k2-fsa/OmniVoice` | TTS model id |
 | `OMNIVOICE_DEVICE` | `cuda:0` | TTS device |
+| `FRCRN_ENABLED` | `0` (**off**) | `1` loads the FRCRN denoiser again (A/B only — evidence says enhancement hurts Whisper) |
+| `SAVE_UTTERANCES` | `0` | `1` saves each accepted utterance's raw audio + manifest row to `logs/utterances/` (eval ground truth) |
 | `OLLAMA_FLASH_ATTENTION` / `OLLAMA_KV_CACHE_TYPE` | `1` / `q8_0` | set on a fresh `ollama serve` (halve KV VRAM) |
 | `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` | reduce CUDA fragmentation |
 

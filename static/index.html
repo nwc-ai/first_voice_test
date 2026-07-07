@@ -45,41 +45,10 @@
     }
     #hint { font-size: 0.78rem; color: #444; text-align: center; }
     #connect-btn:disabled { opacity: 0.35; cursor: not-allowed; animation: none; }
-
-    /* Model + TTS selectors */
-    .selector-row {
-      display: flex; align-items: center; gap: 10px;
-      width: 100%; max-width: 580px;
-    }
-    .selector-row label {
-      font-size: 0.82rem; color: #aaa; white-space: nowrap;
-      font-weight: 600; direction: ltr; min-width: 46px;
-    }
-    .selector-row select {
-      flex: 1; background: #1e1e2e; border: 1px solid #4a4a8a;
-      color: #e0e0ff; border-radius: 8px; padding: 8px 12px;
-      font-size: 0.88rem; cursor: pointer; outline: none;
-      direction: ltr; text-align: left; appearance: auto;
-    }
-    .selector-row select:hover  { border-color: #7a7aff; }
-    .selector-row select:disabled { opacity: 0.4; cursor: not-allowed; }
-    .reload-btn {
-      background: #1a1a2e; border: 1px solid #3a3a6a; color: #888;
-      border-radius: 6px; padding: 6px 10px; cursor: pointer; font-size: 1rem;
-    }
-    .reload-btn:hover { border-color: #7a7aff; color: #aaf; }
   </style>
 </head>
 <body>
   <h1>المساعد الصوتي — OmniVoice</h1>
-
-  <div id="model-row" class="selector-row">
-    <label>LLM:</label>
-    <select id="model-select">
-      <option>Loading...</option>
-    </select>
-    <button id="reload-btn" class="reload-btn" title="Reload model list">↻</button>
-  </div>
 
   <div id="status">اضغط للاتصال</div>
 
@@ -120,6 +89,10 @@ let nextStartTime = 0;
 let playGen       = 0;                   // bumped on clear — invalidates in-flight decodes
 let decodeChain   = Promise.resolve();   // serializes decodes so sentences play in order
 let isPlaying     = false;
+let pausedForBarge = false;  // playback suspended while the server decides whether the detected
+                             // speech is a real barge-in (→ transcript clears it) or noise
+                             // (→ resume_playback un-pauses it). We no longer DESTROY audio on
+                             // speech onset — that killed replies for bystander noise.
 
 // Client-side barge-in (works on SPEAKERS): detect the user talking over the AI
 // directly on the mic data and stop playback locally + instantly. Server-side VAD
@@ -149,24 +122,16 @@ const transcriptEl = document.getElementById('transcript-text');
 const responseEl   = document.getElementById('response-text');
 const connectBtn   = document.getElementById('connect-btn');
 const hintEl       = document.getElementById('hint');
-const modelSelect  = document.getElementById('model-select');
-const reloadBtn    = document.getElementById('reload-btn');
+
+let rejectedTimer = null;   // reverts the brief "didn't catch that" status back to listening
 
 function setStatus(text, cls) {
   statusEl.textContent = text;
   statusEl.className   = cls || '';
 }
 
-// ── LLM is LOCKED to qwen3.5:27b ────────────────────────────────────────────────
-// The server enforces this (ignores any model param); the UI shows it as the only,
-// fixed option so it can't be changed to a second LLM (which would OOM the GPU).
-async function loadModels() {
-  modelSelect.innerHTML = '<option value="qwen3.5:27b">qwen3.5:27b</option>';
-  modelSelect.value = 'qwen3.5:27b';
-}
-
-reloadBtn.style.display = 'none';   // nothing to reload — model is fixed
-loadModels();
+// The LLM is fixed server-side (qwen3.5:27b) — the old decorative one-option dropdown
+// and its ?model= query param were removed; the server never honored them.
 
 // ── AudioWorklet inline ──────────────────────────────────────────────────────
 const WORKLET_CODE = `
@@ -229,10 +194,8 @@ async function connect() {
   workletNode  = new AudioWorkletNode(audioCtx, 'mic-sender');
   source.connect(workletNode);
 
-  // Pass selected model as a query param
-  const selectedModel = encodeURIComponent(modelSelect.value || '');
   const WS_PROTO = location.protocol === 'https:' ? 'wss://' : 'ws://';
-  const WS_URL = `${WS_PROTO}${location.host}/ws?model=${selectedModel}`;
+  const WS_URL = `${WS_PROTO}${location.host}/ws`;
   wantReconnect = true;
 
   // Socket-scoped handlers: `sock` is captured locally so a STALE socket's
@@ -242,9 +205,6 @@ async function connect() {
   const sock = new WebSocket(WS_URL);
   sock.binaryType = 'arraybuffer';
   ws = sock;
-
-  // Lock selector while connected
-  modelSelect.disabled = true;
 
   sock.onopen = () => {
     if (sock !== ws) { try { sock.close(); } catch (_) {} return; }  // superseded
@@ -313,7 +273,6 @@ function disconnect(stopServer = true) {
   connectBtn.disabled    = false;   // re-enable even if we dropped mid-'loading'
   hintEl.textContent     = 'اضغط للاتصال — سيستمع تلقائياً بعد ذلك';
   setStatus('اضغط للاتصال', '');
-  modelSelect.disabled = false;
 
   clearAudioQueue();
   if (workletNode) { workletNode.port.onmessage = null; workletNode.disconnect(); workletNode = null; }
@@ -354,12 +313,38 @@ function handleMessage(event) {
     setStatus('يستمع...', 'listening');
     return;
   }
+  if (msg.event === 'stt_rejected') {
+    // Server heard speech but couldn't use it (wrong language, garbled) — show a brief
+    // notice instead of the old silent nothing, which looked like a dead mic.
+    setStatus('لم أفهم — حاول مرة أخرى', 'processing');
+    if (rejectedTimer) clearTimeout(rejectedTimer);
+    rejectedTimer = setTimeout(() => {
+      rejectedTimer = null;
+      if (connected && !isPlaying) { connectBtn.className = 'connected'; setStatus('يستمع...', 'listening'); }
+    }, 2500);
+    return;
+  }
   if (msg.event === 'speech_start') {
-    clearAudioQueue();
+    // PAUSE (not destroy) any playing audio while the server checks whether this is real
+    // speech. Real speech → the transcript event clears the queue; noise → resume_playback.
+    if (playCtx && playCtx.state === 'running' && (isPlaying || activeSources.length > 0)) {
+      playCtx.suspend();          // sample-accurate freeze; queued sentences stay scheduled
+      pausedForBarge = true;
+    }
     // Don't clear the response box here: if the AI was still thinking, its
     // answer keeps streaming — the box is cleared on the next transcript.
     connectBtn.className   = 'connected user-speaking';
     setStatus('تتحدث...', 'speaking');
+  }
+  if (msg.event === 'resume_playback') {
+    // The "speech" was rejected as noise — continue the reply where it paused.
+    if (pausedForBarge && playCtx && playCtx.state === 'suspended') {
+      playCtx.resume();
+      connectBtn.className = 'connected ai-speaking';
+      setStatus('يتكلم...', 'speaking');
+    }
+    pausedForBarge = false;
+    return;
   }
   if (msg.event === 'transcript') {
     clearAudioQueue();               // stop any lingering audio from the previous turn
@@ -443,6 +428,12 @@ function clearAudioQueue() {
   activeSources = [];
   nextStartTime = 0;
   isPlaying     = false;
+  // If we were paused for a barge check, un-suspend the (now empty) context so the NEXT
+  // turn's audio can play — a suspended context would freeze all future playback.
+  if (pausedForBarge && playCtx && playCtx.state === 'suspended') {
+    try { playCtx.resume(); } catch (_) {}
+  }
+  pausedForBarge = false;
   if (wasPlaying) sendControl('playback_done');
 }
 </script>

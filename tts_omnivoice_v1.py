@@ -88,6 +88,17 @@ _DEVICE   = os.environ.get("OMNIVOICE_DEVICE", "cuda:0")
 _model = None
 _model_lock = threading.Lock()
 
+# generate() is serialized: OmniVoice is not documented thread-safe, and a barge-in orphans an
+# in-flight to_thread synthesis (the thread runs to completion) — without this lock the next
+# turn's first sentence could run generate() CONCURRENTLY with the orphaned one on the same
+# model object, doubling scratch VRAM and slowing both exactly when responsiveness matters.
+_gen_lock = threading.Lock()
+
+# Precomputed voice-clone prompts, one per registry voice (built in warm_up()). Passing
+# voice_clone_prompt= to generate() skips the per-sentence reference-clip load + silence-trim +
+# audio-tokenizer encode (~16 ms/sentence measured, plus disk I/O).
+_voice_prompts: dict[str, Any] = {}
+
 
 def load_models():
     """Optional warm-up hook — call from FastAPI lifespan so the first user
@@ -99,6 +110,17 @@ def load_models():
                 f"Place the reference WAV at that path before starting the server."
             )
     _get_model()
+
+
+def warm_up():
+    """Precompute the clone prompt for every registry voice and run one tiny synthesis, so the
+    first real turn pays neither first-inference CUDA kernel cost nor reference encoding.
+    Call after load_models() (server lifespan does)."""
+    model = _get_model()
+    for key, (ref_audio, ref_text) in _VOICES.items():
+        if key not in _voice_prompts and os.path.exists(ref_audio):
+            _voice_prompts[key] = model.create_voice_clone_prompt(ref_audio, ref_text)
+    _synthesize_mp3_blocking("مرحبا.", DEFAULT_VOICE, None)
 
 
 def _get_model():
@@ -142,21 +164,23 @@ def _strip_openers(text: str) -> str:
 
 # ── Blocking synthesis helpers (run via asyncio.to_thread) ───────────────────────────────
 
-def _synthesize_mp3_blocking(text: str, ref_audio: str = _REF_AUDIO, ref_text: str = _REF_TEXT,
+def _synthesize_mp3_blocking(text: str, voice: str = DEFAULT_VOICE,
                              language: Optional[str] = None) -> bytes:
     """OmniVoice inference + LAME MP3 encode in one blocking call (one to_thread dispatch).
     Returns a complete MP3 container — browser decodeAudioData requires this.
-    ref_audio/ref_text select the cloned voice (default = Saudi). `language` is an OmniVoice dialect
+    `voice` is a registry key ("saudi"/"egyptian"); the precomputed clone prompt is used when
+    available, else falls back to per-call ref_audio/ref_text. `language` is an OmniVoice dialect
     ID (e.g. "egyptian arabic" → arz) that pins pronunciation to one dialect; None = language-agnostic."""
     import lameenc
     model = _get_model()
+    prompt = _voice_prompts.get(voice)
     # OmniVoice.generate returns a list of float32 np.ndarray (T,) at 24 kHz.
-    audio = model.generate(
-        text=text,
-        ref_audio=ref_audio,
-        ref_text=ref_text,
-        language=language,
-    )
+    with _gen_lock:   # strict serialization — see _gen_lock comment
+        if prompt is not None:
+            audio = model.generate(text=text, voice_clone_prompt=prompt, language=language)
+        else:
+            ref_audio, ref_text = _resolve_voice(voice)
+            audio = model.generate(text=text, ref_audio=ref_audio, ref_text=ref_text, language=language)
     pcm_int16 = (np.clip(audio[0], -1.0, 1.0) * 32767).astype(np.int16)
     enc = lameenc.Encoder()
     enc.set_bit_rate(64)
@@ -168,9 +192,9 @@ def _synthesize_mp3_blocking(text: str, ref_audio: str = _REF_AUDIO, ref_text: s
     return mp3
 
 
-async def _synthesize_mp3(text: str, ref_audio: str = _REF_AUDIO, ref_text: str = _REF_TEXT,
+async def _synthesize_mp3(text: str, voice: str = DEFAULT_VOICE,
                           language: Optional[str] = None) -> bytes:
-    return await asyncio.to_thread(_synthesize_mp3_blocking, text, ref_audio, ref_text, language)
+    return await asyncio.to_thread(_synthesize_mp3_blocking, text, voice, language)
 
 
 # ── Public WebSocket API (identical signature to the Silma module) ───────────────────────
@@ -182,23 +206,31 @@ async def stream_tts_to_ws(
     on_first_audio=None,
     voice: Optional[str] = None,
     language: Optional[str] = None,
+    is_truncated=None,   # callable → True when the LLM stopped on its token cap
+                         # (done_reason=="length"); the unterminated tail is then not spoken
+    chunk_filter=None,   # callable(str) -> str applied to each flushed sentence-chunk BEFORE
+                         # it is displayed or queued for TTS ("" = drop the chunk entirely).
+                         # server.py uses it for the meta-leak filter + dialect word fixups.
 ) -> None:
     """
     Consume an async token generator, synthesise sentence-by-sentence with OmniVoice,
     and send audio + text events over a WebSocket connection.
 
-    Tokens stream to the browser continuously while a single background worker
-    synthesises queued sentences — the LLM is never stalled by GPU synthesis.
+    Text is emitted to the browser per sentence-chunk (the same flush points that feed TTS),
+    not per token — so `chunk_filter` can rewrite or drop a whole sentence before ANY of it
+    is shown, and the response box always carries exactly what the voice says. A single
+    background worker synthesises queued sentences — the LLM is never stalled by GPU synthesis.
 
     Message types:
-      JSON  {"event":"token","text":...}  — emitted text (display)
+      JSON  {"event":"token","text":...}  — one flushed sentence-chunk (display)
       bytes <raw MP3>                      — one complete MP3 per sentence
       JSON  {"event":"tts_end"}            — all audio sent
 
     Cancellation checked at three points: (a) token loop top, (b) before synth, (c) after synth.
     """
     sentence_queue: asyncio.Queue = asyncio.Queue()
-    ref_audio, ref_text = _resolve_voice(voice)   # pick the cloned voice for this whole turn
+    # Pick the cloned voice for this whole turn (unknown/missing key → Saudi default).
+    voice_key = voice if voice in _VOICES else DEFAULT_VOICE
 
     async def synth_worker():
         nonlocal on_first_audio
@@ -209,7 +241,7 @@ async def stream_tts_to_ws(
             if cancel_event.is_set():                               # (b)
                 continue   # keep draining so the producer's sentinel is reached
             try:
-                audio_bytes = await _synthesize_mp3(_expand_abbreviations(sentence), ref_audio, ref_text, language)
+                audio_bytes = await _synthesize_mp3(_expand_abbreviations(sentence), voice_key, language)
             except Exception as e:
                 print(f"[tts] synthesis failed, skipping sentence: {type(e).__name__}: {e}")
                 continue
@@ -224,20 +256,34 @@ async def stream_tts_to_ws(
     buffer = ""
     flushed_any = False
 
+    async def _deliver(chunk: str, tts: bool) -> str:
+        # The single checkpoint every chunk passes through: filter/rewrite → display →
+        # (optionally) TTS queue. Display and audio therefore always carry IDENTICAL text.
+        # Returns the delivered text ("" when chunk_filter dropped the chunk).
+        if chunk_filter is not None:
+            chunk = chunk_filter(chunk)
+        if not chunk:
+            return ""
+        await ws.send_json({"event": "token", "text": chunk + " "})
+        if tts:
+            await sentence_queue.put(chunk)
+        return chunk
+
     async def _emit(text_chunk: str) -> None:
-        # Send text to the browser (display) AND feed it into the sentence buffer (TTS),
-        # so the response box and the spoken audio always carry IDENTICAL text.
+        # Feed tokens into the sentence buffer; each flushed sentence goes through _deliver.
+        # (Display moved from per-token to per-chunk 2026-07-07 so the meta-leak filter and
+        # dialect fixups can rewrite/drop a sentence before any of it reaches the browser.)
         nonlocal buffer, flushed_any
         if not text_chunk:
             return
-        await ws.send_json({"event": "token", "text": text_chunk})
         for char in text_chunk:
             buffer += char
             if _should_flush(buffer, char, first=not flushed_any):
                 sentence = buffer.strip()
                 buffer = ""
-                if sentence:
-                    await sentence_queue.put(sentence)
+                if sentence and await _deliver(sentence, tts=True):
+                    # a filtered-out chunk does NOT count as the first flush, so
+                    # FIRST_SOFT_MIN still applies to the real first sentence
                     flushed_any = True
 
     head = ""
@@ -263,9 +309,15 @@ async def stream_tts_to_ws(
         # Response ended before the head threshold (very short reply) — emit what we have.
         if not head_done and head and not cancel_event.is_set():
             await _emit(_strip_openers(head))
-        # Flush any remaining text that didn't end with punctuation.
+        # Flush any remaining text that didn't end with punctuation — UNLESS the LLM hit its
+        # num_predict cap: that tail is a fragment cut mid-sentence and speaking it aloud sounds
+        # broken ("...وبالتالي فإن الحضارة المصرية كا—"). It stays visible in the text box.
         if buffer.strip() and not cancel_event.is_set():
-            await sentence_queue.put(buffer.strip())
+            if is_truncated is not None and is_truncated():
+                print(f"[tts] dropping truncated tail (LLM token cap): {buffer.strip()[:60]!r}")
+                await _deliver(buffer.strip(), tts=False)   # display-only, never spoken
+            else:
+                await _deliver(buffer.strip(), tts=True)
     finally:
         # Close the LLM stream promptly so a barge-in stops Ollama generating.
         aclose = getattr(token_gen, "aclose", None)
@@ -280,6 +332,8 @@ async def stream_tts_to_ws(
             # GPU synthesis to finish (can take 2-5s). The underlying thread still
             # runs to completion, but this task's await returns as soon as the
             # current to_thread call exits — no extra sentences are processed.
+            # (_gen_lock makes the orphaned thread harmless: the next turn's first
+            # synthesis simply queues behind it instead of running concurrently.)
             worker.cancel()
         try:
             await worker

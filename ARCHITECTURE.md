@@ -8,6 +8,24 @@ voice assistant. Nothing in the codebase is intentionally omitted. Line referenc
 > The dialect routing, **Fusha-as-default**, the Egyptian **v3** voice, and the STT language-pick
 > refinement are all committed (HEAD = `ba71bbc`); only the docs may carry an uncommitted refresh (see §14).
 
+> ⚠️ **2026-07-06 review-fix pass — sections below are PARTIALLY STALE** (line numbers and some behavior).
+> What changed (see CLAUDE.md for detail; symbol names remain authoritative here):
+> - **License:** OmniVoice *weights* are **CC-BY-NC** (code Apache-2.0) — commercial plan pending.
+> - `num_predict` 300→400 + `done_reason=="length"` guard (truncated tails are displayed, never spoken).
+> - Dialect markers revised: أيوه/تمام/هلا removed from Hijazi; مش/ده/دي demoted to 0.5-weight Egyptian
+>   markers (win needs score ≥ 1.0). Request parsing: negation guard, translation-question exclusion,
+>   English dialect names need request context. Routing extracted to `_route_turn()` (testable).
+> - STT: forced-re-decode results skip the first-pass lang-prob gate; per-word confidence replaced by
+>   `exp(avg_logprob)` (word_timestamps removed); >500-char utterances truncated not dropped; MIN 2 chars;
+>   repetition filter needs 6+ repeats; rejects send an `stt_rejected` UI event. Dead Latin-remap deleted.
+> - **FRCRN denoiser OFF by default** (`FRCRN_ENABLED=1` to A/B). `SAVE_UTTERANCES=1` collects eval audio.
+> - Whisper + OmniVoice warm inference at startup; per-voice clone prompts precomputed; OmniVoice
+>   `generate()` serialized behind a lock; injection filter tightened + speaks a refusal; empty-LLM
+>   fallback skips when a newer utterance is queued; `empty_cache` off-loop; background tasks hold refs.
+> - `/review` HTML moved to `static/review.html`; decorative model selector + `?model=` removed;
+>   Egyptian v1/v2 clips deleted; **`eval/` harness added** (routing regression suite, dialect-ID eval,
+>   per-dialect WER scorer — `eval/README.md`).
+
 ---
 
 ## Table of contents
@@ -204,7 +222,7 @@ The 1298-line core. Sections below follow the file top-to-bottom.
   server (a second LLM would OOM the GPU).
 - **`SYSTEM_PROMPT`** ([:112-144](server.py#L112)) — the full system message. 13 numbered rules
   (0–12): rule 0 language-override; rule 1 English→English; **rule 2 dialect map (Najdi/Hijazi/
-  Egyptian/Gulf with example words)**; rule 3 code-switch mirroring; **rule 4 unclear → DEFAULT
+  Egyptian/Fusha — Gulf removed 2026-07-07)**; rule 3 code-switch mirroring; **rule 4 unclear → DEFAULT
   Fusha/MSA (not a regional dialect)**; rule 5 never mix two dialects; rule 6 no CJK/Cyrillic scripts; rule 7
   full spoken sentences; rule 8 punctuation; rule 9 no markdown; rule 10 no filler openers; rule 11
   never ask for clarification; rule 12 spell out abbreviations (voice).
@@ -525,7 +543,6 @@ computes `tts_voice` and `tts_language`, both passed to `stream_tts_to_ws`:
 | Egyptian (detected/requested) | `egyptian` (Egyptian **v3** clip) | `egyptian arabic` |
 | Najdi | `saudi` | `najdi arabic` |
 | Hijazi | `saudi` | `hijazi arabic` |
-| Gulf (explicit) | `saudi` | `gulf arabic` |
 | **Fusha (default: unclear / no-marker / requested-no-dialect)** | `saudi` | `standard arabic` |
 | English | `saudi` | `None` |
 | Mixed AR+EN | per detected dialect (else Saudi/Fusha) | `None` (avoids mispronouncing the English) |

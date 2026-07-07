@@ -13,3 +13,6 @@ checkpoints/
 
 # Logs and temp files
 *.log
+
+# A/B run reports — data, not code
+eval/ab_runs/
