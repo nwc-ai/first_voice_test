@@ -92,8 +92,11 @@ STT is also biased toward dialect spelling via Whisper `hotwords` on the forced-
   `stream_tts_to_ws`) BEFORE display/TTS: `_META_LEAK_RE` drops rules-narrating sentences (tight,
   first-person meta only — grammar answers about «القاعدة الأولى» and the unknown-dialect note pass),
   and `_DIALECT_FIXUPS` swaps single wrong-dialect words whose replacement fills the IDENTICAL syntax
-  slot (جداً→مرة/أوي، دلوقتي↔الحين/دحين، كتير↔كثير) — ده/دي/مش/كمان are deliberately NOT
-  auto-fixed (need restructuring; prompt's job). Fixups are skipped on translation questions and Fusha.
+  slot (جداً→مرة/أوي، دلوقتي↔الحين/دحين، كتير↔كثير; since 2026-07-08 also the Saudi-dialect
+  demonstrative/negation swaps ده/دا→هذا، دي→هذي، كده/كدا→كذا، مش→مو، هيك→كذا — postposed
+  Egyptian demonstratives map 1:1 onto Najdi/Hijazi ones, so the old "needs restructuring"
+  exclusion was too conservative; هيك→كده also fires in Egyptian). كمان stays un-fixed
+  (placement varies). Fixups are skipped on translation questions and Fusha.
   Text display is therefore **per sentence-chunk, not per token** — box and voice always carry
   identical, filtered text. Abstention phrases («مش متأكد بصراحة») are ONLY for genuine uncertainty,
   never openers; unknown proper names are omitted, not guessed.

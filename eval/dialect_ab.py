@@ -16,6 +16,10 @@ Usage:
     .venv/bin/python eval/dialect_ab.py                          # full run (~60 turns, 3-5 min)
     .venv/bin/python eval/dialect_ab.py --tag before-register    # names the report file
     .venv/bin/python eval/dialect_ab.py --dialects Najdi,Egyptian
+    LLM_THINK=1 .venv/bin/python eval/dialect_ab.py --tag think-on   # qwen thinking mode
+                    # (env flag read by server.py at import; num_predict auto-raised to 1500;
+                    #  per-turn seconds + thinking size are recorded so the latency cost of
+                    #  thinking is measured, not guessed)
 Requires Ollama running on localhost:11434 with the pinned model (start_server.sh starts it).
 Reports land in eval/ab_runs/<timestamp>[-tag].md (gitignored — they are data, not code).
 """
@@ -25,6 +29,7 @@ import datetime
 import json
 import os
 import sys
+import time
 
 import httpx
 
@@ -75,13 +80,14 @@ QUESTIONS = [
 ]
 
 
-def ask_ollama(client: httpx.Client, messages: list[dict]) -> str:
+def ask_ollama(client: httpx.Client, messages: list[dict]) -> tuple[str, str]:
     cfg = server._get_model_config(MODEL)
     payload = {"model": MODEL, "messages": messages, "stream": False,
                "options": cfg["options"], **cfg["extra"]}
-    r = client.post(OLLAMA_URL, json=payload, timeout=180.0)
+    r = client.post(OLLAMA_URL, json=payload, timeout=300.0)
     r.raise_for_status()
-    return (r.json().get("message") or {}).get("content", "").strip()
+    msg = r.json().get("message") or {}
+    return (msg.get("content", "") or "").strip(), (msg.get("thinking", "") or "").strip()
 
 
 def run_turn(client, text: str, lang: str) -> dict:
@@ -90,13 +96,16 @@ def run_turn(client, text: str, lang: str) -> dict:
         {"role": "system", "content": server.SYSTEM_PROMPT},
         {"role": "user",   "content": server._build_turn_content(text, route)},
     ]
-    raw = ask_ollama(client, messages)
+    t0 = time.time()
+    raw, thinking = ask_ollama(client, messages)
+    elapsed = time.time() - t0
     target = lint._TTS_LANG_TO_DIALECT.get(route["tts_language"] or "")
     leaks, drift = lint.find_leaks(raw, target) if target else ([], [])
     fixups: list[str] = []
     delivered = server._apply_fixups(raw, route["tts_language"] if not route["translation_q"] else None, fixups)
     return {"route": route["route"], "target": target, "raw": raw, "delivered": delivered,
-            "leaks": leaks, "drift": drift, "fixups": fixups}
+            "leaks": leaks, "drift": drift, "fixups": fixups,
+            "elapsed_s": elapsed, "thinking": thinking}
 
 
 def main() -> int:
@@ -131,22 +140,27 @@ def main() -> int:
                     continue
                 s = stats[d]
                 s["n"] += 1
+                s["secs"] = s.get("secs", 0.0) + r["elapsed_s"]
                 flags = []
                 if r["leaks"]:  s["leaky"]  += 1; flags.append("LEAK: "  + "، ".join(r["leaks"]))
                 if r["drift"]:  s["drifty"] += 1; flags.append("drift: " + "، ".join(r["drift"]))
                 if r["fixups"]: s["fixed"]  += 1; flags.append("would-fix: " + "، ".join(r["fixups"]))
-                print(f"  {qid:<14} [{kind}] {' | '.join(flags) if flags else 'clean'}")
-                lines.append(f"### {qid} [{kind}] — {' | '.join(flags) if flags else 'clean'}")
+                think_note = f"  [think {len(r['thinking'])}ch]" if r["thinking"] else ""
+                print(f"  {qid:<14} [{kind}] {r['elapsed_s']:.1f}s{think_note} {' | '.join(flags) if flags else 'clean'}")
+                lines.append(f"### {qid} [{kind}] — {r['elapsed_s']:.1f}s — {' | '.join(flags) if flags else 'clean'}")
                 lines.append(f"**Q:** {text}\n\n**A (raw):** {r['raw']}\n")
                 if r["fixups"]:
                     lines.append(f"**A (delivered):** {r['delivered']}\n")
+                if r["thinking"]:
+                    lines.append(f"<details><summary>thinking ({len(r['thinking'])} chars)</summary>\n\n{r['thinking'][:1500]}\n</details>\n")
 
-    print(f"\n{'dialect':>9}  {'turns':>5}  {'leaky':>5}  {'drifty':>6}  {'would-fix':>9}")
-    lines.append("\n## Summary\n\n| dialect | turns | leaky | drifty | would-fix |\n|---|---|---|---|---|")
+    print(f"\n{'dialect':>9}  {'turns':>5}  {'leaky':>5}  {'drifty':>6}  {'would-fix':>9}  {'avg-sec':>7}")
+    lines.append("\n## Summary\n\n| dialect | turns | leaky | drifty | would-fix | avg sec/turn |\n|---|---|---|---|---|---|")
     for d in dialects:
         s = stats[d]
-        print(f"{d:>9}  {s['n']:>5}  {s['leaky']:>5}  {s['drifty']:>6}  {s['fixed']:>9}")
-        lines.append(f"| {d} | {s['n']} | {s['leaky']} | {s['drifty']} | {s['fixed']} |")
+        avg = s.get("secs", 0.0) / max(s["n"], 1)
+        print(f"{d:>9}  {s['n']:>5}  {s['leaky']:>5}  {s['drifty']:>6}  {s['fixed']:>9}  {avg:>6.1f}s")
+        lines.append(f"| {d} | {s['n']} | {s['leaky']} | {s['drifty']} | {s['fixed']} | {avg:.1f} |")
 
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))

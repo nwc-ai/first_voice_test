@@ -75,6 +75,15 @@ MAX_HISTORY_TURNS = 3   # rolling memory: keep only the last N user+assistant pa
 # q8_0 KV cache in start_server.sh makes a bigger context affordable. Used by BOTH the
 # warm-up and the chat requests so the model loads once at this size (no reload).
 LLM_NUM_CTX = int(os.environ.get("LLM_NUM_CTX", "8192"))
+
+# Qwen thinking mode — DEFAULT OFF, testing flag only (LLM_THINK=1 bash start_server.sh).
+# think:True makes the model reason SILENTLY inside the same num_predict budget before any
+# spoken token: at 300–400 tokens that means EMPTY replies (the 2026-07-08 live incident:
+# done_reason=length, thinking=1284 chars, content=0), and even correctly budgeted it adds
+# seconds of dead air before the first sentence. When ON, num_predict is raised so the budget
+# covers thinking + a full answer. Never hardcode think:True in MODEL_CONFIGS — use this flag.
+LLM_THINK       = os.environ.get("LLM_THINK", "0") == "1"
+LLM_NUM_PREDICT = 1500 if LLM_THINK else 400
 LOG_DIR      = os.path.join(os.path.dirname(__file__), "logs")
 PERF_LOG     = os.path.join(LOG_DIR, "interactions.jsonl")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -207,6 +216,10 @@ def _load_all_blocking():
     else:
         print("FRCRN denoiser disabled (default — evidence says enhancement hurts Whisper; "
               "set FRCRN_ENABLED=1 to A/B).")
+
+    if LLM_THINK:
+        print("⚠ LLM THINKING MODE ON (LLM_THINK=1, num_predict 1500) — TESTING ONLY: "
+              "expect several seconds of silence before each reply while the model reasons.")
 
     # Warm inference — symmetrical with _warm_llm: loading weights alone leaves the first real
     # turn paying first-inference CUDA kernel/allocator cost for Whisper AND OmniVoice (plus the
@@ -813,6 +826,23 @@ def _turn_dialect_label(route: dict[str, Any]) -> str:
     return route["requested_dialect"] or route["detected_dialect"] or "Fusha"
 
 
+def _purity_reminder(route: dict[str, Any]) -> str:
+    """THE one deliberately double-stated rule (owner decision 2026-07-08): dialect purity.
+    Already in SYSTEM_PROMPT rules 2+5 and the cards; this repeats it ONCE more in the
+    strongest slot a prompt has — the very last line before generation (recency). Names ONLY
+    the routed dialect (never lists other dialects' words — in-context exemplars seed the
+    exact leakage this fights). English turns get nothing (no leak surface)."""
+    cur = _turn_dialect_label(route)
+    if cur == "English":
+        return ""
+    if cur == "Fusha":
+        what = ("correct Modern Standard Arabic (الفصحى) — ZERO regional-dialect words")
+    else:
+        what = (f"pure {cur} — if even ONE word belongs to another Arabic dialect, "
+                f"swap it for the {cur} word before writing it")
+    return f"\n\nREMEMBER — the most important rule of this reply: every single word must be {what}."
+
+
 def _build_turn_content(text: str, route: dict[str, Any],
                         history_dialects: Optional[list[str]] = None) -> str:
     """Per-turn user-message wrapper: the routed dialect instruction (with its card) + the few
@@ -847,6 +877,7 @@ def _build_turn_content(text: str, route: dict[str, Any],
         f"{contrast}"
         f"{no_meta}.\n\n"
         f"User: {text}"
+        f"{_purity_reminder(route)}"
     )
 
 
@@ -881,12 +912,17 @@ _META_LEAK_RE = re.compile(
 _AR_FIX_PRE = r"((?:[وفب])?(?:ال)?)"
 _AR_LETTER  = r"[ء-يًٌٍَُِّْ]"
 
-def _fixup(word_pattern: str, target: str, label: str) -> tuple[re.Pattern, str, str]:
-    return (re.compile(rf"(?<!{_AR_LETTER}){_AR_FIX_PRE}{word_pattern}(?!{_AR_LETTER})",
+# Narrow prefix for the demonstrative/negation swaps: و/ف only — no ب (would swallow the
+# Levantine verb بده "he wants") and no ال (المش is an Egyptian food noun).
+_AR_FIX_PRE_NB = r"((?:[وف])?)"
+
+def _fixup(word_pattern: str, target: str, label: str,
+           pre: str = _AR_FIX_PRE) -> tuple["re.Pattern[str]", str, str]:
+    return (re.compile(rf"(?<!{_AR_LETTER}){pre}{word_pattern}(?!{_AR_LETTER})",
                        re.UNICODE),
             rf"\1{target}", label)
 
-_DIALECT_FIXUPS: dict[str, list[tuple[re.Pattern, str, str]]] = {
+_DIALECT_FIXUPS: dict[str, list[tuple["re.Pattern[str]", str, str]]] = {
     "najdi arabic":    [_fixup(r"جد(?:ًا|اً|ا)", "مرة",    "جداً→مرة"),
                         _fixup(r"دلوقتي",        "الحين",   "دلوقتي→الحين"),
                         _fixup(r"كتير",          "كثير",    "كتير→كثير")],
@@ -896,6 +932,23 @@ _DIALECT_FIXUPS: dict[str, list[tuple[re.Pattern, str, str]]] = {
                         _fixup(r"الحين",         "دلوقتي",  "الحين→دلوقتي"),
                         _fixup(r"كثير",          "كتير",    "كثير→كتير")],
 }
+
+# Saudi-dialect demonstrative/negation swaps (added 2026-07-08 after «الدنيا دي مجرد محطة»
+# and «غير هيك» reached a LIVE Najdi reply despite the card). Previously excluded as
+# "needs restructuring" — too conservative: unlike كمان (placement varies), these occupy the
+# IDENTICAL syntax slot in both dialects. Egyptian postposed ده/دي maps 1:1 onto Najdi/Hijazi
+# postposed هذا/هذي; مش→مو, كده→كذا, and Levantine هيك→كذا are direct substitutions.
+_SAUDI_DEMONSTRATIVES = [
+    (r"ده", "هذا", "ده→هذا"), (r"دا", "هذا", "دا→هذا"), (r"دي", "هذي", "دي→هذي"),
+    (r"كده", "كذا", "كده→كذا"), (r"كدا", "كذا", "كدا→كذا"),
+    (r"مش", "مو", "مش→مو"), (r"هيك", "كذا", "هيك→كذا"),
+]
+for _d in ("najdi arabic", "hijazi arabic"):
+    _DIALECT_FIXUPS[_d] += [_fixup(w, t, l, pre=_AR_FIX_PRE_NB)
+                            for w, t, l in _SAUDI_DEMONSTRATIVES]
+# Levantine هيك is wrong in EVERY target dialect; Egyptian says كده:
+_DIALECT_FIXUPS["egyptian arabic"].append(_fixup(r"هيك", "كده", "هيك→كده", pre=_AR_FIX_PRE_NB))
+
 
 def _apply_fixups(text: str, tts_language: Optional[str],
                   applied: Optional[list[str]] = None) -> str:
@@ -1136,21 +1189,21 @@ _STOP_SEQUENCES       = ["User:", "user:", "\nUser", "\nالمستخدم:", "Hum
 # model-switching machinery — they live on the `multi-engine-snapshot` branch if needed.
 MODEL_CONFIGS: dict[str, dict[str, Any]] = {
     "qwen3.5": {
-        # think:False — voice needs direct, fast answers. With thinking ON the
-        # model spends its whole num_predict budget reasoning and never emits a
-        # spoken response (empty-response bug).
+        # think — governed by the LLM_THINK env flag ONLY (default False: voice needs direct,
+        # fast answers; see the flag's comment near LLM_NUM_CTX for the 2026-07-08 incident).
         # temp lowered 0.7 → 0.5: factual queries fabricated badly at 0.7 (invented
         # parties/dates for Nawaz Sharif). Lower temp = less creative drift, more
         # grounded answers. Trades a little conversational flair for accuracy.
-        "extra":   {"think": False},
+        "extra":   {"think": LLM_THINK},
         "options": {
             "temperature":      0.5,
             "top_p":            0.8,
             "top_k":            20,
             "presence_penalty": 1.5,
-            "num_predict":      400,   # raised from 300, which truncated ~170-word Arabic answers mid-sentence.
-                                       # If the cap still hits, done_reason=="length" suppresses speaking the
-                                       # dangling fragment (is_truncated guard in stream_tts_to_ws).
+            # 400 default (raised from 300, which truncated ~170-word Arabic answers
+            # mid-sentence; done_reason=="length" suppresses speaking the dangling tail).
+            # 1500 under LLM_THINK=1 — the thinking happens INSIDE this budget.
+            "num_predict":      LLM_NUM_PREDICT,
             # Context window (default 8192 via LLM_NUM_CTX). The default-32768 KV cache
             # OOM'd with OmniVoice in-process on one 32 GB GPU; 8192 fits the prompt
             # (system + 3-turn memory + reply ≈ 2.5k tokens) with room to spare. Raise via
@@ -1189,8 +1242,9 @@ async def ollama_chat_token_gen(
     messages: list[dict[str, str]],         # [system, ...history..., current user]
     model: str = MODEL,
     on_first_token: Optional[Any] = None,   # callable fired once on first token
-    status: Optional[dict] = None,          # filled with {"done_reason": ...} on completion —
-                                            # "length" = num_predict cap hit mid-generation
+    status: Optional[dict[str, Any]] = None,  # filled with {"done_reason": ...} on completion
+                                               # ("length" = num_predict cap hit mid-generation)
+                                               # + "thinking_chars" under LLM_THINK
 ):
     """Stream a chat completion from Ollama's /api/chat (carries conversation history)."""
     cfg = _get_model_config(model)
@@ -1211,7 +1265,12 @@ async def ollama_chat_token_gen(
                     continue
                 chunk = json.loads(line)
                 # /api/chat streams {"message": {"role": "assistant", "content": "<tok>"}, ...}
-                token = chunk.get("message", {}).get("content", "")
+                msg   = chunk.get("message", {})
+                token = msg.get("content", "")
+                # Thinking chunks arrive in message.thinking (never spoken/displayed);
+                # track their size so logs show where the token budget went (LLM_THINK).
+                if status is not None and msg.get("thinking"):
+                    status["thinking_chars"] = status.get("thinking_chars", 0) + len(msg["thinking"])
                 if token:
                     if first and on_first_token:
                         on_first_token()
@@ -1776,6 +1835,9 @@ async def websocket_endpoint(ws: WebSocket):
                             # sentence was dropped. Non-empty fixups = the model still leaks.
                             "fixups":             fixups_applied,
                             "meta_leak_filtered": meta_leak_filtered,
+                            # >0 only under LLM_THINK=1: how much of the budget went to
+                            # silent reasoning before the first spoken token.
+                            "thinking_chars":     llm_status.get("thinking_chars", 0),
                         },
                         # True = barge-in cut this turn; the response is PARTIAL — exclude
                         # from quality evaluation.

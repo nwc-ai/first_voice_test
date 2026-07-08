@@ -274,6 +274,21 @@ _fx: list = []
 F("الموضوع كبير جداً والتفاصيل جداً مهمة", "egyptian arabic", _fx)
 check("fixup: labels logged once per chunk", _fx, ["جداً→أوي"])
 
+# Saudi demonstrative/negation swaps (2026-07-08 — live «الدنيا دي» / «غير هيك» in Najdi):
+check("fixup: دي→هذي (Najdi, live case)",    F("لأن الدنيا دي مجرد محطة قصيرة", "najdi arabic"), "لأن الدنيا هذي مجرد محطة قصيرة")
+check("fixup: هيك→كذا (Najdi, live case)",   F("ما أدري غير هيك", "najdi arabic"), "ما أدري غير كذا")
+check("fixup: ده→هذا (Najdi)",               F("الزمان ده صعب", "najdi arabic"), "الزمان هذا صعب")
+check("fixup: وده→وهذا glued (Najdi)",       F("وده يعني الشي واضح", "najdi arabic"), "وهذا يعني الشي واضح")
+check("fixup: مش→مو (Najdi)",                F("العداد مش شغال", "najdi arabic"), "العداد مو شغال")
+check("fixup: كده→كذا (Hijazi)",             F("ليش كده يا صاحبي", "hijazi arabic"), "ليش كذا يا صاحبي")
+check("fixup: هيك→كده (Egyptian)",           F("مش عايز هيك", "egyptian arabic"), "مش عايز كده")
+check("fixup: Egyptian ده/دي/مش untouched",  F("الحكاية دي مش سهلة وده واضح", "egyptian arabic"), "الحكاية دي مش سهلة وده واضح")
+check("fixup: بده NOT matched (no ب prefix)", F("بده يروح البيت", "najdi arabic"), "بده يروح البيت")
+check("fixup: المش NOT matched (no ال)",      F("جبت المش من السوق", "najdi arabic"), "جبت المش من السوق")
+check("fixup: مشكلة NOT matched (boundary)",  F("عندنا مشكلة في الضغط", "najdi arabic"), "عندنا مشكلة في الضغط")
+check("linter: هيك leaks in Najdi",           "هيك" in leaks("ما أدري غير هيك والله", "Najdi"), True)
+check("linter: مزيان leaks in Egyptian",      "مزيان" in leaks("الناس عندها مزيان وحب للضيف", "Egyptian"), True)
+
 # ── Anti-recycling contrast note + no-announce clauses (2026-07-07) ───────────────────────
 print("\n== contrast note / no-announce ==")
 _rt_naj = server._route_turn("reply in Najdi please", "en")
@@ -296,6 +311,26 @@ _w_unk = server._build_turn_content("x", server._route_turn("Tell me the history
 check("unknown-dialect wrapper skips it",    "never announce or explain which language" in _w_unk, False)
 check("najdi card: راح FUTURE-only rule",    "FUTURE ONLY" in najdi_instr, True)
 check("egyptian card: دلوقتي present-only",  "present moment ONLY" in egy_instr, True)
+
+# ── LLM config guards (2026-07-08: a silent IDE edit set think:True + num_predict:300 and ──
+# ── every live reply came back EMPTY; these pins make that class of edit fail loudly) ──────
+print("\n== llm config guards ==")
+_cfg = server._get_model_config("qwen3.5:27b")
+check("think OFF by default (env-gated)",    _cfg["extra"]["think"], False)
+check("num_predict 400 by default",          _cfg["options"]["num_predict"], 400)
+check("num_ctx from LLM_NUM_CTX",            _cfg["options"]["num_ctx"], server.LLM_NUM_CTX)
+
+# ── Purity reminder: THE double-stated rule, in the recency slot (2026-07-08) ─────────────
+print("\n== purity reminder ==")
+_w_pn = server._build_turn_content("what is pressure", server._route_turn("reply in Najdi please", "en"))
+check("najdi wrapper: reminder present",     "REMEMBER — the most important rule" in _w_pn, True)
+check("najdi reminder is the LAST line",     _w_pn.rstrip().endswith("before writing it."), True)
+check("najdi reminder AFTER user text",      _w_pn.index("User:") < _w_pn.index("REMEMBER"), True)
+check("najdi reminder names ONLY Najdi",     ("Egyptian" in _w_pn.split("REMEMBER")[1]) or ("Hijazi" in _w_pn.split("REMEMBER")[1]), False)
+_w_pf = server._build_turn_content("x", server._route_turn("tell me that in Arabic", "en"))
+check("fusha reminder: zero-dialect form",   "ZERO regional-dialect words" in _w_pf, True)
+_w_pe2 = server._build_turn_content("hi", server._route_turn("hello there, how are you", "en"))
+check("english wrapper: no reminder",        "REMEMBER" in _w_pe2, False)
 
 # ── Spoken register + water-utility domain lexicon (2026-07-07 owner decisions) ───────────
 print("\n== register / domain lexicon ==")

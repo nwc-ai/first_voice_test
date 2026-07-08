@@ -103,6 +103,13 @@ FORBIDDEN: dict[str, set] = {
     "Fusha":    (_EGY | _NAJDI_GULF | _HIJAZI_ONLY
                  | {"مش", "ده", "دي", "كمان", "بدي", "يلا", "معليش"}),
 }
+# Stray-dialect words that belong to NO target dialect (Levantine هيك, Maghrebi مزيان —
+# both reached live replies 2026-07-08: «غير هيك» in a Najdi answer, «عندها مزيان» in an
+# Egyptian one). Forbidden everywhere:
+_STRAY = {"هيك", "مزيان"}
+for _d in FORBIDDEN:
+    FORBIDDEN[_d] |= _STRAY
+
 _HA_FORBIDDEN_IN = {"Najdi", "Hijazi", "Fusha"}   # هـ-future allowed only in Egyptian
 
 # Egyptian ـش-negation as a PATTERN (ما + verb + ش: «ما نعرفش») — caught live in a Najdi reply
