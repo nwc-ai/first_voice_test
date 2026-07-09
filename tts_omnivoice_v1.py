@@ -12,9 +12,11 @@
 # load + the per-sentence synthesis call are OmniVoice-specific.
 #
 # OmniVoice is a zero-shot voice-cloner: it needs a short reference clip + its transcript to define the
-# voice. A per-dialect voice registry (_VOICES) selects the clip per turn — Saudi (default) for
-# Najdi/Fusha/English, Egyptian (v3 clip) for Egyptian-routed turns — and server.py also passes an
-# OmniVoice `language=` dialect ID per turn to pin pronunciation.
+# voice. A per-dialect voice registry (_VOICES) selects the clip per turn — currently just the Saudi
+# default for every routed dialect (Najdi/Fusha/English) — and server.py also passes an OmniVoice
+# `language=` dialect ID per turn to pin pronunciation. (Egyptian support was REMOVED 2026-07-09,
+# owner decision — the "egyptian" registry key + its reference clip constants were deleted here;
+# the WAV itself is left on disk at voices/omnivoice-tts-egyptian-24k-v3.wav, unreferenced.)
 # =========================================================================================
 
 import asyncio
@@ -25,6 +27,25 @@ from typing import Any, AsyncIterator, Optional
 
 import numpy as np
 import torch
+
+# CATT tashkeel (diacritization) — DEFAULT ON (owner decision 2026-07-09, re-added after Egyptian/
+# Hijazi removal). Same on/off-lever shape as FRCRN_ENABLED: set CATT_ENABLED=0 to revert to plain
+# (undiacritized) text in one env var if it sounds bad, without a code change.
+# History: tashkeel was evaluated and DROPPED in an earlier session because CATT is MSA-trained and
+# mis-vocalizes colloquial words (documented example: علطول→عُلْطُولُ). That reasoning was never
+# Egyptian-specific — it's about MSA-vs-dialect in general. Re-verified live on 2026-07-09 against
+# real Najdi strings from this repo: Fusha diacritizes cleanly (expected, CATT IS an MSA model), but
+# Najdi words get semantically mangled, not just cosmetically odd — مرة ("very") comes back as مَرّةً
+# (misread as the MSA noun "a time/once"), and صج ("really") comes back as صَجَّ (misread as an
+# unrelated real MSA verb root, "he shouted"). Owner chose to enable it for BOTH Najdi and Fusha
+# anyway, accepting that Najdi mispronunciations of this kind can recur — this flag is the fast
+# revert if that turns out to sound bad in practice.
+CATT_ENABLED = os.environ.get("CATT_ENABLED", "1") == "1"
+
+# Only diacritize text that's actually going to a Najdi or Fusha voice — never English (CATT is
+# Arabic-only) and never mixed AR+EN (tts_language=None there specifically to avoid mispronouncing
+# the English half; running an Arabic diacritizer over a code-switched string is untested territory).
+_TASHKEEL_LANGUAGES = {"najdi arabic", "standard arabic"}
 
 # ── Sentence boundary constants (carried over from the earlier Silma TTS module) ─────────
 HARD_BREAK = {'!', '?', '؟'}
@@ -55,21 +76,18 @@ def _expand_abbreviations(text: str) -> str:
 
 SAMPLE_RATE = 24000  # OmniVoice output sample rate
 
-# Saudi DEFAULT voice (registry key "saudi") — used for Najdi/Fusha/English. Egyptian voice below.
+# Saudi DEFAULT voice (registry key "saudi") — used for every routed dialect (Najdi/Fusha/English).
 _REF_AUDIO = os.path.join(os.path.dirname(__file__), "voices", "silma-tts-saudi-24k.wav")
 _REF_TEXT  = "الثقافة السعودية فيها عراقة وتاريخ عميق، وقيم إسلامية راسخة، وعادات وتقاليد قبلية أصيلة متوارثة."
 
-# Egyptian reference clip (user-provided) + its exact transcript — used for Egyptian-routed turns.
-_EGY_REF_AUDIO = os.path.join(os.path.dirname(__file__), "voices", "omnivoice-tts-egyptian-24k-v3.wav")
-_EGY_REF_TEXT  = "في الغالب بتبقى أكتر من الطفل اللي اتولد في آخر السنة، وبالتالي أداؤه في اللعب هيكون أحسن، فده هيلفت نظر المدربين فهيهتموا بيه"
-
 # Voice registry: key → (reference clip, its exact transcript). OmniVoice CLONES the reference, so the
-# chosen clip IS the spoken voice. server.py picks the key per turn from the routed dialect (Egyptian-routed
-# → "egyptian", everything else → "saudi"). Add a new voice later by dropping a WAV + one entry here.
+# chosen clip IS the spoken voice. server.py currently only ever picks "saudi" (Egyptian support was
+# REMOVED 2026-07-09 — the "egyptian" key + its _EGY_REF_AUDIO/_EGY_REF_TEXT constants were deleted
+# here; the reference clip itself is left on disk, unreferenced). Add a new voice later by dropping a
+# WAV + one entry here.
 DEFAULT_VOICE = "saudi"
 _VOICES: dict[str, tuple[str, str]] = {
     "saudi":    (_REF_AUDIO, _REF_TEXT),
-    "egyptian": (_EGY_REF_AUDIO, _EGY_REF_TEXT),
 }
 
 def _resolve_voice(key: Optional[str]) -> tuple[str, str]:
@@ -99,6 +117,30 @@ _gen_lock = threading.Lock()
 # audio-tokenizer encode (~16 ms/sentence measured, plus disk I/O).
 _voice_prompts: dict[str, Any] = {}
 
+# ── Lazy tashkeel model singleton (same shape as _model/_model_lock above) ────────────────
+_tashkeel_model = None
+_tashkeel_lock = threading.Lock()
+
+
+def _get_tashkeel_model():
+    global _tashkeel_model
+    with _tashkeel_lock:
+        if _tashkeel_model is None:
+            import catt_tashkeel
+            _tashkeel_model = catt_tashkeel.CATTEncoderDecoder()
+        return _tashkeel_model
+
+
+def _add_tashkeel(text: str) -> str:
+    """Diacritize Arabic text via CATT for pronunciation precision. CATT is a third-party ONNX
+    model, not internal code — falls back to the plain (undiacritized) text on any error rather
+    than let a tashkeel hiccup break a turn's audio."""
+    try:
+        return _get_tashkeel_model().do_tashkeel(text, verbose=False)
+    except Exception as e:
+        print(f"[tts] tashkeel failed, using plain text: {type(e).__name__}: {e}")
+        return text
+
 
 def load_models():
     """Optional warm-up hook — call from FastAPI lifespan so the first user
@@ -110,17 +152,25 @@ def load_models():
                 f"Place the reference WAV at that path before starting the server."
             )
     _get_model()
+    if CATT_ENABLED:
+        print("[tts] loading CATT tashkeel model...")
+        _get_tashkeel_model()
+        print("[tts] CATT tashkeel ready.")
+    else:
+        print("[tts] CATT tashkeel disabled (CATT_ENABLED=0) — replies stay undiacritized.")
 
 
 def warm_up():
     """Precompute the clone prompt for every registry voice and run one tiny synthesis, so the
     first real turn pays neither first-inference CUDA kernel cost nor reference encoding.
-    Call after load_models() (server lifespan does)."""
+    Call after load_models() (server lifespan does). language="standard arabic" so this dummy
+    call also exercises the CATT tashkeel path — its first ONNX inference is warmed here too,
+    not on the first real reply."""
     model = _get_model()
     for key, (ref_audio, ref_text) in _VOICES.items():
         if key not in _voice_prompts and os.path.exists(ref_audio):
             _voice_prompts[key] = model.create_voice_clone_prompt(ref_audio, ref_text)
-    _synthesize_mp3_blocking("مرحبا.", DEFAULT_VOICE, None)
+    _synthesize_mp3_blocking("مرحبا.", DEFAULT_VOICE, "standard arabic")
 
 
 def _get_model():
@@ -168,10 +218,14 @@ def _synthesize_mp3_blocking(text: str, voice: str = DEFAULT_VOICE,
                              language: Optional[str] = None) -> bytes:
     """OmniVoice inference + LAME MP3 encode in one blocking call (one to_thread dispatch).
     Returns a complete MP3 container — browser decodeAudioData requires this.
-    `voice` is a registry key ("saudi"/"egyptian"); the precomputed clone prompt is used when
+    `voice` is a registry key ("saudi"); the precomputed clone prompt is used when
     available, else falls back to per-call ref_audio/ref_text. `language` is an OmniVoice dialect
-    ID (e.g. "egyptian arabic" → arz) that pins pronunciation to one dialect; None = language-agnostic."""
+    ID (e.g. "najdi arabic") that pins pronunciation to one dialect; None = language-agnostic.
+    When `language` is Najdi/Fusha and CATT_ENABLED, `text` is diacritized before synthesis —
+    display text (server.py's chunk_filter output, sent separately to the browser) is untouched."""
     import lameenc
+    if CATT_ENABLED and language in _TASHKEEL_LANGUAGES:
+        text = _add_tashkeel(text)
     model = _get_model()
     prompt = _voice_prompts.get(voice)
     # OmniVoice.generate returns a list of float32 np.ndarray (T,) at 24 kHz.

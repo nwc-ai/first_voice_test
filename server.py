@@ -140,7 +140,7 @@ SYSTEM_PROMPT = (
     "   THAT language regardless of which language they wrote their request in. This overrides rules 1-4. "
     "1. Otherwise, if the user speaks English → reply in English only. "
     "2. If the user speaks Arabic → reply in the exact dialect stated in the per-message "
-    "   instruction (Najdi نجدي / Egyptian مصري / Fusha فصحى). "
+    "   instruction (Najdi نجدي / Fusha فصحى). "
     "   Each message carries a usage guide for that dialect — follow it exactly and NEVER mix "
     "   words from a different dialect into the reply. "
     "3. If the user mixes Arabic and English (code-switching) → reply in the same natural mix, matching their Arabic dialect. "
@@ -482,10 +482,10 @@ _TRANSLATION_Q_RE = re.compile(
     re.IGNORECASE | re.UNICODE,
 )
 
-# Negation guard: «لا ترد باللهجة المصرية» / "don't reply in Egyptian" must NOT commit the very
+# Negation guard: «لا ترد باللهجة النجدية» / "don't reply in Najdi" must NOT commit the very
 # dialect the user is forbidding. A dialect/language request match is discarded when a negation
 # token appears within the ~20 chars before it. (A complaint with no negation word — e.g.
-# «ليش تتكلم بالمصري؟» — still slips through; fixing that lexically would cost real requests.)
+# «ليش تتكلم بالنجدي؟» — still slips through; fixing that lexically would cost real requests.)
 _NEG_BEFORE_RE = re.compile(
     r"\bلا\b|\bما\b|\bمو\b|\bمش\b|\bبلاش\b|\bبدون\b|don'?t|do\s+not|\bnot\b|\bnever\b|\bstop\b",
     re.IGNORECASE | re.UNICODE,
@@ -498,8 +498,8 @@ def _negated(text: str, start: int) -> bool:
 def _en_dialect_req(name_re: str) -> str:
     """English dialect-name request pattern. The bare name only counts WITH request context —
     a dialect noun ('<name> arabic/dialect/accent') or a speak-verb ('reply/speak/say it in
-    <name>') — so proper nouns ('the Egyptian Museum', 'Gulf region', 'a Najdi restaurant')
-    no longer trigger a dialect request. (Closes the previously accepted permissive-EN gap.)"""
+    <name>') — so a proper noun ('a Najdi restaurant') no longer triggers a dialect request.
+    (Closes the previously accepted permissive-EN gap.)"""
     return (rf"\b(?:{name_re})\s+(?:arabic|dialect|accent)\b"
             rf"|\b(?:reply|respond|answer|speak|say\s+it|talk|switch(?:\s+to)?|use)\s+"
             rf"(?:in\s+|into\s+|to\s+)?(?:the\s+)?(?:{name_re})\b")
@@ -521,12 +521,12 @@ _DIALECT_PATTERNS: list[tuple[str, Any, str]] = [
     ("Najdi", re.compile(_en_dialect_req("najdi") + r"|\bsaudi\s+(?:arabic|dialect|accent)\b"
                          r"|بال(?:نجدي|سعودي)(?:ة|ه)?|(?:لهجة|لغة)\s+ال?(?:نجدي|سعودي)(?:ة|ه)?", re.IGNORECASE | re.UNICODE),
      "the Najdi dialect"),
-    ("Egyptian", re.compile(_en_dialect_req("egyptian|masri") + r"|بالمصري(?:ة|ه)?|(?:لهجة|لغة)\s+ال?مصري(?:ة|ه)?", re.IGNORECASE | re.UNICODE),
-     "the Egyptian dialect"),
-    # Gulf/Khaleeji was REMOVED as a supported dialect (2026-07-07, owner decision), and Hijazi
-    # was REMOVED as a supported dialect (2026-07-09, owner decision) — an English "in
-    # Gulf/Khaleeji/Hijazi dialect" request now falls through to the unknown_dialect branch
-    # (Fusha + supported-dialects note); Arabic «بالخليجي»/«بالحجازي» falls to the Fusha default.
+    # Gulf/Khaleeji was REMOVED as a supported dialect (2026-07-07, owner decision), Hijazi
+    # was REMOVED as a supported dialect (2026-07-09, owner decision), and Egyptian was REMOVED
+    # as a supported dialect (2026-07-09, owner decision, same day) — an English "in
+    # Gulf/Khaleeji/Hijazi/Egyptian dialect" request now falls through to the unknown_dialect
+    # branch (Fusha + supported-dialects note); Arabic «بالخليجي»/«بالحجازي»/«بالمصري» falls to
+    # the Fusha default.
     ("Fusha", re.compile(r"\bfus-?ha\b|\bmsa\b|modern\s+standard|classical\s+arabic|الفصحى|فصحى",
                          re.IGNORECASE | re.UNICODE),
      "Modern Standard Arabic (Fusha)"),
@@ -536,7 +536,7 @@ _DIALECT_PATTERNS: list[tuple[str, Any, str]] = [
 # garbling a real dialect name ("Najati", "90 dialect", "HD dialect", "my gene dialect").
 _UNKNOWN_DIALECT_RE     = re.compile(r"\b(?:in|into)\s+(?:the\s+)?([\w][\w\s-]{0,24}?)\s+dialect\b",
                                      re.IGNORECASE)
-_KNOWN_DIALECT_NAME_RE  = re.compile(r"najdi|egyptian|masri|"
+_KNOWN_DIALECT_NAME_RE  = re.compile(r"najdi|"
                                      r"arabic|fus-?ha|msa|standard|saudi|english",
                                      re.IGNORECASE)
 
@@ -544,7 +544,7 @@ _KNOWN_DIALECT_NAME_RE  = re.compile(r"najdi|egyptian|masri|"
 def _requested_dialect(text: str) -> Optional[str]:
     """Return a phrase describing the requested Arabic dialect, or None when none is named
     (caller defaults to Fusha). Matches preceded by a negation token are skipped, so
-    «لا ترد بالمصري، رد بالفصحى» resolves to Fusha, not Egyptian."""
+    «لا ترد بالنجدي» resolves to None (Fusha default), not Najdi."""
     for _name, pattern, phrase in _DIALECT_PATTERNS:
         for m in pattern.finditer(text):
             if not _negated(text, m.start()):
@@ -552,41 +552,22 @@ def _requested_dialect(text: str) -> Optional[str]:
     return None
 
 # Najdi DISTINGUISHING markers (from the shared Saudi-slang glossary) — used to detect that the
-# user actually SPOKE Najdi, so the reply commits to it instead of guessing (Hijazi's own marker
-# set was REMOVED 2026-07-09, owner decision — see the _DIALECT_PATTERNS note above). Words
-# shared with other dialects (وين، ليش، بعدين، خلاص، يلا، بس، مرة) carry no signal and are
-# deliberately excluded. Whole-word matching only (no substrings). Hamza/no-hamza variants included
-# because both users and STT vary on it.
+# user actually SPOKE Najdi, so the reply commits to it instead of guessing. Words shared with
+# other Arabic speech generally (وين، ليش، بعدين، خلاص، يلا، بس، مرة، عشان) carry no signal and
+# are deliberately excluded. Whole-word matching only (no substrings). Hamza/no-hamza variants
+# included because both users and STT vary on it.
+# (Gulf's marker set was removed 2026-07-07, Hijazi's 2026-07-09, and Egyptian's 2026-07-09 —
+# see the _DIALECT_PATTERNS note above. Najdi is the only dialect `_detect_dialect` scores now,
+# so this is a plain marker-membership check rather than a multi-way race — no tie-break needed.)
 _NAJDI_MARKERS    = {"وش", "أبغى", "ابغى", "الحين", "زين", "ماله", "يبيلك", "صج", "عاد", "هيه", "أدري", "ادري"}
-# Egyptian (Cairene/Delta) markers — إزاي, عايز, دلوقتي, كده, علشان, plus the Egyptian
-# interrogatives إيه (=what)، كام (=how much)، فين (=where) — all distinct from Najdi
-# (وش، كم، وين) and MSA (ماذا/كم/أين). (إمتى is intentionally NOT added — it's not a reliable
-# Egyptian-only signal.)
-# NOTE: bare "عشان" is deliberately EXCLUDED — it's shared across Najdi/Gulf/Egyptian speech
-# generally, so it carries no dialect signal and was tying real Najdi utterances to Egyptian (e.g. "وش ... عشان ..." →
-# 1-1 tie → unclear). "علشان" (with the ل) is kept as the Egyptian-leaning variant.
-_EGYPTIAN_MARKERS = {"إزاي", "ازاي", "إزيك", "ازيك", "عايز", "عاوز", "عايزة", "دلوقتي", "دلوقت",
-                     "كده", "كدا", "علشان", "دول", "النهاردة", "إمبارح", "امبارح", "أهو",
-                     "إيه", "ايه", "كام", "فين"}
-# WEAK Egyptian markers — high-frequency words also common outside Egyptian speech generally.
-# Half weight: they support a strong marker but can never flip the voice alone.
-_EGYPTIAN_WEAK    = {"مش", "ده", "دي"}
 _AR_WORD_SPLIT_RE = re.compile(r"[^؀-ۿ]+")  # split on any run of non-Arabic-letter chars
 
 def _detect_dialect(text: str) -> Optional[str]:
-    """Lexically classify spoken Arabic as 'Najdi' / 'Egyptian' by scoring distinguishing marker
-    words (weak Egyptian markers count 0.5). Returns None when the top score is < 1.0 —
-    i.e. only weak evidence — OR tied (caller defaults to Fusha). Short utterances rarely carry a
-    marker and many words are shared, so 'unclear' is the common, intended case."""
-    words  = {w for w in _AR_WORD_SPLIT_RE.split(text) if w}
-    scores = {
-        "Najdi":    float(len(words & _NAJDI_MARKERS)),
-        "Egyptian": len(words & _EGYPTIAN_MARKERS) + 0.5 * len(words & _EGYPTIAN_WEAK),
-    }
-    top = max(scores.values())
-    if top < 1.0 or sum(1 for v in scores.values() if v == top) > 1:
-        return None   # no/weak-only markers, or a tie between dialects → unclear → Fusha default
-    return max(scores, key=scores.get)
+    """Lexically classify spoken Arabic as 'Najdi' by checking for distinguishing marker words.
+    Returns None (caller defaults to Fusha) when no marker hits — short utterances rarely carry
+    one and many words are shared, so 'unclear' is the common, intended case."""
+    words = {w for w in _AR_WORD_SPLIT_RE.split(text) if w}
+    return "Najdi" if words & _NAJDI_MARKERS else None
 
 
 # ── Per-dialect language cards (2026-07-06, built from the user's cross-dialect glossary) ──
@@ -594,8 +575,8 @@ def _detect_dialect(text: str) -> Optional[str]:
 # function words + morphology ONLY — these apply to any topic; no topic phrases, no example
 # sentences to parrot. Each card orders the model to write naturally, because the 2026-07-06
 # eval showed the model KEYWORD-STUFFS a bare word list (وش/زين dropped into Egyptian grammar).
-# The top defects each card targets: Egyptian هـ-future inside Najdi (هخبرك/هتكون), Gulf
-# إيش/وايد/شنو inside Najdi, Najdi الحين inside Egyptian, MSA جداً/حيث inside Egyptian.
+# The top defects Najdi's card targets: Egyptian هـ-future inside Najdi (هخبرك/هتكون), Gulf
+# إيش/وايد/شنو inside Najdi.
 #
 # Two 2026-07-07 additions (owner decisions):
 #   REGISTER — dialect answers must SOUND like talk. Git archaeology showed the June replies
@@ -605,8 +586,9 @@ def _detect_dialect(text: str) -> Optional[str]:
 #   FIELD/STATUS words — the deployment is a water-utility field assistant, so the glossary's
 #   domain rows are justified vocabulary (only words that DIFFER from MSA/other dialects;
 #   خزان/عداد/ضغط/تدفق/محطة/خط are identical everywhere and need no card space).
-# Gulf/Khaleeji was REMOVED entirely (2026-07-07, owner decision), and Hijazi was REMOVED
-# entirely (2026-07-09, owner decision): supported set is Najdi/Egyptian/Fusha + English + mixed.
+# Gulf/Khaleeji was REMOVED entirely (2026-07-07, owner decision), Hijazi was REMOVED entirely
+# (2026-07-09, owner decision), and Egyptian was REMOVED entirely (2026-07-09, owner decision,
+# same day): supported set is Najdi/Fusha + English + mixed.
 _SPOKEN_REGISTER = (
     " REGISTER: this is a VOICE conversation — answer the way a knowledgeable local TALKS: "
     "address the listener directly, keep a spoken sentence rhythm, and let the dialect's own "
@@ -634,22 +616,6 @@ _DIALECT_CARDS: dict[str, str] = {
         "empty=فاضي، dirty=وسخ، really=صج، okay/then=عاد."
         + _SPOKEN_REGISTER
     ),
-    "Egyptian": (
-        "EGYPTIAN usage guide — write natural, fluent Masri as a native speaker would, on any topic. "
-        "These are your FUNCTION words, not a checklist; never force them in: "
-        "what=إيه، why=ليه، where=فين (never وين)، now=دلوقتي (NEVER الحين/الآن; دلوقتي means "
-        "the present moment ONLY — never use it inside past or historical narration)، want=عايز/عاوز "
-        "(never أبغى/أبي)، good=كويس، very=أوي (NEVER جداً/مرة)، a lot=كتير (never كثير/وايد)، "
-        "I don't know=مش عارف (never ما أدري)، yes=أيوه، thanks=متشكر، there isn't=مفيش، "
-        "full=مليان + noun directly (مليان أحداث — no من). "
-        "FUTURE: the هـ prefix (هقولك، هيكون) — never راح or بـ for the future. "
-        "NEGATION: مش / ما...ش (معرفش). "
-        "Demonstratives ده/دي come AFTER the noun (الزمان ده، الحكاية دي — NEVER ده الزمان). "
-        "Avoid MSA connectives (حيث، لذا) — use عشان/علشان. "
-        "FIELD/STATUS words: working=شغال، broken=بايظ، high=عالي، low=واطي، full=مليان، "
-        "empty=فاضي، dirty=وسخ، reading=قراية (not قراءة)، leak=رشح، outage=قطع، really=فعلاً."
-        + _SPOKEN_REGISTER
-    ),
     "Fusha": (
         "FUSHA quality guide — correct Modern Standard Arabic: mind verb–subject gender agreement "
         "(يتميز التاريخ لا تتميز التاريخ، اشتهر شعبها لا اشتهرت شعبها)، number–noun rules "
@@ -661,7 +627,7 @@ _DIALECT_CARDS: dict[str, str] = {
 
 def _route_turn(text: str, lang: str) -> dict[str, Any]:
     """Decide this turn's routing from the transcript. Returns a dict:
-      tts_voice          — voice registry key ("saudi"/"egyptian")
+      tts_voice          — voice registry key (always "saudi" now Egyptian's voice is unwired)
       tts_language       — OmniVoice language= ID or None
       instruction        — the committed per-turn LLM instruction
       route              — which branch fired: explicit_arabic | explicit_english | mixed |
@@ -705,8 +671,8 @@ def _route_turn(text: str, lang: str) -> dict[str, Any]:
         lang_instruction = (
             "The user asked for a reply in a dialect name that is not recognized — most likely "
             "the speech recognizer garbled the dialect's name. Reply in Modern Standard Arabic "
-            "(Fusha). START with ONE short sentence saying, in Fusha, that you speak Najdi, "
-            "Egyptian and Fusha and asking them to repeat the dialect name if they "
+            "(Fusha). START with ONE short sentence saying, in Fusha, that you speak Najdi "
+            "and Fusha and asking them to repeat the dialect name if they "
             "wanted one of those — then answer their actual question fully in Fusha. "
             "Do NOT reason about this out loud and never mention rules or instructions. "
             + _DIALECT_CARDS["Fusha"]
@@ -714,10 +680,9 @@ def _route_turn(text: str, lang: str) -> dict[str, Any]:
     elif wants_arabic:
         route   = "explicit_arabic"
         dialect = req_dialect or "Modern Standard Arabic (Fusha)"
-        tts_voice = "egyptian" if ("Egyptian" in dialect or "مصري" in dialect) else "saudi"
-        if   "Egyptian" in dialect or "مصري" in dialect: tts_language, req_name = "egyptian arabic", "Egyptian"
-        elif "Najdi" in dialect:                          tts_language, req_name = "najdi arabic", "Najdi"
-        else:                                             tts_language, req_name = "standard arabic", "Fusha"
+        tts_voice = "saudi"
+        if   "Najdi" in dialect: tts_language, req_name = "najdi arabic", "Najdi"
+        else:                    tts_language, req_name = "standard arabic", "Fusha"
         print(f"  [lang] explicit Arabic request → {dialect}")
         # Generic "in Arabic (dialect)" with no dialect named → Fusha WITHOUT narrating the
         # choice: the model twice opened with «بما أنك لم تحدد لهجة معينة، سألتزم بالقاعدة
@@ -746,7 +711,7 @@ def _route_turn(text: str, lang: str) -> dict[str, Any]:
     elif lang == "mixed":
         route = "mixed"
         det = _detect_dialect(text)
-        tts_voice = "egyptian" if det == "Egyptian" else "saudi"
+        tts_voice = "saudi"
         tts_language = None   # mixed AR+EN: don't pin a dialect language (would mispronounce the English)
         dial = (f"For the Arabic parts, use the {det} dialect."
                 if det else "For the Arabic parts, use Modern Standard Arabic (Fusha).")
@@ -761,10 +726,9 @@ def _route_turn(text: str, lang: str) -> dict[str, Any]:
         # Server-side dialect decision (committed), not a vague "detect it yourself".
         route = "spoken_arabic"
         det = _detect_dialect(text)
-        tts_voice = "egyptian" if det == "Egyptian" else "saudi"
-        tts_language = {"Najdi": "najdi arabic",
-                        "Egyptian": "egyptian arabic"}.get(det, "standard arabic")
-        if det in ("Najdi", "Egyptian"):
+        tts_voice = "saudi"
+        tts_language = "najdi arabic" if det == "Najdi" else "standard arabic"
+        if det == "Najdi":
             print(f"  [lang] detected {det}")
             lang_instruction = (
                 f"The user spoke the {det.upper()} dialect. Reply ONLY in natural spoken {det} — "
@@ -793,7 +757,7 @@ def _route_turn(text: str, lang: str) -> dict[str, Any]:
     }
 
 
-_ABSTENTION_PHRASES = {"Najdi": "«ما أدري بالضبط»", "Egyptian": "«مش متأكد بصراحة»"}
+_ABSTENTION_PHRASES = {"Najdi": "«ما أدري بالضبط»"}
 
 def _abstention_phrase(route: dict[str, Any]) -> str:
     """The uncertainty phrase for THIS turn's routed dialect only. The wrapper used to show
@@ -914,15 +878,12 @@ _DIALECT_FIXUPS: dict[str, list[tuple["re.Pattern[str]", str, str]]] = {
                         _fixup(r"أوي",           "مرة",    "أوي→مرة"),
                         _fixup(r"دلوقتي",        "الحين",   "دلوقتي→الحين"),
                         _fixup(r"كتير",          "كثير",    "كتير→كثير")],
-    "egyptian arabic": [_fixup(r"جد(?:ًا|اً|ا)", "أوي",    "جداً→أوي"),
-                        _fixup(r"الحين",         "دلوقتي",  "الحين→دلوقتي"),
-                        _fixup(r"كثير",          "كتير",    "كثير→كتير")],
 }
 
 # Saudi-dialect demonstrative/negation swaps (added 2026-07-08 after «الدنيا دي مجرد محطة»
 # and «غير هيك» reached a LIVE Najdi reply despite the card). Previously excluded as
 # "needs restructuring" — too conservative: unlike كمان (placement varies), these occupy the
-# IDENTICAL syntax slot in both dialects. Egyptian postposed ده/دي maps 1:1 onto Najdi's own
+# IDENTICAL syntax slot Najdi uses: Egyptian-style postposed ده/دي maps 1:1 onto Najdi's own
 # postposed هذا/هذي; مش→مو, كده→كذا, and Levantine هيك→كذا are direct substitutions.
 _SAUDI_DEMONSTRATIVES = [
     (r"ده", "هذا", "ده→هذا"), (r"دا", "هذا", "دا→هذا"), (r"دي", "هذي", "دي→هذي"),
@@ -931,8 +892,6 @@ _SAUDI_DEMONSTRATIVES = [
 ]
 _DIALECT_FIXUPS["najdi arabic"] += [_fixup(w, t, l, pre=_AR_FIX_PRE_NB)
                                     for w, t, l in _SAUDI_DEMONSTRATIVES]
-# Levantine هيك is wrong in EVERY target dialect; Egyptian says كده:
-_DIALECT_FIXUPS["egyptian arabic"].append(_fixup(r"هيك", "كده", "هيك→كده", pre=_AR_FIX_PRE_NB))
 
 
 def _apply_fixups(text: str, tts_language: Optional[str],

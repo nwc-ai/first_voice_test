@@ -3,9 +3,8 @@ dialect_purity_lint.py — glossary-based cross-dialect leak detector (no GPU, r
 ==============================================================================================
 Scans the Arabic assistant replies in logs/interactions.jsonl and reports, per routed dialect,
 tokens that must NOT appear there — e.g. the Egyptian هـ-future (هخبرك/هتكون) or دلوقتي inside
-a Najdi reply, or الحين/وش inside an Egyptian reply. Built from the user's cross-dialect
-glossary (2026-07-06). This turns "the dialects are mixing" into a NUMBER to watch after every
-prompt/model change.
+a Najdi reply. Built from the user's cross-dialect glossary (2026-07-06). This turns "the
+dialects are mixing" into a NUMBER to watch after every prompt/model change.
 
 Usage:
     .venv/bin/python eval/dialect_purity_lint.py                     # whole log
@@ -15,10 +14,9 @@ Usage:
 Three severity levels:
   LEAK       — a token from ANOTHER dialect (misroutes voice/pronunciation identity), OR جداً
                inside a dialect reply (promoted from soft drift 2026-07-07: the owner's cards
-               say NEVER جداً — Najdi=مرة, Egyptian=أوي). Hard error.
-  MSA-drift  — MSA function words (حيث، مليء، لذا…; كيف for Egyptian only) inside a dialect
-               reply. Soft: an educated register is acceptable, but rising drift = the model
-               is slipping back to Fusha.
+               say NEVER جداً — Najdi=مرة). Hard error.
+  MSA-drift  — MSA function words (حيث، مليء، لذا…) inside a dialect reply. Soft: an educated
+               register is acceptable, but rising drift = the model is slipping back to Fusha.
   auto-fixed — the server's _DIALECT_FIXUPS swapped a wrong word BEFORE delivery (llm.fixups
                log field, 2026-07-07). Delivered text is clean, but the count measures what
                the model ATTEMPTED — the honest model-quality signal now that fixups exist.
@@ -52,6 +50,8 @@ import server  # noqa: E402  (for _route_turn reconstruction on old rows)
 # lint unflagged. They are weak markers for DETECTION (shared with other urban Arabic speech),
 # but the owner's cards forbid them outright in Najdi replies — the linter measures
 # card compliance, so they are hard leaks here. Veto by eye if one shows up in a quote.
+# Egyptian is NO LONGER a routed dialect (removed 2026-07-09, owner decision) but these tokens
+# stay forbidden inside Najdi/Fusha replies — same reuse pattern as _NAJDI_GULF/_HIJAZI_ONLY.
 _EGY = {"دلوقتي", "دلوقت", "كده", "كدا", "النهاردة", "إمبارح", "امبارح", "إزاي", "ازاي",
         "إزيك", "ازيك", "عايز", "عاوز", "عايزة", "مفيش", "معنديش", "متشكر", "أوي",
         "بتاع", "بتاعة", "دول", "كتير", "كويس", "ده", "دي", "مش", "فين",
@@ -64,10 +64,10 @@ _EGY = {"دلوقتي", "دلوقت", "كده", "كدا", "النهاردة", "�
         # is handled by _SHIN_NEG_RE below):
         "معرفش", "مكانش", "ماكانش", "منفعش"}
 # Najdi + Gulf-adjacent words. Gulf is NO LONGER a routed dialect (removed 2026-07-07,
-# owner decision) but these tokens stay forbidden inside Egyptian/Fusha replies.
+# owner decision) but these tokens stay forbidden inside Fusha replies.
 _NAJDI_GULF = {"وش", "أبغى", "ابغى", "الحين", "يبيلك", "صج", "وايد", "شنو", "دحين"}
 # Hijazi is NO LONGER a routed dialect (removed 2026-07-09, owner decision) but these tokens
-# stay forbidden inside Najdi/Egyptian/Fusha replies — per user's directive, Najdi says وش,
+# stay forbidden inside Najdi/Fusha replies — per user's directive, Najdi says وش,
 # never إيش. Same reuse pattern as _NAJDI_GULF above.
 _HIJAZI_ONLY = {"إيش", "ايش", "دحين"}
 # جداً was PROMOTED out of soft drift (2026-07-07): every card says NEVER جداً, and it was the
@@ -75,9 +75,8 @@ _HIJAZI_ONLY = {"إيش", "ايش", "دحين"}
 # [ء-ي]+ tokenizer strips the tanween, so جداً surfaces as جدا.
 _JIDDAN = {"جدا", "جداً"}
 _MSA_DRIFT = {"حيث", "مليء", "مليئة", "بعيدا", "بعيداً", "لذا", "كذلك"}
-_EGY_DRIFT_EXTRA = {"كيف"}   # Egyptian wants إزاي; كيف is native in Najdi/Gulf
 
-# Egyptian هـ-future — forbidden outside Egyptian replies. Two shapes:
+# Egyptian هـ-future — Egyptian-origin grammar, forbidden in the dialects we still route to. Two shapes:
 #  2nd/3rd person: ه + ي/ت/ن + stem (هيكون، هتكون، هنروح) — regex + lookalike whitelist.
 #  1st person: ه attaches straight to the verb (هقولك، هخبرك، هعمل) — regex would swallow
 #  ordinary nouns (هجوم، هدوء), so these are a curated list of common forms.
@@ -96,11 +95,6 @@ _HA_FUTURE_1P = {"هقول", "هقولك", "هقوللك", "هقولكم", "هع
 # where جداً is correct MSA.
 FORBIDDEN: dict[str, set] = {
     "Najdi":    _EGY | _HIJAZI_ONLY | _JIDDAN | {"وايد", "شنو", "كمان", "بدي", "حاجة"},
-    # وين added 2026-07-07 (live: an Egyptian joke recycled from a Hijazi one kept «وين الفول»;
-    # Egyptian says فين). راح is deliberately NOT here — it is also valid Egyptian past "went"
-    # (راح البيت), and راح-future vs راح-went can't be separated lexically; the Egyptian card
-    # forbids راح-future prompt-side instead.
-    "Egyptian": _NAJDI_GULF | _HIJAZI_ONLY | _JIDDAN | {"مشكور", "زين", "وين"},
     # Fusha must contain no dialect function words at all:
     "Fusha":    (_EGY | _NAJDI_GULF | _HIJAZI_ONLY
                  | {"مش", "ده", "دي", "كمان", "بدي", "يلا", "معليش"}),
@@ -112,7 +106,7 @@ _STRAY = {"هيك", "مزيان"}
 for _d in FORBIDDEN:
     FORBIDDEN[_d] |= _STRAY
 
-_HA_FORBIDDEN_IN = {"Najdi", "Fusha"}   # هـ-future allowed only in Egyptian
+_HA_FORBIDDEN_IN = {"Najdi", "Fusha"}   # هـ-future is Egyptian-origin grammar, never native here
 
 # Egyptian ـش-negation as a PATTERN (ما + verb + ش: «ما نعرفش») — caught live in a Najdi reply
 # 2026-07-07 where the glued list missed it. Same dialect set as the هـ-future gate; the rare
@@ -120,11 +114,11 @@ _HA_FORBIDDEN_IN = {"Najdi", "Fusha"}   # هـ-future allowed only in Egyptian
 _SHIN_NEG_RE = re.compile(r"\bما\s+[ء-ي]{2,}ش\b")
 
 _AR_WORD_RE = re.compile(r"[ء-ي]+")
-# NOTE: "gulf arabic" is intentionally absent (Gulf removed 2026-07-07) and "hijazi arabic" is
-# intentionally absent (Hijazi removed 2026-07-09) — any old log rows routed to either are
-# skipped rather than scored against a dialect that no longer exists.
-_TTS_LANG_TO_DIALECT = {"najdi arabic": "Najdi",
-                        "egyptian arabic": "Egyptian", "standard arabic": "Fusha"}
+# NOTE: "gulf arabic" is intentionally absent (Gulf removed 2026-07-07), "hijazi arabic" is
+# intentionally absent (Hijazi removed 2026-07-09), and "egyptian arabic" is intentionally
+# absent (Egyptian removed 2026-07-09) — any old log rows routed to any of these are skipped
+# rather than scored against a dialect that no longer exists.
+_TTS_LANG_TO_DIALECT = {"najdi arabic": "Najdi", "standard arabic": "Fusha"}
 
 
 def find_leaks(text: str, dialect: str) -> tuple[list[str], list[str]]:
@@ -143,8 +137,7 @@ def find_leaks(text: str, dialect: str) -> tuple[list[str], list[str]]:
                 leaks.append(f"هـ-future:{m}")
         for m in _SHIN_NEG_RE.findall(text):
             leaks.append(f"ش-negation:{m}")
-    drift_set = _MSA_DRIFT | (_EGY_DRIFT_EXTRA if dialect == "Egyptian" else set())
-    drift = sorted(words & drift_set) if dialect in ("Najdi", "Egyptian") else []
+    drift = sorted(words & _MSA_DRIFT) if dialect == "Najdi" else []
     return leaks, drift
 
 
@@ -205,7 +198,7 @@ def main() -> int:
           f"{' since ' + args.since if args.since else ''} ==\n")
     print(f"{'dialect':>9}  {'replies':>7}  {'with-leaks':>10}  {'leak-rate':>9}  {'msa-drift':>9}  {'auto-fixed':>10}")
     total_n = total_leaky = 0
-    for d in ("Najdi", "Egyptian", "Fusha"):
+    for d in ("Najdi", "Fusha"):
         s = stats.get(d)
         if not s:
             continue
@@ -215,7 +208,7 @@ def main() -> int:
     print(f"{'TOTAL':>9}  {total_n:>7}  {total_leaky:>10}  {100*total_leaky/max(total_n,1):>8.0f}%")
 
     print("\n-- offending turns --")
-    for d in ("Najdi", "Egyptian", "Fusha"):
+    for d in ("Najdi", "Fusha"):
         for ts, leaks, drift, fixups, q in stats.get(d, {}).get("rows", []):
             parts = []
             if leaks:

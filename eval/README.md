@@ -31,9 +31,11 @@ and pronunciation). Missing a dialect (→ Fusha default) is the designed, safe 
 ## 3. `dialect_purity_lint.py` — cross-dialect leak rate (fast, no GPU)
 
 Scans the Arabic replies in `interactions.jsonl` and flags tokens that must not appear in the
-routed dialect (Egyptian هـ-future or ده/دي/مش/دلوقتي in a Najdi reply, الحين/وش in an Egyptian
-reply, any dialect word in Fusha), plus a softer MSA-drift count (حيث/مليء; كيف for Egyptian
-only), plus an **auto-fixed** column: turns where the server's `_DIALECT_FIXUPS` swapped a
+routed dialect (Egyptian هـ-future or ده/دي/مش/دلوقتي in a Najdi reply, any dialect word in Fusha
+— Hijazi's and Egyptian's own per-dialect targets were removed 2026-07-09 along with those
+dialects; their word sets still count as leaks *into* Najdi/Fusha, per the reuse pattern
+described in the module docstring), plus a softer MSA-drift count (حيث/مليء), plus an
+**auto-fixed** column: turns where the server's `_DIALECT_FIXUPS` swapped a
 wrong word before delivery (`llm.fixups` in the log). Since 2026-07-07 the delivered text is
 clean for جداً-class words *by construction* — auto-fixed is the honest model-quality signal.
 Built from the owner's cross-dialect glossary. **Run after every prompt or model change**:

@@ -15,7 +15,7 @@ numbers are the floor, your ear is the ceiling.
 Usage:
     .venv/bin/python eval/dialect_ab.py                          # full run (~60 turns, 3-5 min)
     .venv/bin/python eval/dialect_ab.py --tag before-register    # names the report file
-    .venv/bin/python eval/dialect_ab.py --dialects Najdi,Egyptian
+    .venv/bin/python eval/dialect_ab.py --dialects Najdi,Fusha
     LLM_THINK=1 .venv/bin/python eval/dialect_ab.py --tag think-on   # qwen thinking mode
                     # (env flag read by server.py at import; num_predict auto-raised to 1500;
                     #  per-turn seconds + thinking size are recorded so the latency cost of
@@ -45,14 +45,12 @@ MODEL      = "qwen3.5:27b"
 # ("… in Najdi dialect"). Fusha uses the generic-Arabic request (routes explicit_arabic→Fusha).
 _REQUEST_SUFFIX = {
     "Najdi":    " Tell me that in Najdi dialect.",
-    "Egyptian": " Tell me that in Egyptian dialect.",
     "Fusha":    " Tell me that in Arabic.",
 }
 
 # Spoken-Arabic opener per dialect (exercises _detect_dialect the way live speech does).
 _AR_GREETING = {
     "Najdi":    "هلا والله، وش أخبارك اليوم؟",
-    "Egyptian": "إزيك؟ عامل إيه النهاردة؟",
     "Fusha":    "كيف حالك اليوم؟",
 }
 
@@ -108,7 +106,7 @@ def run_turn(client, text: str, lang: str) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--dialects", default="Najdi,Egyptian,Fusha")
+    ap.add_argument("--dialects", default="Najdi,Fusha")
     ap.add_argument("--tag", default="", help="suffix for the report filename (e.g. before-register)")
     args = ap.parse_args()
     dialects = [d.strip() for d in args.dialects.split(",") if d.strip()]

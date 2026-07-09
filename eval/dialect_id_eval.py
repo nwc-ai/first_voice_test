@@ -1,7 +1,7 @@
 """
 dialect_id_eval.py — measure _detect_dialect accuracy on labeled transcripts (no GPU)
 ======================================================================================
-Reads a JSONL of {"text", "dialect"} rows (dialect: "Najdi"|"Egyptian"|null,
+Reads a JSONL of {"text", "dialect"} rows (dialect: "Najdi"|null,
 null = MSA/unclear → the expected outcome is the Fusha default) and reports per-dialect
 recall, false-switch rate, and a confusion table.
 
@@ -15,8 +15,10 @@ Run:
 
 Interpreting: recall on marker-less rows ("source": "...-no-marker") is EXPECTED to be 0 —
 the classifier is precision-first by design; those rows exist to quantify how much a future
-ML dialect-ID model could add. What must stay near-zero is CROSS-dialect confusion
-(e.g. Egyptian rows classified Najdi), which misroutes voice + pronunciation.
+ML dialect-ID model could add. What must stay near-zero is FALSE dialect firing on non-Najdi
+rows (a "None"-labeled row classified "Najdi"), which would misroute voice + pronunciation.
+Cross-dialect confusion no longer applies now that Najdi is the only detectable dialect
+(Hijazi removed 2026-07-09, Egyptian removed 2026-07-09) — this column reads 0 by construction.
 """
 
 import json
@@ -36,7 +38,7 @@ for r in rows:
     got = server._detect_dialect(r["text"]) or "None"
     confusion[expected][got] += 1
 
-labels = ["Najdi", "Egyptian", "None"]
+labels = ["Najdi", "None"]
 print(f"\n{len(rows)} cases from {os.path.basename(path)}\n")
 print(f"{'true \\ pred':>12} " + " ".join(f"{l:>9}" for l in labels))
 for t in labels:

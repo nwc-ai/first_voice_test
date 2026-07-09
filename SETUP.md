@@ -23,12 +23,13 @@ This is the manual runbook to get the voice assistant running. It's reconstructe
 
 ## 2. Get the code + the voice clips
 The repo's **reference voice clips are mandatory** — `load_models()` aborts at boot if any registry clip is
-missing. Both active clips are committed in git under `voices/`:
-- `voices/silma-tts-saudi-24k.wav` — Saudi default voice (Najdi/Fusha/English)
-- `voices/omnivoice-tts-egyptian-24k-v3.wav` — active Egyptian voice
+missing. The one active clip is committed in git under `voices/`:
+- `voices/silma-tts-saudi-24k.wav` — Saudi default voice (Najdi/Fusha/English; every routed dialect)
 
-(The superseded Egyptian v1/v2 clips were deleted from the tree on 2026-07-06 — recover from git history
-if ever needed.)
+`voices/omnivoice-tts-egyptian-24k-v3.wav` is also still in the tree but **unreferenced** — Egyptian
+support (and its `_VOICES` registry key) was removed 2026-07-09; the clip was deliberately left on
+disk rather than deleted. (The superseded Egyptian v1/v2 clips were deleted from the tree on
+2026-07-06, before Egyptian itself was removed — recover either from git history if ever needed.)
 
 ---
 
@@ -117,7 +118,7 @@ tunnel works; a raw remote IP over plain HTTP will be blocked by the browser. Us
 
 ## 8. Verify it works
 - Browser: button turns green ("يستمع…"); speak Arabic → you see a transcript, a streamed reply, and hear audio.
-- Detected Egyptian → Egyptian voice + Egyptian words; a clearly-Najdi sentence → Saudi voice + Najdi words; unclear/no-marker Arabic → **Fusha** (Saudi voice, MSA); English → English.
+- A clearly-Najdi sentence → Saudi voice + Najdi words; unclear/no-marker Arabic → **Fusha** (Saudi voice, MSA); English → English.
 - **Dashboard:** open `http://localhost:8765/review` — per-turn latency + transcript/response table (from `logs/interactions.jsonl`).
 - **No-mic smoke test** (TTS+LLM only): `.venv/bin/python test_local.py` → writes MP3s to `test_output/`.
 
@@ -139,8 +140,6 @@ Run with a bigger context, e.g.: `LLM_NUM_CTX=16384 bash start_server.sh`.
 ---
 
 ## 10. Troubleshooting
-- **`OmniVoice reference audio for voice 'egyptian' not found`** at boot → the active Egyptian clip is
-  missing. Put `voices/omnivoice-tts-egyptian-24k-v3.wav` in place (the registry's active Egyptian voice).
 - **Browser WS keeps closing (`1006`/`1005`)** while idle → it's the **SSH tunnel** dropping, not the app;
   use the keepalive flags in §7. The browser auto-reconnects.
 - **CUDA / `libcublas` / torchcodec import errors** → torch isn't the `+cu130` build, or the venv isn't at

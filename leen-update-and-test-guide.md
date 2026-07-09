@@ -94,8 +94,8 @@ changed in this update; a cached old page will misbehave).
 ## What changed since June (so you know what "correct" looks like)
 
 1. **Fusha (فصحى) is now the default** when you ask for Arabic without naming a dialect.
-2. **Per-dialect voices + pronunciation**: Egyptian requests use an Egyptian voice; each
-   dialect's pronunciation is pinned (no more Saudi/Egyptian word-mixing in one sentence).
+2. **Per-dialect pronunciation is pinned** (`language=` ID) — no more Saudi/Egyptian word-mixing
+   in one sentence, back when Egyptian was still a target dialect (removed 2026-07-09 — see #6 below).
 3. **Dialect quality guards**: the assistant should never say جداً in a dialect reply
    (auto-corrected to أوي/مرة), never narrate its own rules, and never copy an
    earlier answer's dialect into a new one.
@@ -104,8 +104,9 @@ changed in this update; a cached old page will misbehave).
 5. **Barge-in is smarter**: background noise/voices while it's speaking now cause a ~1-second
    *pause then resume*, instead of killing the reply. A real interruption (you speaking
    clearly into the mic) still stops it.
-6. **"Saudi dialect" works** (treated as Najdi). **Gulf/Khaleeji and Hijazi were removed** — asking
-   for either gets a polite Fusha reply naming the supported dialects.
+6. **"Saudi dialect" works** (treated as Najdi). **Gulf/Khaleeji, Hijazi, and Egyptian were all
+   removed** — asking for any of them gets a polite Fusha reply naming the supported dialects
+   (Najdi and Fusha only, now).
 7. **New dashboard**: http://localhost:8765/review shows every turn with its dialect routing
    and timings.
 
@@ -119,7 +120,7 @@ Go through these in order. For each: ✅ = behaves as described. Note the time o
 |---|---|---|
 | 1 | "Hey, how are you?" | English reply, natural |
 | 2 | "Tell me about the history of coffee **in Arabic**." | Fusha reply, Saudi voice |
-| 3 | Same question "**in Egyptian dialect**" | Egyptian voice + Egyptian wording (ده/كده/دلوقتي are correct here) |
+| 3 | Same question "**in Egyptian dialect**" | Egyptian was removed (2026-07-09) — Fusha answer that starts by naming the supported dialects, same as Gulf/Hijazi below |
 | 4 | Same question "**in Najdi dialect**" | Saudi voice; NO Egyptian words (no ده/دي/مش), NO جداً |
 | 5 | Same question "**in Hijazi dialect**" | Hijazi was removed (2026-07-09) — Fusha answer that starts by naming the supported dialects, same as Gulf below |
 | 6 | Same question "**in Saudi dialect**" | Behaves exactly like Najdi (new) |
