@@ -7,7 +7,7 @@ en/ar language-ID accuracy.
 
 Manifest: JSONL rows of
     {"audio": "/path/clip.wav", "text": "reference transcript", "dialect": "Najdi", "lang": "ar"}
-dialect ∈ Najdi|Hijazi|Egyptian|MSA|null; lang ∈ ar|en|mixed.
+dialect ∈ Najdi|Egyptian|MSA|null; lang ∈ ar|en|mixed.
 SAVE_UTTERANCES=1 on the server writes logs/utterances/manifest.jsonl in this format —
 correct its `text` fields by hand and fill `dialect` before trusting the numbers.
 

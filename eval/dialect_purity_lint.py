@@ -15,7 +15,7 @@ Usage:
 Three severity levels:
   LEAK       — a token from ANOTHER dialect (misroutes voice/pronunciation identity), OR جداً
                inside a dialect reply (promoted from soft drift 2026-07-07: the owner's cards
-               say NEVER جداً — Najdi/Hijazi=مرة, Egyptian=أوي). Hard error.
+               say NEVER جداً — Najdi=مرة, Egyptian=أوي). Hard error.
   MSA-drift  — MSA function words (حيث، مليء، لذا…; كيف for Egyptian only) inside a dialect
                reply. Soft: an educated register is acceptable, but rising drift = the model
                is slipping back to Fusha.
@@ -49,8 +49,8 @@ import server  # noqa: E402  (for _route_turn reconstruction on old rows)
 
 # ── Token groups (from the user's glossary; high-precision distinctive words only) ─────────
 # ده/دي/مش/فين added 2026-07-07: the live «والعبادة دي مش بس الصلاة» Najdi reply passed the
-# lint unflagged. They are weak markers for DETECTION (shared with urban Hijazi speech), but
-# the owner's cards forbid them outright in Najdi AND Hijazi replies — the linter measures
+# lint unflagged. They are weak markers for DETECTION (shared with other urban Arabic speech),
+# but the owner's cards forbid them outright in Najdi replies — the linter measures
 # card compliance, so they are hard leaks here. Veto by eye if one shows up in a quote.
 _EGY = {"دلوقتي", "دلوقت", "كده", "كدا", "النهاردة", "إمبارح", "امبارح", "إزاي", "ازاي",
         "إزيك", "ازيك", "عايز", "عاوز", "عايزة", "مفيش", "معنديش", "متشكر", "أوي",
@@ -66,13 +66,16 @@ _EGY = {"دلوقتي", "دلوقت", "كده", "كدا", "النهاردة", "�
 # Najdi + Gulf-adjacent words. Gulf is NO LONGER a routed dialect (removed 2026-07-07,
 # owner decision) but these tokens stay forbidden inside Egyptian/Fusha replies.
 _NAJDI_GULF = {"وش", "أبغى", "ابغى", "الحين", "يبيلك", "صج", "وايد", "شنو", "دحين"}
-_HIJAZI_ONLY = {"إيش", "ايش", "دحين"}          # per user's directive: Najdi says وش, never إيش
+# Hijazi is NO LONGER a routed dialect (removed 2026-07-09, owner decision) but these tokens
+# stay forbidden inside Najdi/Egyptian/Fusha replies — per user's directive, Najdi says وش,
+# never إيش. Same reuse pattern as _NAJDI_GULF above.
+_HIJAZI_ONLY = {"إيش", "ايش", "دحين"}
 # جداً was PROMOTED out of soft drift (2026-07-07): every card says NEVER جداً, and it was the
 # single most frequent violation (20/33 Egyptian replies on 2026-07-06). Tokenizer note: the
 # [ء-ي]+ tokenizer strips the tanween, so جداً surfaces as جدا.
 _JIDDAN = {"جدا", "جداً"}
 _MSA_DRIFT = {"حيث", "مليء", "مليئة", "بعيدا", "بعيداً", "لذا", "كذلك"}
-_EGY_DRIFT_EXTRA = {"كيف"}   # Egyptian wants إزاي; كيف is native in Najdi/Hijazi/Gulf
+_EGY_DRIFT_EXTRA = {"كيف"}   # Egyptian wants إزاي; كيف is native in Najdi/Gulf
 
 # Egyptian هـ-future — forbidden outside Egyptian replies. Two shapes:
 #  2nd/3rd person: ه + ي/ت/ن + stem (هيكون، هتكون، هنروح) — regex + lookalike whitelist.
@@ -89,11 +92,10 @@ _HA_FUTURE_1P = {"هقول", "هقولك", "هقوللك", "هقولكم", "هع
                  "هكلمك", "هبعت", "هحكي", "هحكيلك", "هفكر", "هبدأ", "هحط", "هديك", "هساعدك"}
 
 # What is forbidden INSIDE a reply routed to each dialect. حاجة is Najdi-only forbidden
-# (Najdi=شي; Hijazi uses حاجة natively). _JIDDAN is forbidden in every dialect but NOT Fusha,
+# (Najdi says شي, never حاجة). _JIDDAN is forbidden in every dialect but NOT Fusha,
 # where جداً is correct MSA.
 FORBIDDEN: dict[str, set] = {
     "Najdi":    _EGY | _HIJAZI_ONLY | _JIDDAN | {"وايد", "شنو", "كمان", "بدي", "حاجة"},
-    "Hijazi":   _EGY | _JIDDAN | {"شنو", "يبيلك", "صج"},
     # وين added 2026-07-07 (live: an Egyptian joke recycled from a Hijazi one kept «وين الفول»;
     # Egyptian says فين). راح is deliberately NOT here — it is also valid Egyptian past "went"
     # (راح البيت), and راح-future vs راح-went can't be separated lexically; the Egyptian card
@@ -110,7 +112,7 @@ _STRAY = {"هيك", "مزيان"}
 for _d in FORBIDDEN:
     FORBIDDEN[_d] |= _STRAY
 
-_HA_FORBIDDEN_IN = {"Najdi", "Hijazi", "Fusha"}   # هـ-future allowed only in Egyptian
+_HA_FORBIDDEN_IN = {"Najdi", "Fusha"}   # هـ-future allowed only in Egyptian
 
 # Egyptian ـش-negation as a PATTERN (ما + verb + ش: «ما نعرفش») — caught live in a Najdi reply
 # 2026-07-07 where the glued list missed it. Same dialect set as the هـ-future gate; the rare
@@ -118,9 +120,10 @@ _HA_FORBIDDEN_IN = {"Najdi", "Hijazi", "Fusha"}   # هـ-future allowed only in 
 _SHIN_NEG_RE = re.compile(r"\bما\s+[ء-ي]{2,}ش\b")
 
 _AR_WORD_RE = re.compile(r"[ء-ي]+")
-# NOTE: "gulf arabic" is intentionally absent (Gulf removed 2026-07-07) — any old log rows
-# routed to it are skipped rather than scored against a dialect that no longer exists.
-_TTS_LANG_TO_DIALECT = {"najdi arabic": "Najdi", "hijazi arabic": "Hijazi",
+# NOTE: "gulf arabic" is intentionally absent (Gulf removed 2026-07-07) and "hijazi arabic" is
+# intentionally absent (Hijazi removed 2026-07-09) — any old log rows routed to either are
+# skipped rather than scored against a dialect that no longer exists.
+_TTS_LANG_TO_DIALECT = {"najdi arabic": "Najdi",
                         "egyptian arabic": "Egyptian", "standard arabic": "Fusha"}
 
 
@@ -141,7 +144,7 @@ def find_leaks(text: str, dialect: str) -> tuple[list[str], list[str]]:
         for m in _SHIN_NEG_RE.findall(text):
             leaks.append(f"ش-negation:{m}")
     drift_set = _MSA_DRIFT | (_EGY_DRIFT_EXTRA if dialect == "Egyptian" else set())
-    drift = sorted(words & drift_set) if dialect in ("Najdi", "Hijazi", "Egyptian") else []
+    drift = sorted(words & drift_set) if dialect in ("Najdi", "Egyptian") else []
     return leaks, drift
 
 
@@ -202,7 +205,7 @@ def main() -> int:
           f"{' since ' + args.since if args.since else ''} ==\n")
     print(f"{'dialect':>9}  {'replies':>7}  {'with-leaks':>10}  {'leak-rate':>9}  {'msa-drift':>9}  {'auto-fixed':>10}")
     total_n = total_leaky = 0
-    for d in ("Najdi", "Hijazi", "Egyptian", "Fusha"):
+    for d in ("Najdi", "Egyptian", "Fusha"):
         s = stats.get(d)
         if not s:
             continue
@@ -212,7 +215,7 @@ def main() -> int:
     print(f"{'TOTAL':>9}  {total_n:>7}  {total_leaky:>10}  {100*total_leaky/max(total_n,1):>8.0f}%")
 
     print("\n-- offending turns --")
-    for d in ("Najdi", "Hijazi", "Egyptian", "Fusha"):
+    for d in ("Najdi", "Egyptian", "Fusha"):
         for ts, leaks, drift, fixups, q in stats.get(d, {}).get("rows", []):
             parts = []
             if leaks:

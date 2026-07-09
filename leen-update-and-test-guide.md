@@ -104,8 +104,8 @@ changed in this update; a cached old page will misbehave).
 5. **Barge-in is smarter**: background noise/voices while it's speaking now cause a ~1-second
    *pause then resume*, instead of killing the reply. A real interruption (you speaking
    clearly into the mic) still stops it.
-6. **"Saudi dialect" works** (treated as Najdi). **Gulf/Khaleeji was removed** — asking for it
-   gets a polite Fusha reply naming the supported dialects.
+6. **"Saudi dialect" works** (treated as Najdi). **Gulf/Khaleeji and Hijazi were removed** — asking
+   for either gets a polite Fusha reply naming the supported dialects.
 7. **New dashboard**: http://localhost:8765/review shows every turn with its dialect routing
    and timings.
 
@@ -121,7 +121,7 @@ Go through these in order. For each: ✅ = behaves as described. Note the time o
 | 2 | "Tell me about the history of coffee **in Arabic**." | Fusha reply, Saudi voice |
 | 3 | Same question "**in Egyptian dialect**" | Egyptian voice + Egyptian wording (ده/كده/دلوقتي are correct here) |
 | 4 | Same question "**in Najdi dialect**" | Saudi voice; NO Egyptian words (no ده/دي/مش), NO جداً |
-| 5 | Same question "**in Hijazi dialect**" | Saudi voice, Hijazi wording (إيش/دحين fine) |
+| 5 | Same question "**in Hijazi dialect**" | Hijazi was removed (2026-07-09) — Fusha answer that starts by naming the supported dialects, same as Gulf below |
 | 6 | Same question "**in Saudi dialect**" | Behaves exactly like Najdi (new) |
 | 7 | Anything "**in Gulf dialect**" | Fusha answer that starts by naming the supported dialects (new) |
 | 8 | Speak Arabic directly: «وش أفضل مطعم بالرياض؟» | Najdi-flavored reply |

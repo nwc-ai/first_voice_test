@@ -45,7 +45,6 @@ MODEL      = "qwen3.5:27b"
 # ("… in Najdi dialect"). Fusha uses the generic-Arabic request (routes explicit_arabic→Fusha).
 _REQUEST_SUFFIX = {
     "Najdi":    " Tell me that in Najdi dialect.",
-    "Hijazi":   " Tell me that in Hijazi dialect.",
     "Egyptian": " Tell me that in Egyptian dialect.",
     "Fusha":    " Tell me that in Arabic.",
 }
@@ -53,7 +52,6 @@ _REQUEST_SUFFIX = {
 # Spoken-Arabic opener per dialect (exercises _detect_dialect the way live speech does).
 _AR_GREETING = {
     "Najdi":    "هلا والله، وش أخبارك اليوم؟",
-    "Hijazi":   "إيش أخبارك اليوم؟ أبي أسولف معك شوية",
     "Egyptian": "إزيك؟ عامل إيه النهاردة؟",
     "Fusha":    "كيف حالك اليوم؟",
 }
@@ -110,7 +108,7 @@ def run_turn(client, text: str, lang: str) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--dialects", default="Najdi,Hijazi,Egyptian,Fusha")
+    ap.add_argument("--dialects", default="Najdi,Egyptian,Fusha")
     ap.add_argument("--tag", default="", help="suffix for the report filename (e.g. before-register)")
     args = ap.parse_args()
     dialects = [d.strip() for d in args.dialects.split(",") if d.strip()]

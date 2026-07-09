@@ -24,7 +24,7 @@ This is the manual runbook to get the voice assistant running. It's reconstructe
 ## 2. Get the code + the voice clips
 The repo's **reference voice clips are mandatory** — `load_models()` aborts at boot if any registry clip is
 missing. Both active clips are committed in git under `voices/`:
-- `voices/silma-tts-saudi-24k.wav` — Saudi default voice (Najdi/Hijazi/Fusha/English)
+- `voices/silma-tts-saudi-24k.wav` — Saudi default voice (Najdi/Fusha/English)
 - `voices/omnivoice-tts-egyptian-24k-v3.wav` — active Egyptian voice
 
 (The superseded Egyptian v1/v2 clips were deleted from the tree on 2026-07-06 — recover from git history

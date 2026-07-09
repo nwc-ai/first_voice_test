@@ -32,8 +32,6 @@ print("\n== _detect_dialect ==")
 D = server._detect_dialect
 check("najdi: وش رايك",                    D("وش رايك"), "Najdi")
 check("najdi: أبغى أروح البيت الحين",       D("أبغى أروح البيت الحين"), "Najdi")
-check("hijazi: إيش رايك",                  D("إيش رايك"), "Hijazi")
-check("hijazi: أبي أروح دحين",             D("أبي أروح دحين"), "Hijazi")
 check("egyptian: إزيك عامل إيه",           D("إزيك؟ عامل إيه"), "Egyptian")
 check("egyptian: عايز أعرف إزاي أروح",     D("عايز أعرف إزاي أروح المطار"), "Egyptian")
 check("egyptian: علشان النهاردة",          D("علشان النهاردة عندي شغل"), "Egyptian")
@@ -41,6 +39,12 @@ check("egyptian: علشان النهاردة",          D("علشان النها
 check("REGR أيوه is not Hijazi",           D("أيوه يا فندم"), None)          # was: Hijazi
 check("REGR تمام is not Hijazi",           D("تمام، اتفقنا"), None)          # was: Hijazi
 check("REGR هلا doesn't tie away Najdi",   D("هلا والله، وش الأخبار"), "Najdi")  # was: tie → None
+# Hijazi REMOVED as a supported dialect (2026-07-09, owner decision): former Hijazi-only
+# markers carry no signal at all now, and a former Najdi/Hijazi 1-1 tie correctly resolves
+# to Najdi (2-way race, not a bug — same effect as Gulf's removal collapsing a wider tie).
+check("REGR إيش alone no longer Hijazi",   D("إيش رايك"), None)
+check("REGR دحين alone no longer Hijazi",  D("أبي أروح دحين"), None)
+check("REGR former Najdi/Hijazi tie → Najdi", D("وش رايك؟ خلك دحين"), "Najdi")
 # REGRESSIONS — weak Egyptian markers (مش/ده/دي) can support but never win alone
 check("REGR مش alone is not Egyptian",     D("مش عارف كيف أروح"), None)      # was: Egyptian
 check("REGR ده alone is not Egyptian",     D("ده كتاب جميل"), None)          # was: Egyptian
@@ -56,7 +60,6 @@ R = server._requested_dialect
 check("رد بالمصري",                        "Egyptian" in (R("رد بالمصري") or ""), True)
 check("باللهجة النجدية",                   "Najdi" in (R("تكلم باللهجة النجدية") or ""), True)
 check("in Egyptian dialect",               "Egyptian" in (R("tell me about Egypt in Egyptian dialect") or ""), True)
-check("speak Hijazi Arabic",               "Hijazi" in (R("speak Hijazi Arabic please") or ""), True)
 check("reply in Najdi",                    "Najdi" in (R("reply in Najdi") or ""), True)
 check("switch to Egyptian",                "Egyptian" in (R("switch to Egyptian") or ""), True)
 check("say it in Masri",                   "Egyptian" in (R("say it in Masri") or ""), True)
@@ -77,6 +80,11 @@ check("بالخليجي no longer a request",      R("رد بالخليجي"), N
 check("'Gulf dialect' → unknown note",     server._route_turn("Tell me about Dubai in Gulf dialect", "en")["route"], "unknown_dialect")
 check("'Khaleeji dialect' → unknown note", server._route_turn("say that in Khaleeji dialect", "en")["route"], "unknown_dialect")
 check("بالخليجي spoken → Fusha default",   server._route_turn("رد بالخليجي عن الطقس", "ar")["tts_language"], "standard arabic")
+# Hijazi REMOVED as a supported dialect (2026-07-09, owner decision):
+check("Hijazi no longer a request",        R("speak Hijazi Arabic please"), None)
+check("بالحجازي no longer a request",      R("رد بالحجازي"), None)
+check("'Hijazi dialect' → unknown note",   server._route_turn("Tell me about Jeddah in Hijazi dialect", "en")["route"], "unknown_dialect")
+check("بالحجازي spoken → Fusha default",   server._route_turn("رد بالحجازي عن الطقس", "ar")["tts_language"], "standard arabic")
 # REGRESSIONS — proper nouns / bare names must NOT be requests (review finding)
 check("REGR Egyptian Museum",              R("The Egyptian Museum is in Cairo"), None)
 check("REGR Gulf region",                  R("I work in the Gulf region"), None)
@@ -237,7 +245,7 @@ check("REGR دي/مش in Najdi are leaks",       set(leaks("والعبادة د�
 check("REGR حاجة in Najdi is a leak",        "حاجة" in leaks("ولا فيه حاجة أكبر من كذا", "Najdi"), True)
 check("REGR جداً in Najdi is a leak",        "جدا" in leaks("الحياة الاجتماعية فيها قوية جداً", "Najdi"), True)
 check("جداً in Fusha is correct MSA",        leaks("هذا الموضوع مهم جداً في التاريخ", "Fusha"), [])
-check("حاجة in Hijazi is native (ok)",       "حاجة" in leaks("أبي أشتري حاجة من السوق", "Hijazi"), False)
+check("no Hijazi entry left in FORBIDDEN",   "Hijazi" in lint.FORBIDDEN, False)
 _, _kif_drift = lint.find_leaks("عايزين نفهم كيف الدنيا بتمشي", "Egyptian")
 check("كيف is Egyptian-only msa-drift",      "كيف" in _kif_drift, True)
 _, _kif_najdi = lint.find_leaks("ما أدري كيف الوضع عندكم", "Najdi")
@@ -254,17 +262,18 @@ check("filters: chunk 2 (سألتزم بالقاعدة)",  M("سألتزم با�
 check("filters: as per rule (EN)",           M("As per rule 4, I will reply in Fusha."), True)
 check("filters: according to my instructions", M("According to my instructions, I must use Fusha."), True)
 # Must NOT filter real content:
-check("keeps: unknown-dialect note",         M("أتحدث باللهجات النجدية والحجازية والمصرية والفصحى، أرجو أن تكرر اسم اللهجة."), False)
+check("keeps: unknown-dialect note",         M("أتحدث باللهجات النجدية والمصرية والفصحى، أرجو أن تكرر اسم اللهجة."), False)
 check("keeps: grammar-rules answer",         M("القاعدة الأولى في النحو هي أن الفاعل مرفوع دائماً."), False)
 check("keeps: normal opener",                M("فلسفة الحياة هي فرع من فروع الفلسفة يهتم بدراسة المعنى."), False)
 
 F = server._apply_fixups
 check("fixup: جداً→أوي (Egyptian)",          F("الوضع كبير جداً هنا", "egyptian arabic"), "الوضع كبير أوي هنا")
 check("fixup: جدا→مرة (Najdi)",              F("المطعم زين جدا", "najdi arabic"), "المطعم زين مرة")
+check("fixup: أوي→مرة (Najdi)",              F("الأكل زين أوي", "najdi arabic"), "الأكل زين مرة")
 check("fixup: gulf arabic gone (no-op)",     F("الجو حار جداً", "gulf arabic"), "الجو حار جداً")
+check("fixup: hijazi arabic gone (no-op)",   F("الجو حلو أوي", "hijazi arabic"), "الجو حلو أوي")
 check("fixup: الحين→دلوقتي (Egyptian)",      F("الطقس حلو الحين", "egyptian arabic"), "الطقس حلو دلوقتي")
 check("fixup: دلوقتي→الحين (Najdi)",         F("الوضع دلوقتي زين", "najdi arabic"), "الوضع الحين زين")
-check("fixup: دلوقتي→دحين (Hijazi)",         F("المدينة دلوقتي زحمة", "hijazi arabic"), "المدينة دحين زحمة")
 check("fixup: glued وكتير→وكثير (Najdi)",    F("فيها أماكن وكتير منها قديم", "najdi arabic"), "فيها أماكن وكثير منها قديم")
 check("fixup: كثير→كتير (Egyptian)",         F("فيه ناس كثير هناك", "egyptian arabic"), "فيه ناس كتير هناك")
 check("fixup: Fusha untouched",              F("هذا الأمر مهم جداً", "standard arabic"), "هذا الأمر مهم جداً")
@@ -280,7 +289,6 @@ check("fixup: هيك→كذا (Najdi, live case)",   F("ما أدري غير ه�
 check("fixup: ده→هذا (Najdi)",               F("الزمان ده صعب", "najdi arabic"), "الزمان هذا صعب")
 check("fixup: وده→وهذا glued (Najdi)",       F("وده يعني الشي واضح", "najdi arabic"), "وهذا يعني الشي واضح")
 check("fixup: مش→مو (Najdi)",                F("العداد مش شغال", "najdi arabic"), "العداد مو شغال")
-check("fixup: كده→كذا (Hijazi)",             F("ليش كده يا صاحبي", "hijazi arabic"), "ليش كذا يا صاحبي")
 check("fixup: هيك→كده (Egyptian)",           F("مش عايز هيك", "egyptian arabic"), "مش عايز كده")
 check("fixup: Egyptian ده/دي/مش untouched",  F("الحكاية دي مش سهلة وده واضح", "egyptian arabic"), "الحكاية دي مش سهلة وده واضح")
 check("fixup: بده NOT matched (no ب prefix)", F("بده يروح البيت", "najdi arabic"), "بده يروح البيت")
@@ -326,7 +334,7 @@ _w_pn = server._build_turn_content("what is pressure", server._route_turn("reply
 check("najdi wrapper: reminder present",     "REMEMBER — the most important rule" in _w_pn, True)
 check("najdi reminder is the LAST line",     _w_pn.rstrip().endswith("before writing it."), True)
 check("najdi reminder AFTER user text",      _w_pn.index("User:") < _w_pn.index("REMEMBER"), True)
-check("najdi reminder names ONLY Najdi",     ("Egyptian" in _w_pn.split("REMEMBER")[1]) or ("Hijazi" in _w_pn.split("REMEMBER")[1]), False)
+check("najdi reminder names ONLY Najdi",     "Egyptian" in _w_pn.split("REMEMBER")[1], False)
 _w_pf = server._build_turn_content("x", server._route_turn("tell me that in Arabic", "en"))
 check("fusha reminder: zero-dialect form",   "ZERO regional-dialect words" in _w_pf, True)
 _w_pe2 = server._build_turn_content("hi", server._route_turn("hello there, how are you", "en"))
@@ -334,19 +342,19 @@ check("english wrapper: no reminder",        "REMEMBER" in _w_pe2, False)
 
 # ── Spoken register + water-utility domain lexicon (2026-07-07 owner decisions) ───────────
 print("\n== register / domain lexicon ==")
-hijazi_instr = server._route_turn("speak Hijazi Arabic please", "en")["instruction"]
-for _nm, _ins in (("najdi", najdi_instr), ("hijazi", hijazi_instr),
+for _nm, _ins in (("najdi", najdi_instr),
                   ("egyptian", egy_instr)):
     check(f"{_nm} card: spoken REGISTER note",  "VOICE conversation" in _ins, True)
 check("fusha card: NO register note",        "VOICE conversation" in fusha_instr, False)
 check("najdi card: broken=خربان",            "خربان" in najdi_instr, True)
 check("najdi card: really=صج",               "صج" in najdi_instr, True)
-check("hijazi card: broken=عاطل",            "عاطل" in hijazi_instr, True)
 check("egyptian card: broken=بايظ",          "بايظ" in egy_instr, True)
 check("egyptian card: reading=قراية",        "قراية" in egy_instr, True)
 check("no Gulf card remains",                "Gulf" in server._DIALECT_CARDS, False)
+check("no Hijazi card remains",              "Hijazi" in server._DIALECT_CARDS, False)
 _unk_note = server._route_turn("history of America in 90 dialect.", "en")["instruction"]
 check("unknown note lists no Gulf",          "Gulf" in _unk_note, False)
+check("unknown note lists no Hijazi",        "Hijazi" in _unk_note, False)
 check("linter: بايظ leaks in Najdi",         "بايظ" in leaks("العداد بايظ من أمس", "Najdi"), True)
 check("linter: قراية leaks in Najdi",        "قراية" in leaks("خذ قراية العداد اليوم", "Najdi"), True)
 check("linter: بايظ fine in Egyptian",       "بايظ" in leaks("العداد بايظ خالص", "Egyptian"), False)

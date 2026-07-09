@@ -54,7 +54,7 @@ WebSocket to a Python server that runs the entire pipeline **in one process on o
 (except the LLM, which runs in a separate Ollama process), and streams synthesized speech back.
 
 - **General-purpose assistant** (not domain-specific), tuned to **reply in the user's dialect**.
-- **Dialects:** Najdi, Hijazi, Egyptian, Fusha (MSA). **Fusha (MSA) is the default** when the
+- **Dialects:** Najdi, Egyptian, Fusha (MSA). **Fusha (MSA) is the default** when the
   dialect is unclear (see §11).
 - **Latency target:** time-to-first-audio ≈ 1–1.5 s (full turn typically 3–5 s).
 - **Barge-in:** speaking over the AI cancels its turn immediately.
@@ -221,8 +221,8 @@ The 1298-line core. Sections below follow the file top-to-bottom.
 - **`MODEL = "qwen3.5:27b"`** ([:107](server.py#L107)) — the ONLY model, hard-locked in both UI and
   server (a second LLM would OOM the GPU).
 - **`SYSTEM_PROMPT`** ([:112-144](server.py#L112)) — the full system message. 13 numbered rules
-  (0–12): rule 0 language-override; rule 1 English→English; **rule 2 dialect map (Najdi/Hijazi/
-  Egyptian/Fusha — Gulf removed 2026-07-07)**; rule 3 code-switch mirroring; **rule 4 unclear → DEFAULT
+  (0–12): rule 0 language-override; rule 1 English→English; **rule 2 dialect map (Najdi/
+  Egyptian/Fusha — Gulf removed 2026-07-07, Hijazi removed 2026-07-09)**; rule 3 code-switch mirroring; **rule 4 unclear → DEFAULT
   Fusha/MSA (not a regional dialect)**; rule 5 never mix two dialects; rule 6 no CJK/Cyrillic scripts; rule 7
   full spoken sentences; rule 8 punctuation; rule 9 no markdown; rule 10 no filler openers; rule 11
   never ask for clarification; rule 12 spell out abbreviations (voice).
@@ -311,7 +311,7 @@ The 1298-line core. Sections below follow the file top-to-bottom.
 Covered in depth in §11. Symbols: `_ARABIC_CHARS_RE`/`_LATIN_WORDS_RE` ([:507-508](server.py#L507)) which
 feed `_is_mixed` ([:510](server.py#L510)), `_WANTS_ARABIC_RE`/
 `_WANTS_ENGLISH_RE` ([:515-526](server.py#L515)), `_DIALECT_PATTERNS` ([:534-546](server.py#L534)),
-`_requested_dialect` ([:548-553](server.py#L548)), `_NAJDI_MARKERS`/`_HIJAZI_MARKERS`/
+`_requested_dialect` ([:548-553](server.py#L548)), `_NAJDI_MARKERS`/
 `_EGYPTIAN_MARKERS` ([:560-571](server.py#L560)), `_AR_WORD_SPLIT_RE` ([:572](server.py#L572)),
 `_detect_dialect` ([:574-587](server.py#L574)), `_ARABIC_SCRIPT_REMAP` ([:595](server.py#L595)),
 `MIN_TEXT_CHARS=3`/`MAX_TEXT_CHARS=500` ([:596-597](server.py#L596)).
@@ -488,7 +488,7 @@ smoke test**, not a full end-to-end test.
 - **`logs/barge_diag.log`** — timestamped lines from `_diag`: `[SERVER-VAD] speech_start …`,
   `[SERVER-UTTERANCE] …`, `[CLIENT-BARGE] …`, `[WS-DISCONNECT] code=…`. Gitignored (`*.log`). Temporary.
 - **`voices/`** — OmniVoice reference clips (24 kHz mono PCM-16): **`silma-tts-saudi-24k.wav`** (Saudi male,
-  7.64 s — the **default** voice for Najdi/Hijazi/Fusha/English, transcript `_REF_TEXT`);
+  7.64 s — the **default** voice for Najdi/Fusha/English, transcript `_REF_TEXT`);
   **`omnivoice-tts-egyptian-24k-v3.wav`** (Egyptian, 8.0 s — the **active** Egyptian voice, transcript
   `_EGY_REF_TEXT`); **`omnivoice-tts-egyptian-24k-v2.wav`** and **`omnivoice-tts-egyptian-24k.wav`**
   (Egyptian v2/v1, **unused**, superseded by v3).
@@ -499,7 +499,7 @@ smoke test**, not a full end-to-end test.
 
 ## 11. Dialect engine deep-dive
 
-The system understands and replies in **Najdi, Hijazi, Egyptian, Fusha**; **Fusha (MSA) is the default**.
+The system understands and replies in **Najdi, Egyptian, Fusha**; **Fusha (MSA) is the default**.
 
 **Explicit requests — `_DIALECT_PATTERNS` + `_requested_dialect` ([server.py:534-553](server.py#L534)):**
 regex-matches a *named* dialect or language request (e.g. "in Najdi", "بالمصري", "in Fusha"). The Arabic
@@ -511,12 +511,11 @@ descriptive phrase or `None`.
 **Spoken-dialect detection — `_detect_dialect(text)` ([server.py:574-587](server.py#L574)):** splits the
 transcript into Arabic-letter words (`_AR_WORD_SPLIT_RE`) and counts **distinguishing marker** hits:
 - `_NAJDI_MARKERS` = وش، أبغى/ابغى، الحين، زين، ماله، يبيلك، صج، عاد، هيه، أدري/ادري
-- `_HIJAZI_MARKERS` = إيش/ايش، أبي/ابي، دحين، هلا، تمام، إيوه/أيوه/ايوه، مشكور، كيفك
 - `_EGYPTIAN_MARKERS` = إزاي/ازاي، إزيك/ازيك، عايز/عاوز/عايزة، دلوقتي/دلوقت، مش، كده/كدا، علشان، ده، دي، دول، النهاردة، إمبارح/امبارح، أهو، **إيه/ايه، كام، فين** (the Egyptian interrogatives, added to catch markerless-looking Egyptian; lifted Egyptian discrimination 58%→92% on the 100-Q test)
 
 Returns the strict-max dialect, or **`None` on no-marker or tie** (the common case for short
 utterances). Shared words are deliberately excluded — notably bare **`عشان`** (used across
-Najdi/Hijazi/Gulf/Egyptian; it was tying real Najdi utterances to Egyptian, so only `علشان` is kept), plus
+Najdi/Gulf/Egyptian generally; it was tying real Najdi utterances to Egyptian, so only `علشان` is kept), plus
 وين، ليش، بعدين، خلاص، يلا، بس، مرة.
 
 **Routing — the per-turn `lang_instruction` in `respond_loop` ([server.py:1111-1182](server.py#L1111)),
@@ -526,11 +525,11 @@ priority order:**
 2. **Explicit English request** (`_WANTS_ENGLISH_RE`) → English ([:1125-1132](server.py#L1125)).
 3. **`lang=="mixed"`** → mirror the AR/EN mix; Arabic parts in the detected dialect, else **Fusha**
    ([:1133-1144](server.py#L1133)).
-4. **`lang=="ar"`** → committed instruction for detected **Najdi / Hijazi / Egyptian**, else **Fusha
+4. **`lang=="ar"`** → committed instruction for detected **Najdi / Egyptian**, else **Fusha
    default** ([:1145-1181](server.py#L1145)).
 5. **else (English)** → English ([:1182](server.py#L1182)).
 
-So: clearly-detected Najdi/Hijazi/Egyptian win; English stays English; **everything else Arabic
+So: clearly-detected Najdi/Egyptian win; English stays English; **everything else Arabic
 defaults to Fusha/MSA** (SYSTEM_PROMPT rule 4 reinforces this). Fusha is routed through the Saudi voice
 clip with `language="standard arabic"` — there is no separate spoken-Fusha classifier.
 STT recognition is biased toward dialect spelling via `_AR_HOTWORDS` on the forced-Arabic re-pass.
@@ -542,7 +541,6 @@ computes `tts_voice` and `tts_language`, both passed to `stream_tts_to_ws`:
 |---|---|---|
 | Egyptian (detected/requested) | `egyptian` (Egyptian **v3** clip) | `egyptian arabic` |
 | Najdi | `saudi` | `najdi arabic` |
-| Hijazi | `saudi` | `hijazi arabic` |
 | **Fusha (default: unclear / no-marker / requested-no-dialect)** | `saudi` | `standard arabic` |
 | English | `saudi` | `None` |
 | Mixed AR+EN | per detected dialect (else Saudi/Fusha) | `None` (avoids mispronouncing the English) |
@@ -612,7 +610,7 @@ Arabic-script languages"). All **code** (`server.py`, `tts_omnivoice_v1.py`, `st
 carry an uncommitted refresh.
 
 **Dialect / voice / STT work now in git (commits `2562aca` → `f3b1758` → `ba71bbc`):**
-- Dialect engine: `_detect_dialect` (3-way Najdi/Hijazi/Egyptian markers) + `_requested_dialect` (explicit
+- Dialect engine: `_detect_dialect` (2-way Najdi/Egyptian markers, Hijazi removed 2026-07-09) + `_requested_dialect` (explicit
   requests, Arabic tokens gated behind a `بال…`/`لهجة` request prefix so proper nouns don't false-trigger)
   + committed per-turn routing; dialect-aware abstention phrasing.
 - **Fusha (MSA) is the DEFAULT** (unclear / no-marker / no-named-dialect / mixed-Arabic-part → Fusha),

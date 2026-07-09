@@ -13,7 +13,7 @@
 #
 # OmniVoice is a zero-shot voice-cloner: it needs a short reference clip + its transcript to define the
 # voice. A per-dialect voice registry (_VOICES) selects the clip per turn — Saudi (default) for
-# Najdi/Hijazi/Fusha/English, Egyptian (v3 clip) for Egyptian-routed turns — and server.py also passes an
+# Najdi/Fusha/English, Egyptian (v3 clip) for Egyptian-routed turns — and server.py also passes an
 # OmniVoice `language=` dialect ID per turn to pin pronunciation.
 # =========================================================================================
 
@@ -55,7 +55,7 @@ def _expand_abbreviations(text: str) -> str:
 
 SAMPLE_RATE = 24000  # OmniVoice output sample rate
 
-# Saudi DEFAULT voice (registry key "saudi") — used for Najdi/Hijazi/Fusha/English. Egyptian voice below.
+# Saudi DEFAULT voice (registry key "saudi") — used for Najdi/Fusha/English. Egyptian voice below.
 _REF_AUDIO = os.path.join(os.path.dirname(__file__), "voices", "silma-tts-saudi-24k.wav")
 _REF_TEXT  = "الثقافة السعودية فيها عراقة وتاريخ عميق، وقيم إسلامية راسخة، وعادات وتقاليد قبلية أصيلة متوارثة."
 

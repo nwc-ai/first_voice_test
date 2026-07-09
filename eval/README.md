@@ -20,7 +20,7 @@ markers, patterns, or routing** — it takes seconds:
 Reports recall + cross-dialect confusion of `_detect_dialect` over labeled transcripts.
 Ships with `dialect_id_cases.jsonl`, a **synthetic seed set** (marked per-row in `source`)
 — useful for catching regressions, not for absolute numbers. What must stay ~0 is
-**cross-dialect confusion** (an Egyptian utterance routed as Hijazi switches the voice
+**cross-dialect confusion** (an Egyptian utterance routed as Najdi switches the voice
 and pronunciation). Missing a dialect (→ Fusha default) is the designed, safe failure.
 
 ```bash

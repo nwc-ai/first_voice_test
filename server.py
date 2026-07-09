@@ -70,20 +70,27 @@ MAX_HISTORY_TURNS = 3   # rolling memory: keep only the last N user+assistant pa
                         # Lowered 6 → 3 — less context re-sent each turn = faster qwen3.5:27b prefill,
                         # while still covering normal follow-ups ("what about X", "وش يعني؟").
 
-# qwen3.5 context window (KV cache size). Default 8192 keeps VRAM low for the in-process
-# stack; raise it (e.g. LLM_NUM_CTX=16384) as the team's prompts/reasoning grow — the
-# q8_0 KV cache in start_server.sh makes a bigger context affordable. Used by BOTH the
-# warm-up and the chat requests so the model loads once at this size (no reload).
-LLM_NUM_CTX = int(os.environ.get("LLM_NUM_CTX", "8192"))
-
 # Qwen thinking mode — DEFAULT OFF, testing flag only (LLM_THINK=1 bash start_server.sh).
 # think:True makes the model reason SILENTLY inside the same num_predict budget before any
-# spoken token: at 300–400 tokens that means EMPTY replies (the 2026-07-08 live incident:
-# done_reason=length, thinking=1284 chars, content=0), and even correctly budgeted it adds
-# seconds of dead air before the first sentence. When ON, num_predict is raised so the budget
-# covers thinking + a full answer. Never hardcode think:True in MODEL_CONFIGS — use this flag.
+# spoken token. Measured 2026-07-09 (live, two consecutive turns): thinking alone ran 6100-6300
+# chars and hit done_reason=length with ZERO content, even at num_predict=1500 — thinking length
+# is not bounded in any way that makes a fixed budget "safe". Raising num_predict here only
+# reduces how OFTEN that happens; the actual guarantee against empty replies is the no-think
+# retry in respond_loop (an attempt that comes back with no content is redone once with
+# thinking off). Never hardcode think:True in MODEL_CONFIGS — use this flag.
 LLM_THINK       = os.environ.get("LLM_THINK", "0") == "1"
-LLM_NUM_PREDICT = 1500 if LLM_THINK else 400
+LLM_NUM_PREDICT = 6000 if LLM_THINK else 400
+
+# qwen3.5 context window (KV cache size). Default 8192 keeps VRAM low for the in-process
+# stack. Under LLM_THINK the default rises to 16384: system prompt + one dialect card +
+# history already runs into four figures of tokens before generation even starts, and a
+# 6000-token num_predict on top of that would exceed 8192 mid-generation — Ollama's response
+# to that is context-shifting (silently dropping the EARLIEST tokens, i.e. the system prompt
+# and dialect rules) rather than erroring, which is worse than just paying for more KV cache.
+# The q8_0 KV cache in start_server.sh makes the bigger context affordable. Override either
+# way with LLM_NUM_CTX=<n>. Used by BOTH the warm-up and the chat requests so the model loads
+# once at this size (no reload).
+LLM_NUM_CTX = int(os.environ.get("LLM_NUM_CTX", "16384" if LLM_THINK else "8192"))
 LOG_DIR      = os.path.join(os.path.dirname(__file__), "logs")
 PERF_LOG     = os.path.join(LOG_DIR, "interactions.jsonl")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -133,7 +140,7 @@ SYSTEM_PROMPT = (
     "   THAT language regardless of which language they wrote their request in. This overrides rules 1-4. "
     "1. Otherwise, if the user speaks English → reply in English only. "
     "2. If the user speaks Arabic → reply in the exact dialect stated in the per-message "
-    "   instruction (Najdi نجدي / Hijazi حجازي / Egyptian مصري / Fusha فصحى). "
+    "   instruction (Najdi نجدي / Egyptian مصري / Fusha فصحى). "
     "   Each message carries a usage guide for that dialect — follow it exactly and NEVER mix "
     "   words from a different dialect into the reply. "
     "3. If the user mixes Arabic and English (code-switching) → reply in the same natural mix, matching their Arabic dialect. "
@@ -218,8 +225,9 @@ def _load_all_blocking():
               "set FRCRN_ENABLED=1 to A/B).")
 
     if LLM_THINK:
-        print("⚠ LLM THINKING MODE ON (LLM_THINK=1, num_predict 1500) — TESTING ONLY: "
-              "expect several seconds of silence before each reply while the model reasons.")
+        print(f"⚠ LLM THINKING MODE ON (LLM_THINK=1, num_predict {LLM_NUM_PREDICT}) — TESTING ONLY: "
+              "expect several seconds of silence before each reply while the model reasons; "
+              "an attempt that comes back empty is retried once with thinking off.")
 
     # Warm inference — symmetrical with _warm_llm: loading weights alone leaves the first real
     # turn paying first-inference CUDA kernel/allocator cost for Whisper AND OmniVoice (plus the
@@ -513,13 +521,12 @@ _DIALECT_PATTERNS: list[tuple[str, Any, str]] = [
     ("Najdi", re.compile(_en_dialect_req("najdi") + r"|\bsaudi\s+(?:arabic|dialect|accent)\b"
                          r"|بال(?:نجدي|سعودي)(?:ة|ه)?|(?:لهجة|لغة)\s+ال?(?:نجدي|سعودي)(?:ة|ه)?", re.IGNORECASE | re.UNICODE),
      "the Najdi dialect"),
-    ("Hijazi", re.compile(_en_dialect_req("hi?jazi|hejazi") + r"|بالحجازي(?:ة|ه)?|(?:لهجة|لغة)\s+ال?حجازي(?:ة|ه)?", re.IGNORECASE | re.UNICODE),
-     "the Hijazi dialect"),
     ("Egyptian", re.compile(_en_dialect_req("egyptian|masri") + r"|بالمصري(?:ة|ه)?|(?:لهجة|لغة)\s+ال?مصري(?:ة|ه)?", re.IGNORECASE | re.UNICODE),
      "the Egyptian dialect"),
-    # Gulf/Khaleeji was REMOVED as a supported dialect (2026-07-07, owner decision) — an
-    # English "in Gulf/Khaleeji dialect" request now falls through to the unknown_dialect
-    # branch (Fusha + supported-dialects note); Arabic «بالخليجي» falls to the Fusha default.
+    # Gulf/Khaleeji was REMOVED as a supported dialect (2026-07-07, owner decision), and Hijazi
+    # was REMOVED as a supported dialect (2026-07-09, owner decision) — an English "in
+    # Gulf/Khaleeji/Hijazi dialect" request now falls through to the unknown_dialect branch
+    # (Fusha + supported-dialects note); Arabic «بالخليجي»/«بالحجازي» falls to the Fusha default.
     ("Fusha", re.compile(r"\bfus-?ha\b|\bmsa\b|modern\s+standard|classical\s+arabic|الفصحى|فصحى",
                          re.IGNORECASE | re.UNICODE),
      "Modern Standard Arabic (Fusha)"),
@@ -529,7 +536,7 @@ _DIALECT_PATTERNS: list[tuple[str, Any, str]] = [
 # garbling a real dialect name ("Najati", "90 dialect", "HD dialect", "my gene dialect").
 _UNKNOWN_DIALECT_RE     = re.compile(r"\b(?:in|into)\s+(?:the\s+)?([\w][\w\s-]{0,24}?)\s+dialect\b",
                                      re.IGNORECASE)
-_KNOWN_DIALECT_NAME_RE  = re.compile(r"najdi|hi?jazi|hejazi|egyptian|masri|"
+_KNOWN_DIALECT_NAME_RE  = re.compile(r"najdi|egyptian|masri|"
                                      r"arabic|fus-?ha|msa|standard|saudi|english",
                                      re.IGNORECASE)
 
@@ -544,40 +551,36 @@ def _requested_dialect(text: str) -> Optional[str]:
                 return phrase
     return None
 
-# Najdi vs Hijazi DISTINGUISHING markers (from the shared Saudi-slang glossary) — used to detect
-# which dialect the user actually SPOKE, so the reply commits to the same one instead of guessing.
-# Words shared by both dialects (وين، ليش، بعدين، خلاص، يلا، بس، مرة) carry no signal and are
+# Najdi DISTINGUISHING markers (from the shared Saudi-slang glossary) — used to detect that the
+# user actually SPOKE Najdi, so the reply commits to it instead of guessing (Hijazi's own marker
+# set was REMOVED 2026-07-09, owner decision — see the _DIALECT_PATTERNS note above). Words
+# shared with other dialects (وين، ليش، بعدين، خلاص، يلا، بس، مرة) carry no signal and are
 # deliberately excluded. Whole-word matching only (no substrings). Hamza/no-hamza variants included
 # because both users and STT vary on it.
-# PAN-DIALECT WORDS REMOVED from the Hijazi set (same logic as the عشان exclusion):
-#   أيوه/إيوه/ايوه — the canonical EGYPTIAN "yes"; it was routing «أيوه يا فندم» to Hijazi.
-#   تمام — universal (Egyptian «تمام قوي», Najdi, MSA all use it).
-#   هلا — as Najdi/Gulf as it is Hijazi; «هلا والله وش الأخبار» tied 1-1 and fell to Fusha.
 _NAJDI_MARKERS    = {"وش", "أبغى", "ابغى", "الحين", "زين", "ماله", "يبيلك", "صج", "عاد", "هيه", "أدري", "ادري"}
-_HIJAZI_MARKERS   = {"إيش", "ايش", "أبي", "ابي", "دحين", "مشكور", "كيفك"}
 # Egyptian (Cairene/Delta) markers — إزاي, عايز, دلوقتي, كده, علشان, plus the Egyptian
-# interrogatives إيه (=what)، كام (=how much)، فين (=where) — all distinct from the Saudi dialects
-# (وش/إيش، كم، وين) and MSA (ماذا/كم/أين). (إمتى is intentionally NOT added — it overlaps Hijazi.)
-# NOTE: bare "عشان" is deliberately EXCLUDED — it's shared across Najdi/Hijazi/Gulf/Egyptian, so it
-# carries no dialect signal and was tying real Najdi utterances to Egyptian (e.g. "وش ... عشان ..." →
+# interrogatives إيه (=what)، كام (=how much)، فين (=where) — all distinct from Najdi
+# (وش، كم، وين) and MSA (ماذا/كم/أين). (إمتى is intentionally NOT added — it's not a reliable
+# Egyptian-only signal.)
+# NOTE: bare "عشان" is deliberately EXCLUDED — it's shared across Najdi/Gulf/Egyptian speech
+# generally, so it carries no dialect signal and was tying real Najdi utterances to Egyptian (e.g. "وش ... عشان ..." →
 # 1-1 tie → unclear). "علشان" (with the ل) is kept as the Egyptian-leaning variant.
 _EGYPTIAN_MARKERS = {"إزاي", "ازاي", "إزيك", "ازيك", "عايز", "عاوز", "عايزة", "دلوقتي", "دلوقت",
                      "كده", "كدا", "علشان", "دول", "النهاردة", "إمبارح", "امبارح", "أهو",
                      "إيه", "ايه", "كام", "فين"}
-# WEAK Egyptian markers — high-frequency words also heard in urban Hijazi speech («مش عارف كيف
-# أروح» is Hijazi). Half weight: they support a strong marker but can never flip the voice alone.
+# WEAK Egyptian markers — high-frequency words also common outside Egyptian speech generally.
+# Half weight: they support a strong marker but can never flip the voice alone.
 _EGYPTIAN_WEAK    = {"مش", "ده", "دي"}
 _AR_WORD_SPLIT_RE = re.compile(r"[^؀-ۿ]+")  # split on any run of non-Arabic-letter chars
 
 def _detect_dialect(text: str) -> Optional[str]:
-    """Lexically classify spoken Arabic as 'Najdi' / 'Hijazi' / 'Egyptian' by scoring distinguishing
-    marker words (weak Egyptian markers count 0.5). Returns None when the top score is < 1.0 —
+    """Lexically classify spoken Arabic as 'Najdi' / 'Egyptian' by scoring distinguishing marker
+    words (weak Egyptian markers count 0.5). Returns None when the top score is < 1.0 —
     i.e. only weak evidence — OR tied (caller defaults to Fusha). Short utterances rarely carry a
     marker and many words are shared, so 'unclear' is the common, intended case."""
     words  = {w for w in _AR_WORD_SPLIT_RE.split(text) if w}
     scores = {
         "Najdi":    float(len(words & _NAJDI_MARKERS)),
-        "Hijazi":   float(len(words & _HIJAZI_MARKERS)),
         "Egyptian": len(words & _EGYPTIAN_MARKERS) + 0.5 * len(words & _EGYPTIAN_WEAK),
     }
     top = max(scores.values())
@@ -591,19 +594,19 @@ def _detect_dialect(text: str) -> Optional[str]:
 # function words + morphology ONLY — these apply to any topic; no topic phrases, no example
 # sentences to parrot. Each card orders the model to write naturally, because the 2026-07-06
 # eval showed the model KEYWORD-STUFFS a bare word list (وش/زين dropped into Egyptian grammar).
-# The top defects each card targets: Egyptian هـ-future inside Najdi (هخبرك/هتكون), Hijazi/Gulf
+# The top defects each card targets: Egyptian هـ-future inside Najdi (هخبرك/هتكون), Gulf
 # إيش/وايد/شنو inside Najdi, Najdi الحين inside Egyptian, MSA جداً/حيث inside Egyptian.
 #
 # Two 2026-07-07 additions (owner decisions):
 #   REGISTER — dialect answers must SOUND like talk. Git archaeology showed the June replies
 #   the owner rated highest were conversational; the failure mode since is lecture-register
-#   answers where dialect survives only as inserted words. Appended to the four dialect cards,
+#   answers where dialect survives only as inserted words. Appended to the dialect cards,
 #   NOT Fusha (whose correct register IS formal). Tone only — no mandated closing questions.
 #   FIELD/STATUS words — the deployment is a water-utility field assistant, so the glossary's
 #   domain rows are justified vocabulary (only words that DIFFER from MSA/other dialects;
 #   خزان/عداد/ضغط/تدفق/محطة/خط are identical everywhere and need no card space).
-# Gulf/Khaleeji was REMOVED entirely (2026-07-07, owner decision): supported set is
-# Najdi/Hijazi/Egyptian/Fusha + English + mixed.
+# Gulf/Khaleeji was REMOVED entirely (2026-07-07, owner decision), and Hijazi was REMOVED
+# entirely (2026-07-09, owner decision): supported set is Najdi/Egyptian/Fusha + English + mixed.
 _SPOKEN_REGISTER = (
     " REGISTER: this is a VOICE conversation — answer the way a knowledgeable local TALKS: "
     "address the listener directly, keep a spoken sentence rhythm, and let the dialect's own "
@@ -629,20 +632,6 @@ _DIALECT_CARDS: dict[str, str] = {
         "Demonstratives: هذا/هذي/كذا — never ده/دي/كده. "
         "FIELD/STATUS words: working=شغال، broken=خربان، high=عالي، low=واطي، full=ممتلي، "
         "empty=فاضي، dirty=وسخ، really=صج، okay/then=عاد."
-        + _SPOKEN_REGISTER
-    ),
-    "Hijazi": (
-        "HIJAZI usage guide — write natural, fluent Hijazi as a native speaker would, on any topic. "
-        "These are your FUNCTION words, not a checklist; never force them in: "
-        "what=إيش، why=ليش، where=وين (never فين)، now=دحين (NEVER دلوقتي)، want=أبي (never عايز)، "
-        "good=تمام، very=مرة (NEVER جداً/أوي)، I don't know=ما أعرف، yes=أيوه، thanks=مشكور، "
-        "there is=فيه، there isn't=ما فيه (never مفيش). "
-        "FUTURE: بـ or راح — NEVER the Egyptian هـ prefix (هخبرك، هيكون are WRONG); راح/بـ mark "
-        "the FUTURE ONLY — past events take the plain past, never راح. "
-        "NEGATION: ما + verb — never مش with verbs, never ـش suffixes (معرفش). "
-        "Demonstratives: هذا/هذي/كذا — never ده/دي/كده. "
-        "FIELD/STATUS words: working=شغال، broken=عاطل، high=عالي، low=واطي، full=ممتلي، "
-        "empty=فاضي، dirty=وسخ، really=جد."
         + _SPOKEN_REGISTER
     ),
     "Egyptian": (
@@ -687,8 +676,8 @@ def _route_turn(text: str, lang: str) -> dict[str, Any]:
     suppress the explicit-language override; negated requests are skipped. Module-level (not
     inline in respond_loop) so eval/test_routing.py can regression-test the decisions directly.
     """
-    # A named dialect (Najdi/Hijazi/Fusha) counts as an Arabic request on its own —
-    # even when "Arabic" isn't said, e.g. "in Najdi Arabic" or "in Hijazi language".
+    # A named dialect (Najdi/Fusha) counts as an Arabic request on its own —
+    # even when "Arabic" isn't said, e.g. "in Najdi Arabic" or "in Saudi language".
     translation_q = bool(_TRANSLATION_Q_RE.search(text))
     req_dialect   = None if translation_q else _requested_dialect(text)
     m_ar          = _WANTS_ARABIC_RE.search(text)
@@ -717,7 +706,7 @@ def _route_turn(text: str, lang: str) -> dict[str, Any]:
             "The user asked for a reply in a dialect name that is not recognized — most likely "
             "the speech recognizer garbled the dialect's name. Reply in Modern Standard Arabic "
             "(Fusha). START with ONE short sentence saying, in Fusha, that you speak Najdi, "
-            "Hijazi, Egyptian and Fusha and asking them to repeat the dialect name if they "
+            "Egyptian and Fusha and asking them to repeat the dialect name if they "
             "wanted one of those — then answer their actual question fully in Fusha. "
             "Do NOT reason about this out loud and never mention rules or instructions. "
             + _DIALECT_CARDS["Fusha"]
@@ -728,7 +717,6 @@ def _route_turn(text: str, lang: str) -> dict[str, Any]:
         tts_voice = "egyptian" if ("Egyptian" in dialect or "مصري" in dialect) else "saudi"
         if   "Egyptian" in dialect or "مصري" in dialect: tts_language, req_name = "egyptian arabic", "Egyptian"
         elif "Najdi" in dialect:                          tts_language, req_name = "najdi arabic", "Najdi"
-        elif "Hijazi" in dialect:                         tts_language, req_name = "hijazi arabic", "Hijazi"
         else:                                             tts_language, req_name = "standard arabic", "Fusha"
         print(f"  [lang] explicit Arabic request → {dialect}")
         # Generic "in Arabic (dialect)" with no dialect named → Fusha WITHOUT narrating the
@@ -774,9 +762,9 @@ def _route_turn(text: str, lang: str) -> dict[str, Any]:
         route = "spoken_arabic"
         det = _detect_dialect(text)
         tts_voice = "egyptian" if det == "Egyptian" else "saudi"
-        tts_language = {"Najdi": "najdi arabic", "Hijazi": "hijazi arabic",
+        tts_language = {"Najdi": "najdi arabic",
                         "Egyptian": "egyptian arabic"}.get(det, "standard arabic")
-        if det in ("Najdi", "Hijazi", "Egyptian"):
+        if det in ("Najdi", "Egyptian"):
             print(f"  [lang] detected {det}")
             lang_instruction = (
                 f"The user spoke the {det.upper()} dialect. Reply ONLY in natural spoken {det} — "
@@ -805,8 +793,7 @@ def _route_turn(text: str, lang: str) -> dict[str, Any]:
     }
 
 
-_ABSTENTION_PHRASES = {"Najdi": "«ما أدري بالضبط»", "Hijazi": "«ما أعرف بالضبط»",
-                       "Egyptian": "«مش متأكد بصراحة»"}
+_ABSTENTION_PHRASES = {"Najdi": "«ما أدري بالضبط»", "Egyptian": "«مش متأكد بصراحة»"}
 
 def _abstention_phrase(route: dict[str, Any]) -> str:
     """The uncertainty phrase for THIS turn's routed dialect only. The wrapper used to show
@@ -924,10 +911,9 @@ def _fixup(word_pattern: str, target: str, label: str,
 
 _DIALECT_FIXUPS: dict[str, list[tuple["re.Pattern[str]", str, str]]] = {
     "najdi arabic":    [_fixup(r"جد(?:ًا|اً|ا)", "مرة",    "جداً→مرة"),
+                        _fixup(r"أوي",           "مرة",    "أوي→مرة"),
                         _fixup(r"دلوقتي",        "الحين",   "دلوقتي→الحين"),
                         _fixup(r"كتير",          "كثير",    "كتير→كثير")],
-    "hijazi arabic":   [_fixup(r"جد(?:ًا|اً|ا)", "مرة",    "جداً→مرة"),
-                        _fixup(r"دلوقتي",        "دحين",    "دلوقتي→دحين")],
     "egyptian arabic": [_fixup(r"جد(?:ًا|اً|ا)", "أوي",    "جداً→أوي"),
                         _fixup(r"الحين",         "دلوقتي",  "الحين→دلوقتي"),
                         _fixup(r"كثير",          "كتير",    "كثير→كتير")],
@@ -936,16 +922,15 @@ _DIALECT_FIXUPS: dict[str, list[tuple["re.Pattern[str]", str, str]]] = {
 # Saudi-dialect demonstrative/negation swaps (added 2026-07-08 after «الدنيا دي مجرد محطة»
 # and «غير هيك» reached a LIVE Najdi reply despite the card). Previously excluded as
 # "needs restructuring" — too conservative: unlike كمان (placement varies), these occupy the
-# IDENTICAL syntax slot in both dialects. Egyptian postposed ده/دي maps 1:1 onto Najdi/Hijazi
+# IDENTICAL syntax slot in both dialects. Egyptian postposed ده/دي maps 1:1 onto Najdi's own
 # postposed هذا/هذي; مش→مو, كده→كذا, and Levantine هيك→كذا are direct substitutions.
 _SAUDI_DEMONSTRATIVES = [
     (r"ده", "هذا", "ده→هذا"), (r"دا", "هذا", "دا→هذا"), (r"دي", "هذي", "دي→هذي"),
     (r"كده", "كذا", "كده→كذا"), (r"كدا", "كذا", "كدا→كذا"),
     (r"مش", "مو", "مش→مو"), (r"هيك", "كذا", "هيك→كذا"),
 ]
-for _d in ("najdi arabic", "hijazi arabic"):
-    _DIALECT_FIXUPS[_d] += [_fixup(w, t, l, pre=_AR_FIX_PRE_NB)
-                            for w, t, l in _SAUDI_DEMONSTRATIVES]
+_DIALECT_FIXUPS["najdi arabic"] += [_fixup(w, t, l, pre=_AR_FIX_PRE_NB)
+                                    for w, t, l in _SAUDI_DEMONSTRATIVES]
 # Levantine هيك is wrong in EVERY target dialect; Egyptian says كده:
 _DIALECT_FIXUPS["egyptian arabic"].append(_fixup(r"هيك", "كده", "هيك→كده", pre=_AR_FIX_PRE_NB))
 
@@ -1245,16 +1230,25 @@ async def ollama_chat_token_gen(
     status: Optional[dict[str, Any]] = None,  # filled with {"done_reason": ...} on completion
                                                # ("length" = num_predict cap hit mid-generation)
                                                # + "thinking_chars" under LLM_THINK
+    no_think: bool = False,   # force thinking off + the non-think num_predict for this call
+                               # only, regardless of the LLM_THINK flag — used by the
+                               # no-think retry when an LLM_THINK attempt comes back empty.
 ):
     """Stream a chat completion from Ollama's /api/chat (carries conversation history)."""
     cfg = _get_model_config(model)
+    options, extra = cfg["options"], cfg["extra"]
+    if no_think:
+        # Copy, don't mutate — cfg holds the shared module-level MODEL_CONFIGS dicts;
+        # writing into them in place would poison every later turn, retry or not.
+        options = {**options, "num_predict": 400}
+        extra   = {**extra, "think": False}
     payload: dict[str, Any] = {
         "model":      model,
         "messages":   messages,
         "stream":     True,
         "keep_alive": -1,   # pin the model in VRAM — a 27B reload after idle costs many seconds
-        "options":    cfg["options"],
-        **cfg["extra"],
+        "options":    options,
+        **extra,
     }
     first = True
     async with httpx.AsyncClient(timeout=120) as client:
@@ -1684,6 +1678,8 @@ async def websocket_endpoint(ws: WebSocket):
                 t_first_audio:   Optional[float] = None
                 response_tokens: list[str]       = []
                 llm_status:      dict[str, Any]  = {}   # done_reason lands here on stream end
+                think_retry       = False               # set by the no-think retry below
+                first_done_reason: Optional[str] = None # attempt 1's done_reason, if retried
 
                 # Per-turn output guard (2026-07-07): every flushed sentence-chunk passes
                 # through this before display/TTS. delivered_parts collects what actually
@@ -1712,12 +1708,13 @@ async def websocket_endpoint(ws: WebSocket):
                     t_first_audio = _time.monotonic()
                     ai_speaking   = True
 
-                async def _collecting_token_gen():
+                async def _collecting_token_gen(no_think: bool = False):
                     inner = _filter_cjk(
                         ollama_chat_token_gen(
                             messages, active_model,
                             on_first_token=_on_first_token_cb,
                             status=llm_status,
+                            no_think=no_think,
                         )
                     )
                     try:
@@ -1758,6 +1755,51 @@ async def websocket_endpoint(ws: WebSocket):
                         final_response = raw_response
                     if entire_reply_filtered:
                         print("  [warn] entire response was meta-leak filtered — kept out of history")
+
+                    # No-think retry: under LLM_THINK the model can spend the WHOLE num_predict
+                    # budget reasoning and never reach the answer (measured live 2026-07-09:
+                    # done_reason=length, thinking_chars~6200, content=0 — see LLM_NUM_PREDICT's
+                    # comment). Retrying once with thinking off is fast (~3-5s, the normal
+                    # non-think path already proven to work) and avoids apologizing to a
+                    # question the model was demonstrably still reasoning about. Same
+                    # newer-utterance guard as the fallback below: answering the queued
+                    # utterance beats retrying this one.
+                    if (LLM_THINK and not final_response and not cancel_event.is_set()
+                            and utterance_queue.empty()):
+                        think_retry       = True
+                        first_done_reason = llm_status.get("done_reason")
+                        first_thinking    = llm_status.get("thinking_chars", 0)
+                        print(f"  [warn] empty reply under thinking (done_reason={first_done_reason}, "
+                              f"thinking_chars={first_thinking}) — retrying once with thinking off")
+                        # Reuse this turn's state so the retry flows through the SAME delivery,
+                        # history and logging code below. llm_status is cleared in place — the
+                        # is_truncated closure above reads this exact dict.
+                        llm_status.clear()
+                        response_tokens.clear()
+                        delivered_parts.clear()
+                        meta_leak_filtered = False
+                        await tts_omnivoice_v1.stream_tts_to_ws(  # type: ignore[no-untyped-call]
+                            token_gen=_collecting_token_gen(no_think=True),
+                            ws=ws,
+                            cancel_event=cancel_event,
+                            on_first_audio=_on_first_audio_timed,
+                            voice=tts_voice,
+                            language=tts_language,
+                            is_truncated=lambda: llm_status.get("done_reason") == "length",
+                            chunk_filter=_chunk_filter,
+                        )
+                        t_done         = _time.monotonic()
+                        raw_response   = "".join(response_tokens).strip()
+                        final_response = " ".join(p for p in delivered_parts if p).strip()
+                        entire_reply_filtered = (bool(raw_response) and not final_response
+                                                 and meta_leak_filtered
+                                                 and not cancel_event.is_set())
+                        if not final_response:
+                            final_response = raw_response
+                        # Preserve attempt 1's reasoning spend for the log — the retry itself
+                        # runs with thinking off, so its own thinking_chars would read 0.
+                        llm_status["thinking_chars"] = first_thinking
+
                     if not final_response and not cancel_event.is_set():
                         # LLM produced no visible text (e.g. thinking-only response) —
                         # send a fallback so the user knows the model heard them.
@@ -1838,6 +1880,11 @@ async def websocket_endpoint(ws: WebSocket):
                             # >0 only under LLM_THINK=1: how much of the budget went to
                             # silent reasoning before the first spoken token.
                             "thinking_chars":     llm_status.get("thinking_chars", 0),
+                            # think_retry=True → attempt 1 came back with no content and was
+                            # silently redone with thinking off; first_done_reason is attempt
+                            # 1's done_reason (None unless think_retry is true).
+                            "think_retry":        think_retry,
+                            "first_done_reason":  first_done_reason,
                         },
                         # True = barge-in cut this turn; the response is PARTIAL — exclude
                         # from quality evaluation.

@@ -45,28 +45,28 @@ per-voice clone prompts, so reference clips are never re-encoded per sentence).
 
 ## Dialects
 
-Recognized + replied-in: **Najdi, Hijazi, Egyptian, Fusha (MSA)**. **Fusha (MSA) is the default** when the
+Recognized + replied-in: **Najdi, Egyptian, Fusha (MSA)**. **Fusha (MSA) is the default** when the
 spoken dialect is unclear, or an Arabic reply is requested without naming a dialect. English input → English.
 (Fusha is routed through the Saudi voice clip with `language="standard arabic"`; there is no separate spoken-Fusha
-classifier — any Arabic that doesn't match a Najdi/Hijazi/Egyptian marker falls through to Fusha.)
+classifier — any Arabic that doesn't match a Najdi/Egyptian marker falls through to Fusha.)
 
 Each turn the server decides three things from the user's words:
 - **reply dialect** — a committed instruction to the LLM (`_detect_dialect` for spoken dialect,
   `_requested_dialect` for explicit requests).
-- **voice clip** — Egyptian-routed turns use the Egyptian clip; Najdi/Hijazi/Fusha/English use the Saudi clip
+- **voice clip** — Egyptian-routed turns use the Egyptian clip; Najdi/Fusha/English use the Saudi clip
   (`_VOICES` registry + `_resolve_voice` in tts_omnivoice_v1.py).
 - **`language=` ID** — passed to `OmniVoice.generate()` to pin pronunciation
-  (`egyptian arabic` / `najdi arabic` / `hijazi arabic` / `standard arabic`); this fixed the
+  (`egyptian arabic` / `najdi arabic` / `standard arabic`); this fixed the
   Saudi/Egyptian pronunciation mixing where some words came out in the wrong dialect.
 
 STT is also biased toward dialect spelling via Whisper `hotwords` on the forced-Arabic re-pass.
 
 **Dialect-detection details (revised 2026-07-06):**
-- Spoken detection (`_detect_dialect`) is marker-based; distinctive Najdi/Hijazi/Egyptian words only.
+- Spoken detection (`_detect_dialect`) is marker-based; distinctive Najdi/Egyptian words only.
   Shared/pan-dialect words are excluded so they don't false-trigger: `عشان`/`وين`/`ليش` (original set)
   **plus `أيوه` (canonical Egyptian "yes" — was wrongly a Hijazi marker), `تمام`, `هلا`**. Egyptian
   markers include the interrogatives `إيه`/`كام`/`فين`; **`مش`/`ده`/`دي` are WEAK markers (0.5 weight,
-  also heard in urban Hijazi)** — they support a strong marker but can never switch the voice alone
+  also heard in other urban Arabic speech)** — they support a strong marker but can never switch the voice alone
   (winning requires score ≥ 1.0). No marker / weak-only / tie → Fusha default.
 - Explicit dialect requests (`_requested_dialect`) require request context on BOTH sides now: Arabic needs
   the `بال…` / `لهجة …` prefix, and **English names need a dialect noun ("Egyptian dialect/arabic/accent")
@@ -79,7 +79,7 @@ STT is also biased toward dialect spelling via Whisper `hotwords` on the forced-
 **Dialect quality (revised 2026-07-06 after the live-conversation eval):**
 - The per-turn instruction embeds a **dialect card** (`_DIALECT_CARDS` in server.py) built from the
   owner's cross-dialect glossary: ~15 function-word mappings ("use X, NEVER Y") + morphology rules
-  (Najdi/Hijazi future = بـ/راح NEVER the Egyptian هـ prefix; Egyptian very = أوي never جداً, now =
+  (Najdi future = بـ/راح NEVER the Egyptian هـ prefix; Egyptian very = أوي never جداً, now =
   دلوقتي never الحين; ده/دي AFTER the noun; Fusha gender/number agreement). Cards are function words
   + morphology ONLY — no topic phrases — and explicitly say "not a checklist, write naturally", because
   the eval showed bare word lists cause keyword-stuffing (وش dropped into Egyptian grammar). Cards are
@@ -94,7 +94,7 @@ STT is also biased toward dialect spelling via Whisper `hotwords` on the forced-
   and `_DIALECT_FIXUPS` swaps single wrong-dialect words whose replacement fills the IDENTICAL syntax
   slot (جداً→مرة/أوي، دلوقتي↔الحين/دحين، كتير↔كثير; since 2026-07-08 also the Saudi-dialect
   demonstrative/negation swaps ده/دا→هذا، دي→هذي، كده/كدا→كذا، مش→مو، هيك→كذا — postposed
-  Egyptian demonstratives map 1:1 onto Najdi/Hijazi ones, so the old "needs restructuring"
+  Egyptian demonstratives map 1:1 onto Najdi's own ones, so the old "needs restructuring"
   exclusion was too conservative; هيك→كده also fires in Egyptian). كمان stays un-fixed
   (placement varies). Fixups are skipped on translation questions and Fusha.
   Text display is therefore **per sentence-chunk, not per token** — box and voice always carry
@@ -127,14 +127,22 @@ STT is also biased toward dialect spelling via Whisper `hotwords` on the forced-
   is lecture-register answers. The dialect cards (not Fusha) now end with `_SPOKEN_REGISTER` ("answer
   the way a knowledgeable local TALKS… never the tone of a written article") — tone only, no mandated
   closing questions. And since the real deployment is a **water-utility field assistant**, each card
-  carries the glossary's FIELD/STATUS words that differ per dialect (broken=خربان/عاطل/بايظ،
+  carries the glossary's FIELD/STATUS words that differ per dialect (broken=خربان/بايظ،
   full=ممتلي/مليان، Egyptian قراية/رشح/قطع); identical technical nouns (خزان/عداد/ضغط/تدفق) need no
   card space. Najdi stays STRICT glossary (وش-only — no شلون/شنو loosening; owner decision).
-- **Gulf/Khaleeji REMOVED entirely (2026-07-07, owner decision).** Supported set: Najdi, Hijazi,
-  Egyptian, Fusha, English, mixed AR+EN. No Gulf card, request pattern, fixups, or linter target
-  remain. "in Gulf/Khaleeji dialect" now routes through the unknown_dialect branch (Fusha + the
-  supported-dialects note); Arabic «بالخليجي» falls to the Fusha default. Gulf-adjacent TOKENS
-  (وايد/شنو/يبيلك…) stay in the linter as forbidden-inside-Egyptian/Fusha words.
+- **Gulf/Khaleeji REMOVED entirely (2026-07-07, owner decision).** No Gulf card, request pattern,
+  fixups, or linter target remain. "in Gulf/Khaleeji dialect" now routes through the unknown_dialect
+  branch (Fusha + the supported-dialects note); Arabic «بالخليجي» falls to the Fusha default.
+  Gulf-adjacent TOKENS (وايد/شنو/يبيلك…) stay in the linter as forbidden-inside-Egyptian/Fusha words.
+- **Hijazi REMOVED entirely (2026-07-09, owner decision).** Supported set is now: Najdi, Egyptian,
+  Fusha, English, mixed AR+EN. No Hijazi card, marker set, fixup table, or per-dialect linter target
+  remain — Hijazi never had its own TTS voice clip (it always shared the Saudi clip with Najdi/Fusha,
+  distinguished only by the `language="hijazi arabic"` pronunciation ID, which is also gone). "in
+  Hijazi dialect" now routes through the unknown_dialect branch (Fusha + the supported-dialects
+  note), same as Gulf; Arabic «بالحجازي» falls to the Fusha default. Hijazi-only TOKENS (إيش/دحين)
+  stay in the linter as forbidden-inside-Najdi/Egyptian/Fusha words. A former Najdi/Hijazi 1-1 tie
+  in `_detect_dialect` now resolves cleanly to Najdi (one fewer competitor in the scoring race) —
+  intended, not a bug; pinned in `eval/test_routing.py`.
 - **`eval/dialect_ab.py`** — like-for-like A/B harness: a FIXED ~15-question set (conversational +
   field + informational) through the exact production prompt surface per dialect, reporting linter
   results + would-be fixups, full replies archived in `eval/ab_runs/` (gitignored). **Run a
@@ -225,7 +233,7 @@ first_voice_test/
 │   ├── stt_eval.py        ← per-dialect WER through the production STT path
 │   └── README.md          ← how to build the ground-truth set (SAVE_UTTERANCES=1, SADA, MGB-3, ArzEn)
 └── voices/
-    ├── silma-tts-saudi-24k.wav            ← Saudi male — default voice (Najdi/Hijazi/Fusha/English)
+    ├── silma-tts-saudi-24k.wav            ← Saudi male — default voice (Najdi/Fusha/English)
     └── omnivoice-tts-egyptian-24k-v3.wav  ← Egyptian voice (ACTIVE; v1/v2 deleted, in git history)
 ```
 
