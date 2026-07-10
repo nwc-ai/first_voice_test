@@ -104,8 +104,8 @@ def _diag(msg: str) -> None:
 _active_ws_task: Optional[asyncio.Task] = None
 _active_ws_ref:  Optional[Any]          = None   # raw WebSocket for the close-4001 signal
 
-MODEL       = "qwen3.5:27b"   # default model — warmed at startup so the first turn isn't a cold load.
-                              # ALLaM stays selectable in the browser dropdown for sub-2s responses.
+MODEL       = "qwen3.5:27b"   # the one and only LLM — warmed at startup so the first turn isn't a
+                              # cold load, and pinned in VRAM (a second model alongside it would OOM).
 SYSTEM_PROMPT = (
     "You are a voice assistant that supports Arabic dialects and English ONLY. "
     "ABSOLUTE RULES — never break these: "
@@ -115,7 +115,6 @@ SYSTEM_PROMPT = (
     "1. Otherwise, if the user speaks English → reply in English only. "
     "2. If the user speaks Arabic → detect their exact dialect and reply in that SAME dialect: "
     "   Najdi (نجدي): use وش/إيش, أبغى, زين, الحين, ماله, يبيلك — "
-    "   Hijazi (حجازي): use إيش, وين, كيف, بدي, تعال, ما عندي — "
     "   Gulf/Khaleeji (خليجي): use شلونك, وايد, يبه, زين, ما أدري. "
     "3. If the user mixes Arabic and English (code-switching) → reply in the same natural mix, matching their Arabic dialect. "
     "4. If Arabic dialect is unclear → use Modern Standard Arabic. "
@@ -244,18 +243,6 @@ async def index():
         os.path.join(STATIC_DIR, "index.html"),
         headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
     )
-
-
-@app.get("/models")
-async def list_models() -> dict[str, Any]:
-    try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            resp = await client.get("http://localhost:11434/api/tags")
-            resp.raise_for_status()
-            models: list[str] = [m["name"] for m in resp.json().get("models", [])]
-            return {"models": models, "default": MODEL}
-    except Exception:
-        return {"models": [MODEL], "default": MODEL}
 
 
 @app.get("/logs")
@@ -538,8 +525,6 @@ _WANTS_ENGLISH_RE = re.compile(
 _DIALECT_PATTERNS: list[tuple[str, Any, str]] = [
     ("Najdi", re.compile(r"\bnajdi\b|نجدي|النجدية", re.IGNORECASE | re.UNICODE),
      "the Najdi dialect (use وش/إيش, أبغى, زين, الحين, ماله, يبيلك)"),
-    ("Hijazi", re.compile(r"\bhi?jazi\b|\bhejazi\b|حجازي|الحجازية", re.IGNORECASE | re.UNICODE),
-     "the Hijazi dialect (use إيش, وين, كيف, بدي, تعال, ما عندي)"),
     ("Gulf", re.compile(r"\bgulf\b|\bkhal[ei]+ji\b|\bkhaleeji\b|خليجي|الخليجية", re.IGNORECASE | re.UNICODE),
      "the Gulf/Khaleeji dialect (use شلونك, وايد, يبه, زين, ما أدري)"),
     ("Fusha", re.compile(r"\bfus-?ha\b|\bmsa\b|modern\s+standard|classical\s+arabic|الفصحى|فصحى",
@@ -547,12 +532,23 @@ _DIALECT_PATTERNS: list[tuple[str, Any, str]] = [
      "Modern Standard Arabic (Fusha)"),
 ]
 
-def _requested_dialect(text: str) -> Optional[str]:
-    """Return a phrase describing the requested Arabic dialect, or None for default (Fusha)."""
-    for _name, pattern, phrase in _DIALECT_PATTERNS:
+def _requested_dialect(text: str) -> tuple[Optional[str], Optional[str]]:
+    """Return (dialect_name, descriptive_phrase) for an explicitly named Arabic dialect, or
+    (None, None) for default (Fusha)."""
+    for name, pattern, phrase in _DIALECT_PATTERNS:
         if pattern.search(text):
-            return phrase
-    return None
+            return name, phrase
+    return None, None
+
+# Lexical Najdi detector for spoken Arabic with no explicitly named dialect — used only to
+# decide whether this turn's TTS gets CATT tashkeel (Fusha-only); it does not affect what
+# dialect the LLM is told to reply in.
+_NAJDI_MARKERS = {"وش", "أبغى", "ابغى", "الحين", "زين", "ماله", "يبيلك", "صج", "عاد", "هيه", "أدري", "ادري"}
+_AR_WORD_SPLIT_RE = re.compile(r"[^؀-ۿ]+")  # split on any run of non-Arabic-letter chars
+
+def _looks_najdi(text: str) -> bool:
+    words = {w for w in _AR_WORD_SPLIT_RE.split(text) if w}
+    return bool(words & _NAJDI_MARKERS)
 
 # Whisper mistakes Arabic for these languages — remap them all to ar.
 # Includes Arabic-script langs (ur/fa/ps/ug/sd) AND Punjabi (pa) which Whisper
@@ -592,12 +588,14 @@ async def _filter_cjk(token_gen: Any):
 # Detects ASR stuck-loops: "ا ا ا ا" or "هل هل هل هل"
 _REPETITION_RE = re.compile(r"(.)\1{4,}|(\b\S+\b)(\s+\2){3,}", re.UNICODE)
 
-# Prompt injection patterns (Arabic + English + Urdu)
+# Prompt injection patterns (Arabic + English + Urdu).
+# "you are now" requires a role-assignment continuation (a/an/the/my) — the bare
+# phrase false-positives on innocent speech like "you are now able to see it".
 _INJECTION_RE = re.compile(
     r"ignore\s+(previous|prior|all)\s+instructions?"
     r"|تجاهل\s+(التعليمات|الأوامر|السابق)"
     r"|forget\s+(your\s+)?(previous|prior|all)"
-    r"|you\s+are\s+now\s+"
+    r"|you\s+are\s+now\s+(a|an|the|my)\b"
     r"|نسيان\s+التعليمات"
     r"|<\s*(system|instructions?)\s*>"
     r"|system\s*:",
@@ -695,11 +693,11 @@ def _transcribe_blocking(audio: Any) -> tuple[str, str]:
 
 # ── Per-model configuration ───────────────────────────────────────────────────
 # Keys are substrings matched against the model name (case-insensitive).
-# First match wins. "default" is the fallback.
+# First match wins. "default" is the fallback (kept so a future model swap
+# degrades gracefully instead of crashing).
 # "extra" fields are merged directly into the Ollama payload (e.g. think:False).
 
-_STOP_SEQUENCES       = ["User:", "user:", "\nUser", "\nالمستخدم:", "Human:", "\nHuman"]
-_ALLAM_STOP_SEQUENCES = _STOP_SEQUENCES + ["<|im_end|>", "<|im_start|>", "<|endoftext|>"]
+_STOP_SEQUENCES = ["User:", "user:", "\nUser", "\nالمستخدم:", "Human:", "\nHuman"]
 
 MODEL_CONFIGS: dict[str, dict[str, Any]] = {
     "qwen3.5": {
@@ -715,64 +713,15 @@ MODEL_CONFIGS: dict[str, dict[str, Any]] = {
             "top_p":            0.8,
             "top_k":            20,
             "presence_penalty": 1.5,
-            "num_predict":      300,   # 300 was truncating mid-sentence on longer answers (~170 Arabic words)
+            "num_predict":      300,   # hard cap on reply length. Known tradeoff: very long answers
+                                       # (~170+ Arabic words) can cut off mid-sentence — accepted for
+                                       # now to keep voice replies bounded.
             # Context window (default 8192 via LLM_NUM_CTX). The default-32768 KV cache
             # OOM'd with OmniVoice in-process on one 32 GB GPU; 8192 fits the prompt
             # (system + 3-turn memory + reply ≈ 2.5k tokens) with room to spare. Raise via
             # the LLM_NUM_CTX env var as prompts grow (q8_0 KV cache makes it affordable).
             "num_ctx":          LLM_NUM_CTX,
             "stop":             _STOP_SEQUENCES,
-        },
-    },
-    "qwen3": {
-        "extra":   {"think": False},
-        "options": {
-            "temperature":      0.7,
-            "top_p":            0.8,
-            "top_k":            20,
-            "presence_penalty": 1.5,
-            "num_predict":      300,
-            "stop":             _STOP_SEQUENCES,
-        },
-    },
-    "qwen2.5": {
-        "extra":   {},
-        "options": {
-            "temperature": 0.7,
-            "top_p":       0.9,
-            "top_k":       40,
-            "num_predict": 300,
-            "stop":        _STOP_SEQUENCES,
-        },
-    },
-    "allam": {
-        "extra":   {},
-        "options": {
-            "temperature": 0.4,   # 0.6 → 0.4: ALLaM placed Dubai's Al Fahidi in Riyadh; lower temp grounds it
-            "top_p":       0.95,
-            "top_k":       50,
-            "num_predict": 300,
-            "stop":        _ALLAM_STOP_SEQUENCES,
-        },
-    },
-    "silma": {
-        "extra":   {},
-        "options": {
-            "temperature": 0.9,
-            "top_p":       0.95,
-            "top_k":       40,
-            "num_predict": 300,
-            "stop":        _STOP_SEQUENCES,
-        },
-    },
-    "falcon": {
-        "extra":   {},
-        "options": {
-            "temperature": 0.7,
-            "top_p":       0.9,
-            "top_k":       40,
-            "num_predict": 300,
-            "stop":        _STOP_SEQUENCES,
         },
     },
     "default": {
@@ -871,7 +820,7 @@ class _LockedWS:
 
 
 @app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket, model: str = MODEL):
+async def websocket_endpoint(ws: WebSocket):
     global _active_ws_task, _active_ws_ref
     await ws.accept()
     # Single-connection policy: supersede the previous session (if any).
@@ -893,8 +842,6 @@ async def websocket_endpoint(ws: WebSocket, model: str = MODEL):
                 old_task.cancel()
         asyncio.create_task(_close_old())
     ws = _LockedWS(ws)  # all subsequent sends are serialized
-    # LLM is LOCKED to qwen3.5:27b — ignore any browser-supplied model. (Prevents a
-    # second LLM, e.g. ALLaM, loading alongside the pinned 27B and OOMing the GPU.)
     active_model = MODEL
     print(f"Browser connected. Model: {active_model}  TTS: omnivoice")
 
@@ -984,20 +931,6 @@ async def websocket_endpoint(ws: WebSocket, model: str = MODEL):
                         client_playing = True
                     elif evt == "playback_done":
                         client_playing = False
-                    elif evt == "barge_in":
-                        # The browser detected the user talking over the AI (fast local
-                        # detection that works on speakers) and already stopped playback.
-                        # Cancel any in-progress turn; the user's utterance is captured by
-                        # the normal VAD/STT path next (now echo-free, so it's clean).
-                        try:
-                            _bp = json.loads(text_payload)
-                        except Exception:
-                            _bp = {}
-                        _diag(f"[CLIENT-BARGE] barge_in received {_bp} "
-                              f"(ai_active={ai_active}, ai_speaking={ai_speaking}, client_playing={client_playing})")
-                        if ai_active or ai_speaking:
-                            cancel_event.set()
-                        client_playing = False
                     continue
                 data = msg.get("bytes")
                 if not data:
@@ -1043,6 +976,11 @@ async def websocket_endpoint(ws: WebSocket, model: str = MODEL):
                     if len(text) < MIN_TEXT_CHARS or len(text) > MAX_TEXT_CHARS:
                         print(f"STT [{lang}] length-rejected ({len(text)} chars): {text!r}")
                         continue
+                    if lang == "en" and len(text.split()) < 2:
+                        # Single-word English fragments ("Okay.", "So.") burn a full
+                        # LLM+TTS turn on nothing — drop them.
+                        print(f"STT [en] fragment-rejected: {text!r}")
+                        continue
                     if _REPETITION_RE.search(text):
                         print(f"STT [{lang}] repetition-rejected: {text!r}")
                         continue
@@ -1071,23 +1009,51 @@ async def websocket_endpoint(ws: WebSocket, model: str = MODEL):
                 ai_speaking = False
 
                 if _INJECTION_RE.search(text):
+                    # Speak a short refusal instead of going silent — a mute assistant
+                    # after a transcript reads as "broken", not "blocked".
                     print(f"Injection attempt blocked: {text!r}")
                     await ws.send_json({"event": "transcript", "text": text, "lang": lang})
-                    await ws.send_json({"event": "tts_end"})
+                    refusal = ("عذراً، ما أقدر أنفذ هذا الطلب." if lang == "ar"
+                               else "Sorry, I can't act on that request.")
+                    try:
+                        await tts_omnivoice_v1.stream_tts_to_ws(  # type: ignore[no-untyped-call]
+                            token_gen=_single_token(refusal),
+                            ws=ws,
+                            cancel_event=cancel_event,
+                            on_first_audio=None,
+                            language=None,
+                        )
+                    except Exception as e:
+                        print(f"  [warn] refusal TTS failed: {e}")
+                        await ws.send_json({"event": "tts_end"})
                     ai_active = False
                     continue
 
                 await ws.send_json({"event": "transcript", "text": text, "lang": lang})
                 print(f"LLM start: {text!r}")
 
-                # A named dialect (Najdi/Hijazi/Gulf/Fusha) counts as an Arabic
+                # A named dialect (Najdi/Gulf/Fusha) counts as an Arabic
                 # request on its own — even when "Arabic" isn't said, e.g.
-                # "in Najdi Arabic" or "in Hijazi language".
-                req_dialect  = _requested_dialect(text)
-                wants_arabic = req_dialect is not None or bool(_WANTS_ARABIC_RE.search(text))
+                # "in Najdi Arabic" or "in Gulf Arabic".
+                req_name, req_phrase = _requested_dialect(text)
+                wants_arabic = req_name is not None or bool(_WANTS_ARABIC_RE.search(text))
+
+                # Decide this turn's TTS language (used only to gate CATT tashkeel to Fusha —
+                # see tts_omnivoice_v1.py). Kept independent of the LLM instruction text above.
+                if req_name == "Najdi":
+                    tts_language = "najdi arabic"
+                elif req_name == "Gulf":
+                    tts_language = None
+                elif wants_arabic:
+                    tts_language = "standard arabic"   # Fusha, explicitly named or default
+                elif lang == "ar":
+                    tts_language = "najdi arabic" if _looks_najdi(text) else "standard arabic"
+                else:
+                    tts_language = None   # English or mixed AR+EN
+                print(f"  [tts-lang] {tts_language}")
 
                 if wants_arabic:
-                    dialect = req_dialect or "Modern Standard Arabic (Fusha)"
+                    dialect = req_phrase or "Modern Standard Arabic (Fusha)"
                     print(f"  [lang] explicit Arabic request → {dialect}")
                     lang_instruction = (
                         "The user EXPLICITLY asked you to reply in Arabic — honor this "
@@ -1104,15 +1070,14 @@ async def websocket_endpoint(ws: WebSocket, model: str = MODEL):
                     lang_instruction = (
                         "The user is mixing Arabic and English (code-switching). "
                         "Reply naturally in the SAME mix of Arabic and English they used. "
-                        "For the Arabic parts, match their dialect (Najdi, Hijazi, or Gulf/Khaleeji). "
+                        "For the Arabic parts, match their dialect (Najdi or Gulf/Khaleeji). "
                         "Do NOT force a reply into all-Arabic or all-English."
                     )
                 elif lang == "ar":
                     lang_instruction = (
                         "The user spoke Arabic. Detect their exact dialect "
-                        "(Najdi, Hijazi, or Gulf/Khaleeji) "
+                        "(Najdi or Gulf/Khaleeji) "
                         "from their vocabulary and reply in that EXACT same dialect. "
-                        "Najdi vs Hijazi: Najdi uses وش/أبغى/الحين; Hijazi uses وين/بدي/كيف. "
                         "Do NOT use Fusha/MSA unless the dialect is completely unclear."
                     )
                 else:
@@ -1176,6 +1141,7 @@ async def websocket_endpoint(ws: WebSocket, model: str = MODEL):
                         ws=ws,
                         cancel_event=cancel_event,
                         on_first_audio=_on_first_audio_timed,
+                        language=tts_language,
                     )
                     t_done = _time.monotonic()
 
@@ -1194,6 +1160,7 @@ async def websocket_endpoint(ws: WebSocket, model: str = MODEL):
                             ws=ws,
                             cancel_event=cancel_event,
                             on_first_audio=_on_first_audio_timed,
+                            language=tts_language,
                         )
                     elif not cancel_event.is_set():
                         # Commit the completed turn to rolling memory — CLEAN user text

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>المساعد الصوتي — Silma</title>
+  <title>المساعد الصوتي</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -45,41 +45,10 @@
     }
     #hint { font-size: 0.78rem; color: #444; text-align: center; }
     #connect-btn:disabled { opacity: 0.35; cursor: not-allowed; animation: none; }
-
-    /* Model + TTS selectors */
-    .selector-row {
-      display: flex; align-items: center; gap: 10px;
-      width: 100%; max-width: 580px;
-    }
-    .selector-row label {
-      font-size: 0.82rem; color: #aaa; white-space: nowrap;
-      font-weight: 600; direction: ltr; min-width: 46px;
-    }
-    .selector-row select {
-      flex: 1; background: #1e1e2e; border: 1px solid #4a4a8a;
-      color: #e0e0ff; border-radius: 8px; padding: 8px 12px;
-      font-size: 0.88rem; cursor: pointer; outline: none;
-      direction: ltr; text-align: left; appearance: auto;
-    }
-    .selector-row select:hover  { border-color: #7a7aff; }
-    .selector-row select:disabled { opacity: 0.4; cursor: not-allowed; }
-    .reload-btn {
-      background: #1a1a2e; border: 1px solid #3a3a6a; color: #888;
-      border-radius: 6px; padding: 6px 10px; cursor: pointer; font-size: 1rem;
-    }
-    .reload-btn:hover { border-color: #7a7aff; color: #aaf; }
   </style>
 </head>
 <body>
-  <h1>المساعد الصوتي — Silma TTS</h1>
-
-  <div id="model-row" class="selector-row">
-    <label>LLM:</label>
-    <select id="model-select">
-      <option>Loading...</option>
-    </select>
-    <button id="reload-btn" class="reload-btn" title="Reload model list">↻</button>
-  </div>
+  <h1>المساعد الصوتي</h1>
 
   <div id="status">اضغط للاتصال</div>
 
@@ -121,19 +90,11 @@ let playGen       = 0;                   // bumped on clear — invalidates in-f
 let decodeChain   = Promise.resolve();   // serializes decodes so sentences play in order
 let isPlaying     = false;
 
-// Client-side barge-in (works on SPEAKERS): detect the user talking over the AI
-// directly on the mic data and stop playback locally + instantly. Server-side VAD
-// can't do this reliably because the speaker echo + echo-canceller suppress your
-// voice during double-talk. We learn the residual-echo level while the AI plays and
-// fire only when the mic clearly rises above it for ~160 ms. Stopping the AI also
-// removes the echo, so the server then transcribes your words cleanly.
-// Barge-in is handled SERVER-SIDE by the Silero VAD: when the user actually
-// speaks over the AI, the server detects real speech (not breathing/noise) and
-// sends a `speech_start` event, which stops playback (see the onmessage handler).
-// The old client-side RMS energy detector was REMOVED — on a quiet headset mic it
-// had no echo baseline, so its gate collapsed to the tiny BARGE_FLOOR and ordinary
-// breathing/noise (rms ~0.02-0.07) falsely tripped it, cutting the AI off mid-reply.
-// Silero discriminates speech from noise far better than raw loudness ever could.
+// Barge-in is handled SERVER-SIDE by the Silero VAD: when the user speaks over
+// the AI, the server detects real speech (not breathing/noise) and sends a
+// `speech_start` event, which stops playback (see the onmessage handler).
+// There is no client-side energy detector — Silero discriminates speech from
+// noise far better than raw loudness could.
 
 // Watchdog: the server pings every 3s. If NOTHING arrives for 10s the socket
 // is half-dead (UI stays green but mic audio goes nowhere) → auto-reconnect.
@@ -149,24 +110,11 @@ const transcriptEl = document.getElementById('transcript-text');
 const responseEl   = document.getElementById('response-text');
 const connectBtn   = document.getElementById('connect-btn');
 const hintEl       = document.getElementById('hint');
-const modelSelect  = document.getElementById('model-select');
-const reloadBtn    = document.getElementById('reload-btn');
 
 function setStatus(text, cls) {
   statusEl.textContent = text;
   statusEl.className   = cls || '';
 }
-
-// ── LLM is LOCKED to qwen3.5:27b ────────────────────────────────────────────────
-// The server enforces this (ignores any model param); the UI shows it as the only,
-// fixed option so it can't be changed to a second LLM (which would OOM the GPU).
-async function loadModels() {
-  modelSelect.innerHTML = '<option value="qwen3.5:27b">qwen3.5:27b</option>';
-  modelSelect.value = 'qwen3.5:27b';
-}
-
-reloadBtn.style.display = 'none';   // nothing to reload — model is fixed
-loadModels();
 
 // ── AudioWorklet inline ──────────────────────────────────────────────────────
 const WORKLET_CODE = `
@@ -229,10 +177,8 @@ async function connect() {
   workletNode  = new AudioWorkletNode(audioCtx, 'mic-sender');
   source.connect(workletNode);
 
-  // Pass selected model as a query param
-  const selectedModel = encodeURIComponent(modelSelect.value || '');
   const WS_PROTO = location.protocol === 'https:' ? 'wss://' : 'ws://';
-  const WS_URL = `${WS_PROTO}${location.host}/ws?model=${selectedModel}`;
+  const WS_URL = `${WS_PROTO}${location.host}/ws`;
   wantReconnect = true;
 
   // Socket-scoped handlers: `sock` is captured locally so a STALE socket's
@@ -242,9 +188,6 @@ async function connect() {
   const sock = new WebSocket(WS_URL);
   sock.binaryType = 'arraybuffer';
   ws = sock;
-
-  // Lock selector while connected
-  modelSelect.disabled = true;
 
   sock.onopen = () => {
     if (sock !== ws) { try { sock.close(); } catch (_) {} return; }  // superseded
@@ -313,7 +256,6 @@ function disconnect(stopServer = true) {
   connectBtn.disabled    = false;   // re-enable even if we dropped mid-'loading'
   hintEl.textContent     = 'اضغط للاتصال — سيستمع تلقائياً بعد ذلك';
   setStatus('اضغط للاتصال', '');
-  modelSelect.disabled = false;
 
   clearAudioQueue();
   if (workletNode) { workletNode.port.onmessage = null; workletNode.disconnect(); workletNode = null; }

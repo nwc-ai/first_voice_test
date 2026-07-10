@@ -8,6 +8,10 @@ faster-whisper==1.1.1
 clearvoice==0.1.2
 omnivoice==0.1.5        # TTS (in-process). Pulls transformers>=5.3 → installs
                         # transformers 5.x; faster-whisper + clearvoice run fine on it (verified).
+catt-tashkeel==1.0.2    # Arabic diacritization (tashkeel) for Fusha replies only, before
+                        # synthesis. CATT_ENABLED=1 by default — see tts_omnivoice_v1.py.
+                        # Gated to Fusha only (Najdi excluded: CATT is MSA-trained and mangles
+                        # dialect words); CATT_ENABLED=0 reverts to plain text.
 
 # PyTorch — must match CUDA 13.0 on this machine
 # Install separately (see setup guide), not via pip install -r

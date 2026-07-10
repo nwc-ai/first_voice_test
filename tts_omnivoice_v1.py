@@ -24,6 +24,14 @@ from typing import Any, AsyncIterator, Optional
 import numpy as np
 import torch
 
+# CATT tashkeel (diacritization) — Fusha-only. CATT is an MSA-trained diacritizer; applying it
+# to Najdi text mis-vocalizes dialect words (e.g. مرة "very" comes back misread as the unrelated
+# MSA noun "a time/once"), so it is gated to Modern Standard Arabic replies only — Najdi audio
+# quality stays exactly as it is today. CATT_ENABLED=0 reverts to plain (undiacritized) text in
+# one env var without a code change.
+CATT_ENABLED = os.environ.get("CATT_ENABLED", "1") == "1"
+_TASHKEEL_LANGUAGES = {"standard arabic"}
+
 # ── Sentence boundary constants (verbatim from tts_silma_v1.py) ──────────────────────────
 HARD_BREAK = {'!', '?', '؟'}
 SOFT_BREAK = {'.', ',', '،', ';', ':'}
@@ -64,6 +72,10 @@ _DEVICE   = os.environ.get("OMNIVOICE_DEVICE", "cuda:0")
 _model = None
 _model_lock = threading.Lock()
 
+# ── Lazy tashkeel model singleton (same shape as _model/_model_lock above) ────────────────
+_tashkeel_model = None
+_tashkeel_lock = threading.Lock()
+
 
 def load_models():
     """Optional warm-up hook — call from FastAPI lifespan so the first user
@@ -74,6 +86,12 @@ def load_models():
             f"Place the Saudi reference WAV at that path before starting the server."
         )
     _get_model()
+    if CATT_ENABLED:
+        print("[tts] loading CATT tashkeel model...")
+        _get_tashkeel_model()
+        print("[tts] CATT tashkeel ready.")
+    else:
+        print("[tts] CATT tashkeel disabled (CATT_ENABLED=0) — replies stay undiacritized.")
 
 
 def _get_model():
@@ -83,6 +101,26 @@ def _get_model():
             from omnivoice import OmniVoice  # type: ignore[import-untyped]
             _model = OmniVoice.from_pretrained(_MODEL_ID, device_map=_DEVICE, dtype=torch.float16)
         return _model
+
+
+def _get_tashkeel_model():
+    global _tashkeel_model
+    with _tashkeel_lock:
+        if _tashkeel_model is None:
+            import catt_tashkeel
+            _tashkeel_model = catt_tashkeel.CATTEncoderDecoder()
+        return _tashkeel_model
+
+
+def _add_tashkeel(text: str) -> str:
+    """Diacritize Arabic text via CATT for pronunciation precision. CATT is a third-party ONNX
+    model, not internal code — falls back to the plain (undiacritized) text on any error rather
+    than let a tashkeel hiccup break a turn's audio."""
+    try:
+        return _get_tashkeel_model().do_tashkeel(text, verbose=False)
+    except Exception as e:
+        print(f"[tts] tashkeel failed, using plain text: {type(e).__name__}: {e}")
+        return text
 
 
 # ── Sentence boundary helper (verbatim) ──────────────────────────────────────────────────
@@ -117,10 +155,14 @@ def _strip_openers(text: str) -> str:
 
 # ── Blocking synthesis helpers (run via asyncio.to_thread) ───────────────────────────────
 
-def _synthesize_mp3_blocking(text: str) -> bytes:
+def _synthesize_mp3_blocking(text: str, language: Optional[str] = None) -> bytes:
     """OmniVoice inference + LAME MP3 encode in one blocking call (one to_thread dispatch).
-    Returns a complete MP3 container — browser decodeAudioData requires this."""
+    Returns a complete MP3 container — browser decodeAudioData requires this. `language` is
+    used ONLY to gate CATT tashkeel (Fusha-only) — it is never passed to OmniVoice itself, so
+    generation is unchanged from before this diacritization was added."""
     import lameenc
+    if CATT_ENABLED and language in _TASHKEEL_LANGUAGES:
+        text = _add_tashkeel(text)
     model = _get_model()
     # OmniVoice.generate returns a list of float32 np.ndarray (T,) at 24 kHz.
     audio = model.generate(
@@ -139,8 +181,8 @@ def _synthesize_mp3_blocking(text: str) -> bytes:
     return mp3
 
 
-async def _synthesize_mp3(text: str) -> bytes:
-    return await asyncio.to_thread(_synthesize_mp3_blocking, text)
+async def _synthesize_mp3(text: str, language: Optional[str] = None) -> bytes:
+    return await asyncio.to_thread(_synthesize_mp3_blocking, text, language)
 
 
 # ── Public WebSocket API (identical signature to the Silma module) ───────────────────────
@@ -150,6 +192,7 @@ async def stream_tts_to_ws(
     ws,
     cancel_event: asyncio.Event,
     on_first_audio=None,
+    language: Optional[str] = None,
 ) -> None:
     """
     Consume an async token generator, synthesise sentence-by-sentence with OmniVoice,
@@ -176,7 +219,7 @@ async def stream_tts_to_ws(
             if cancel_event.is_set():                               # (b)
                 continue   # keep draining so the producer's sentinel is reached
             try:
-                audio_bytes = await _synthesize_mp3(_expand_abbreviations(sentence))
+                audio_bytes = await _synthesize_mp3(_expand_abbreviations(sentence), language)
             except Exception as e:
                 print(f"[tts] synthesis failed, skipping sentence: {type(e).__name__}: {e}")
                 continue

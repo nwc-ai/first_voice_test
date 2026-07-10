@@ -13,3 +13,6 @@ checkpoints/
 
 # Logs and temp files
 *.log
+
+# Conversation logs — real user transcripts, never commit (repo is public)
+logs/
