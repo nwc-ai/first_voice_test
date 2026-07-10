@@ -24,11 +24,14 @@ from typing import Any, AsyncIterator, Optional
 import numpy as np
 import torch
 
+from routing import looks_najdi  # per-sentence Najdi check for the CATT gate
+
 # CATT tashkeel (diacritization) — Fusha-only. CATT is an MSA-trained diacritizer; applying it
 # to Najdi text mis-vocalizes dialect words (e.g. مرة "very" comes back misread as the unrelated
-# MSA noun "a time/once"), so it is gated to Modern Standard Arabic replies only — Najdi audio
-# quality stays exactly as it is today. CATT_ENABLED=0 reverts to plain (undiacritized) text in
-# one env var without a code change.
+# MSA noun "a time/once"). Gated two ways: the turn's `language` must be Fusha AND the sentence
+# being synthesized must not itself look Najdi (the LLM can reply in Najdi even on a turn routed
+# as Fusha — the reply text is the ground truth, not the user's input). CATT_ENABLED=0 reverts
+# to plain (undiacritized) text in one env var without a code change.
 CATT_ENABLED = os.environ.get("CATT_ENABLED", "1") == "1"
 _TASHKEEL_LANGUAGES = {"standard arabic"}
 
@@ -71,6 +74,9 @@ _DEVICE   = os.environ.get("OMNIVOICE_DEVICE", "cuda:0")
 # ── Lazy model singleton ──────────────────────────────────────────────────────────────────
 _model = None
 _model_lock = threading.Lock()
+_clone_prompt = None   # reusable VoiceClonePrompt — built once with the model; passing the
+                       # raw ref WAV per sentence made OmniVoice re-load/re-tokenize the
+                       # reference clip on EVERY sentence (needless first-audio latency).
 
 # ── Lazy tashkeel model singleton (same shape as _model/_model_lock above) ────────────────
 _tashkeel_model = None
@@ -95,11 +101,12 @@ def load_models():
 
 
 def _get_model():
-    global _model
+    global _model, _clone_prompt
     with _model_lock:
         if _model is None:
             from omnivoice import OmniVoice  # type: ignore[import-untyped]
             _model = OmniVoice.from_pretrained(_MODEL_ID, device_map=_DEVICE, dtype=torch.float16)
+            _clone_prompt = _model.create_voice_clone_prompt(_REF_AUDIO, _REF_TEXT)
         return _model
 
 
@@ -161,14 +168,13 @@ def _synthesize_mp3_blocking(text: str, language: Optional[str] = None) -> bytes
     used ONLY to gate CATT tashkeel (Fusha-only) — it is never passed to OmniVoice itself, so
     generation is unchanged from before this diacritization was added."""
     import lameenc
-    if CATT_ENABLED and language in _TASHKEEL_LANGUAGES:
+    if CATT_ENABLED and language in _TASHKEEL_LANGUAGES and not looks_najdi(text):
         text = _add_tashkeel(text)
     model = _get_model()
     # OmniVoice.generate returns a list of float32 np.ndarray (T,) at 24 kHz.
     audio = model.generate(
         text=text,
-        ref_audio=_REF_AUDIO,
-        ref_text=_REF_TEXT,
+        voice_clone_prompt=_clone_prompt,
     )
     pcm_int16 = (np.clip(audio[0], -1.0, 1.0) * 32767).astype(np.int16)
     enc = lameenc.Encoder()

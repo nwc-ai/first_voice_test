@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Model Performance Review</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', sans-serif; background: #0f0f0f; color: #e0e0e0; padding: 24px; }
+  h1 { font-size: 1.3rem; font-weight: 400; color: #888; margin-bottom: 16px; }
+  .controls { display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; align-items: center; }
+  select, input { background: #1a1a1a; border: 1px solid #333; color: #ccc; padding: 6px 10px; border-radius: 6px; font-size: 0.85rem; }
+  button { background: #1e3a1e; border: 1px solid #2a6a2a; color: #6dc96d; padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 0.85rem; }
+  button:hover { background: #254a25; }
+  #count { color: #555; font-size: 0.8rem; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+  th { background: #161616; color: #666; font-weight: 500; padding: 8px 10px; text-align: left; border-bottom: 1px solid #2a2a2a; cursor: pointer; white-space: nowrap; }
+  th:hover { color: #aaa; }
+  td { padding: 8px 10px; border-bottom: 1px solid #1a1a1a; vertical-align: top; max-width: 280px; }
+  tr:hover td { background: #141414; }
+  .model-cell { color: #5a9fd4; font-size: 0.75rem; word-break: break-all; }
+  .lang-badge { display: inline-block; padding: 1px 6px; border-radius: 8px; font-size: 0.7rem; }
+  .lang-ar { background: #1a2a1a; color: #6dc96d; }
+  .lang-en { background: #1a1a2a; color: #6d9dc9; }
+  .lang-mixed { background: #2a2a1a; color: #c9c96d; }
+  .ms { color: #888; }
+  .ms.fast { color: #4ad94a; }
+  .ms.med  { color: #d9a84a; }
+  .ms.slow { color: #d94a4a; }
+  .text-cell { direction: auto; }
+  .sort-asc::after  { content: " ▲"; }
+  .sort-desc::after { content: " ▼"; }
+  #no-data { text-align: center; color: #444; padding: 60px; }
+</style>
+</head>
+<body>
+<h1>Model Performance Review</h1>
+<div class="controls">
+  <select id="model-filter"><option value="">All models</option></select>
+  <select id="lang-filter">
+    <option value="">All languages</option>
+    <option value="ar">Arabic</option>
+    <option value="en">English</option>
+    <option value="mixed">Mixed</option>
+  </select>
+  <input id="search" type="text" placeholder="Search transcript..." style="width:200px">
+  <button onclick="loadData()">↻ Refresh</button>
+  <span id="count"></span>
+</div>
+<table id="tbl">
+  <thead>
+    <tr>
+      <th onclick="sortBy('ts')"          data-col="ts">Time</th>
+      <th onclick="sortBy('model')"       data-col="model">Model</th>
+      <th onclick="sortBy('lang')"        data-col="lang">Lang</th>
+      <th class="text-cell">Transcript</th>
+      <th class="text-cell">Response</th>
+      <th onclick="sortBy('stt')"         data-col="stt">STT</th>
+      <th onclick="sortBy('ttft')"        data-col="ttft">TTFT</th>
+      <th onclick="sortBy('tts_first')"   data-col="tts_first">TTS 1st</th>
+      <th onclick="sortBy('total')"       data-col="total">LLM Total</th>
+      <th onclick="sortBy('e2e')"         data-col="e2e">E2E</th>
+    </tr>
+  </thead>
+  <tbody id="tbody"></tbody>
+</table>
+<div id="no-data" style="display:none">No interactions logged yet.</div>
+
+<script>
+let allData = [], sortCol = 'ts', sortDir = -1;
+
+function msClass(v) {
+  if (!v && v !== 0) return 'ms';
+  if (v < 800)  return 'ms fast';
+  if (v < 2000) return 'ms med';
+  return 'ms slow';
+}
+function fmt(v) { return (v != null) ? v + 'ms' : '—'; }
+function shortModel(m) {
+  const p = m.split('/');
+  return p[p.length-1].replace(':latest','');
+}
+function sortBy(col) {
+  if (sortCol === col) sortDir *= -1; else { sortCol = col; sortDir = -1; }
+  document.querySelectorAll('th[data-col]').forEach(th => {
+    th.classList.remove('sort-asc','sort-desc');
+    if (th.dataset.col === col) th.classList.add(sortDir === 1 ? 'sort-asc' : 'sort-desc');
+  });
+  render();
+}
+function getVal(e, col) {
+  const lat = e.latency || {};
+  const m = { ts: e.ts, model: e.model, lang: e.lang, stt: lat.stt_ms, ttft: lat.llm_ttft_ms, tts_first: lat.tts_first_ms, total: lat.llm_total_ms, e2e: lat.e2e_ms };
+  return m[col] ?? '';
+}
+function render() {
+  const mf = document.getElementById('model-filter').value;
+  const lf = document.getElementById('lang-filter').value;
+  const sf = document.getElementById('search').value.toLowerCase();
+  let rows = allData.filter(e =>
+    (!mf || e.model === mf) &&
+    (!lf || e.lang === lf) &&
+    (!sf || (e.transcript||'').toLowerCase().includes(sf) || (e.response||'').toLowerCase().includes(sf))
+  );
+  rows.sort((a,b) => {
+    const av = getVal(a,sortCol), bv = getVal(b,sortCol);
+    return av < bv ? sortDir : av > bv ? -sortDir : 0;
+  });
+  document.getElementById('count').textContent = rows.length + ' entries';
+  const tbody = document.getElementById('tbody');
+  tbody.innerHTML = '';
+  document.getElementById('no-data').style.display = rows.length ? 'none' : 'block';
+  rows.forEach(e => {
+    const lat = e.latency || {};
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td style="white-space:nowrap;color:#555">${e.ts||''}</td>
+      <td class="model-cell">${shortModel(e.model||'')}</td>
+      <td><span class="lang-badge lang-${e.lang||'en'}">${e.lang||''}</span></td>
+      <td class="text-cell" dir="auto">${(e.transcript||'').slice(0,120)}</td>
+      <td class="text-cell" dir="auto">${(e.response||'').slice(0,200)}</td>
+      <td class="${msClass(lat.stt_ms)}">${fmt(lat.stt_ms)}</td>
+      <td class="${msClass(lat.llm_ttft_ms)}">${fmt(lat.llm_ttft_ms)}</td>
+      <td class="${msClass(lat.tts_first_ms)}">${fmt(lat.tts_first_ms)}</td>
+      <td class="${msClass(lat.llm_total_ms)}">${fmt(lat.llm_total_ms)}</td>
+      <td class="${msClass(lat.e2e_ms)}">${fmt(lat.e2e_ms)}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+async function loadData() {
+  const res = await fetch('/logs');
+  const data = await res.json();
+  allData = data.entries.reverse();
+  const mf = document.getElementById('model-filter');
+  const models = [...new Set(allData.map(e => e.model).filter(Boolean))];
+  const cur = mf.value;
+  mf.innerHTML = '<option value="">All models</option>' + models.map(m => `<option value="${m}"${m===cur?' selected':''}>${m}</option>`).join('');
+  render();
+}
+document.getElementById('model-filter').onchange = render;
+document.getElementById('lang-filter').onchange  = render;
+document.getElementById('search').oninput        = render;
+loadData();
+</script>
+</body>
+</html>

@@ -297,14 +297,34 @@ function handleMessage(event) {
     return;
   }
   if (msg.event === 'speech_start') {
-    clearAudioQueue();
+    // PAUSE playback — don't destroy it. If STT then rejects the utterance
+    // (cough, noise, echo), the server sends `speech_rejected` and we resume
+    // exactly where we stopped. Only an ACCEPTED utterance (a `transcript`
+    // event) actually clears the audio queue.
+    pausePlayback();
     // Don't clear the response box here: if the AI was still thinking, its
     // answer keeps streaming — the box is cleared on the next transcript.
     connectBtn.className   = 'connected user-speaking';
     setStatus('تتحدث...', 'speaking');
   }
+  if (msg.event === 'speech_rejected') {
+    // False trigger — the utterance was dropped by STT. Resume the paused
+    // audio; nothing was lost.
+    resumePlayback();
+    if (connected) {
+      if (activeSources.length > 0 || isPlaying) {
+        connectBtn.className = 'connected ai-speaking';
+        setStatus('يتكلم...', 'speaking');
+      } else {
+        connectBtn.className = 'connected';
+        setStatus('يستمع...', 'listening');
+      }
+    }
+    return;
+  }
   if (msg.event === 'transcript') {
-    clearAudioQueue();               // stop any lingering audio from the previous turn
+    clearAudioQueue();               // accepted utterance — the old turn's audio is obsolete
+    resumePlayback();                // un-suspend so the NEW turn's audio can play
     transcriptEl.textContent = msg.text;
     responseBuffer           = '';
     responseEl.textContent   = '';
@@ -375,6 +395,16 @@ function queueMp3(arrayBuffer) {
       }
     };
   }).catch(e => console.error('playback error:', e));
+}
+
+function pausePlayback() {
+  // Suspend the playback clock — scheduled sources freeze in place and any MP3s
+  // that keep arriving (the turn is still streaming server-side) queue silently.
+  if (playCtx && playCtx.state === 'running') playCtx.suspend().catch(() => {});
+}
+
+function resumePlayback() {
+  if (playCtx && playCtx.state === 'suspended') playCtx.resume().catch(() => {});
 }
 
 function clearAudioQueue() {
