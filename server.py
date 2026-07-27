@@ -250,7 +250,7 @@ async def websocket_endpoint(ws: WebSocket):
     history: list[dict[str, str]] = []
     # Parallel per-PAIR dialect labels for the committed turns above (one label per
     # user+assistant pair): "egyptian" | "najdi" | "fusha" | "en". Used ONLY to clear
-    # history at the Egyptian boundary — see llm.crosses_egyptian_boundary.
+    # history at a dialect boundary — see llm.crosses_dialect_boundary.
     history_dialects: list[str] = []
 
     async def on_speech_start():
@@ -410,12 +410,12 @@ async def websocket_endpoint(ws: WebSocket):
 
                 turn_content, tts_language, route_meta = llm.build_turn(text, lang)
 
-                # History clearing at the EGYPTIAN BOUNDARY — rationale, scope, and the
-                # never-fires-without-Egyptian invariant documented on
-                # llm.crosses_egyptian_boundary (unit-pinned in eval/test_routing.py).
+                # History clearing at an ARABIC-DIALECT BOUNDARY — rationale, scope, and
+                # the never-fires-single-dialect invariant documented on
+                # llm.crosses_dialect_boundary (unit-pinned in eval/test_routing.py).
                 turn_label = llm.turn_dialect_label(tts_language)
-                if history and llm.crosses_egyptian_boundary(turn_label, history_dialects):
-                    print(f"  [history] cleared at Egyptian boundary "
+                if history and llm.crosses_dialect_boundary(turn_label, history_dialects):
+                    print(f"  [history] cleared at dialect boundary "
                           f"({history_dialects} → {turn_label})")
                     history.clear()
                     history_dialects.clear()

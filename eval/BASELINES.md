@@ -671,3 +671,197 @@ Full 6-script gate suite (`test_routing.py`, `dialect_id_eval.py`, `golden_promp
 Najdi marker) now gets CATT tashkeel applied where it previously didn't — no test currently
 pins this either way, `eval/test_tts_args.py`'s fixed Arabic strings don't contain any of the
 4 words so G4 stayed green untouched, but flagging it so it isn't "discovered" as a surprise.
+
+## 2026-07-27 — Generalized dialect-boundary history clearing (Najdi↔Fusha now clears too)
+
+Owner questioned the Egyptian-only scope of `llm.crosses_egyptian_boundary` (history clearing
+on dialect switch): traced the original rationale to the 2026-07-20 Egyptian-reintroduction
+planning doc — Najdi↔Fusha was excluded not because those dialects are "close enough" to share
+context safely, but purely as a byte-invariance constraint for that specific rollout ("Najdi/
+Fusha/English behavior, including history mechanics, must stay byte-identical to the
+pre-Egyptian baseline"). That rollout landed 3 days ago; the scoping reason no longer applies.
+The actual bug the clearing exists to prevent (in-context stylistic imitation of a 27B model's
+own recent replies — documented as the mechanism behind the pre-cards 67% Najdi leak rate) is
+not Egyptian-specific, so there's no principled reason Najdi↔Fusha switches would be immune.
+
+**Decision**: generalize to a fully symmetric rule — clear on any transition between two
+different Arabic dialects among {Najdi, Fusha, Egyptian}; English/mixed unchanged. Considered
+and rejected: a debounce/hysteresis variant for Najdi↔Fusha specifically (cheaper long-term
+fix for the noise concern below, but adds complexity without measured need yet); a prompt-side
+"disregard the prior dialect's wording" reminder (same shape as `NAJDI_NO_OTHER_DIALECTS_RULE`,
+which measurably backfired 1.7%→8.3%); summarizing instead of clearing (extra LLM call,
+violates the "keep live latency untouched" constraint); clearing only assistant turns (breaks
+the user/assistant pairing invariant `server.py`'s trim logic assumes, and produces a message
+shape — consecutive user turns, no assistant reply between them — never sent to the model
+before, an unmeasured risk trade for a measured one).
+
+**Known, accepted tradeoff**: Najdi↔Fusha is not a clean discrete boundary the way Egyptian is
+— Fusha is the default *fallback* bucket, not a positively-detected register, and Najdi recall
+is currently 14/17 (82%, `dialect_id_eval.py`). Over the 3-turn rolling window
+(`MAX_HISTORY_TURNS`), that's roughly a 1-(0.82³) ≈ 45% back-of-envelope chance at least one
+turn in an otherwise-consistent Najdi conversation gets silently mislabeled Fusha and triggers
+a clear nobody asked for — a meaningfully higher spurious-clear rate than Egyptian's boundary
+ever had (Egyptian requires distinctive markers or an explicit request, making its crossings
+comparatively rare and deliberate). Accepted as the cost of the simpler design; the debounce
+variant above is the natural fallback if production data later shows this hurts conversational
+continuity in practice.
+
+**Files changed**: `llm.py` (`crosses_egyptian_boundary` → `crosses_dialect_boundary`, logic
+generalized from the two special-cased branches to `any(d in _ARABIC_DIALECTS and d !=
+turn_label for d in history_dialects)` — actually simpler than the code it replaced),
+`server.py` (4 reference points: declaration comment, pre-call comment, call site, log
+message — rename/reword only, zero mechanics change), `eval/test_routing.py` (renamed the `B`
+assignment; flipped exactly 2 pins — `"najdi after fusha"` and `"fusha after najdi"`, both now
+`CLEAR` instead of `keep`; reworded the stale "THE INVARIANT" comment; added 1 new coverage pin
+confirming an interspersed English turn doesn't mask an Arabic-dialect difference elsewhere in
+history), `CLAUDE.md` (the Egyptian bullet under "Key decisions").
+
+**Verification**: ran the full 6-script gate suite (`test_routing.py`, `dialect_id_eval.py`,
+`golden_prompts.py`, `test_tts_args.py`, `test_dialect_repair.py`, `test_leak_lint.py`) both
+immediately BEFORE this change (to cleanly isolate its effect from the still-fresh 2026-07-24
+marker-set change) and immediately AFTER. Identical numbers both times — Najdi 14/17 (82%),
+Egyptian 20/25 (80%), all 6 scripts green — confirming this change touches only history
+mechanics, with zero effect on routing/detection/repair (expected: dialect detection itself,
+`routing.py`, was not touched by this change at all).
+
+No live multi-turn integration test exists for this behavior in either direction (Egyptian's
+original clearing or this generalization) — every eval harness in this repo (`dialect_ab.py`,
+`dialect_eval_full.py`) deliberately uses fresh context per turn. The 13 unit pins on the pure
+`crosses_dialect_boundary` function are the only automated coverage; a live sanity check (speak
+Najdi, then Fusha, then Najdi again; confirm the `[history] cleared at dialect boundary` log
+line fires on both switches and replies are composed fresh) is a manual follow-up, not gated.
+
+## 2026-07-27 — Full 245-question re-run, current state (owner-requested check)
+
+Re-ran `eval/dialect_eval_full.py` against the same 245 questions as the 2026-07-22 runs, to
+confirm current state after this session's marker-removal (اللي/عشان/لسه/يلا) and
+history-clearing generalization. Report: `logs/ab_runs/2026-07-27_1302-2026-07-27-post-history-fix-full.md`.
+
+| | routing-bad, before marker removal | routing-bad, now | delta |
+|---|---|---|---|
+| Egyptian (n=115) | 32 | 22 | **−10, win** |
+| Najdi (n=65) | 11 | 15 | **+4, accepted tradeoff** |
+| Fusha (n=65) | 0 | 0 | unchanged |
+
+Egyptian improvement matches the 2026-07-24 marker-removal's intent directly. The Najdi
+increase is almost entirely (11/11 of the prior baseline, +4 new) the same two already-known,
+already-accepted causes: (a) 11 of these were ALREADY routing-bad before any of this session's
+changes — confirmed by testing each string directly against `looks_najdi()` — genuinely
+marker-less Najdi phrasing (no lexicon hit at all, e.g. relying on verb-form choice like
+يقدر rather than a listed marker word), the same "precision-first design: marker-less Najdi is
+an EXPECTED miss" limitation `dialect_id_cases.jsonl` has documented from the start, unrelated
+to any code changed this session; (b) exactly 4 NEW misses (`N035`, `O03`, `G18` via عشان;
+`O05` via اللي) are the direct, already-accepted cost of removing those words as Najdi markers
+(both confirmed to now return `False` for `looks_najdi()` where they returned `True` before).
+No unexplained or newly-surprising routing regressions found.
+
+**Leak count worth flagging**: مرة leaking into Egyptian appeared **6 times in this run alone**
+(`E003`, `E015`, `E030`, `EG05`, `EG15`, `EG19`) — on top of the 4 prior instances already
+recorded in the 2026-07-22 entries. This is now a strongly, repeatedly confirmed pattern (10+
+independent instances across three separate runs) and the strongest remaining candidate for a
+future fix — still not attempted, for the same reason as before (مرة is a genuine homograph
+also meaning "one time"/"wife" in some registers; needs a positional regex, not a plain
+`DIALECT_REPAIR_MAP` word-swap). سوى-verb-family leaking into Egyptian also recurred (2-3
+instances) — same status, same reasoning, not re-litigated here.
+
+No new leak/grammar pattern found beyond what's already documented in the 2026-07-22 entries.
+
+## 2026-07-27 (later) — CORRECTION: مرة was never a confirmed leak — leak_lint itself was broken
+
+Owner asked to fix مرة "without disturbing other things." Before designing the positional
+repair flagged above, checked all 10 real occurrences flagged across the 2026-07-22/27 runs
+individually (not just counted) — **every single one was مرة meaning "time/occurrence"**
+(`من أول مرة`, `كل مرة`, `مرة واحدة`, `مرة ثانية`), never the Gulf/Levantine "very" sense that
+`EGYPTIAN_CARD` actually forbids. Zero genuine intensifier leaks found in any real data. The
+"10+ confirmed instances, clears the recurrence bar" conclusion recorded in this file's
+2026-07-22 and 2026-07-27 entries above was itself wrong — driven entirely by
+`eval/leak_lint.py`'s `FORBIDDEN["Egyptian"]` treating bare `مرة` as an unconditional
+word-match, unable to distinguish the two senses of the homograph. **Same shape of mistake as
+جداً/دول** (this file's earlier entries) — a detector flagging a legitimate word because it
+never accounted for a second meaning. This time it was the *measurement* that was wrong, not
+the prompt guidance (`EGYPTIAN_CARD`'s "NEVER مرة" for the intensifier sense is still correct
+advice — it just had no working detector behind it).
+
+**Fix**: removed bare `مرة` from `FORBIDDEN["Egyptian"]`'s plain word-set; added
+`_marra_leaks()`/`_MARRA_TIME_RE` to `eval/leak_lint.py` — a context-aware regex (same shape as
+the existing `_TSAWWA_RE`/`_HA_FUTURE_RE` special-case detectors) that only flags `مرة` when it
+appears OUTSIDE a known time-of-occurrence construction (`أول/كل/آخر/تاني/ثاني/كام/من مرة`, or
+`مرة واحدة/تانية/ثانية/أخرى/كمان`), including the glued و/ف/ل-conjunction forms (`فكل مرة`,
+`لكل مرة`). Verified against all 10 real false-positive sentences (all now clean) and 3
+constructed genuine-intensifier sentences (all still correctly flagged, e.g. `الأكل ده حلو
+مرة`). No change to `routing.py`/`DIALECT_REPAIR_MAP`/`EGYPTIAN_CARD` — this was purely a
+detection-side fix, no repair needed since no genuine leak has actually been observed yet.
+Regression-pinned in `eval/test_leak_lint.py` (7 new cases: 5 false-positive-fix, 1
+true-positive, 1 confirming مرة stays allowed in Najdi where it's the correct word for "very").
+
+Full 6-script gate suite green after the change, zero effect on anything else (`مرة` was never
+a `DIALECT_REPAIR_MAP` key, so `test_dialect_repair.py`'s prose-sync/forbidden-sync checks were
+never coupled to it).
+
+**Going forward**: if a genuine مرة-as-"very" leak is ever observed in real data (now that the
+detector can actually catch one), it clears the recurrence bar from zero, not from a false
+starting count — treat any future report as the first real instance, not a continuation of the
+"10+" figure in the entries above, which is now known to be entirely false positives.
+
+## 2026-07-27 (later still) — Full manual read of the current 245-response report
+
+Owner asked directly whether responses were being evaluated manually, not just via leak_lint —
+did a complete read of every response in `logs/ab_runs/2026-07-27_1302-2026-07-27-post-history-fix-full.md`
+(not just the flagged ones). Findings:
+
+- **Fixed** (see below): `routing.requested_egyptian()` failed to match English explicit-dialect
+  requests with an object pronoun between the verb and "in X" — `"Answer me in Masri please"`
+  and `"Reply to me in Egyptian please"` both returned `False` (only `"Answer in Masri please"`,
+  no pronoun, matched). Live consequence, confirmed in the eval report (`ED2`): the model, never
+  told it was an explicit Egyptian request, hallucinated a fake self-imposed rule ("my
+  instructions require me to speak only English or Najdi") and replied in English — a real,
+  user-facing failure, not a subtle grammar nuance. Checked `WANTS_ARABIC_RE`/`WANTS_ENGLISH_RE`
+  for the same gap — confirmed NOT affected, they have a generic `\b(in|into|to)\s+arabic\b`
+  catch-all arm with no verb requirement, so a pronoun in between never breaks them (verified
+  directly, not assumed — avoided an unnecessary edit there).
+- **Confirmed already mitigated, no action needed**: two occurrences of literal CJK characters
+  embedded mid-word in Fusha replies (`F005`: "لعب书法家ون عظام", `FD3`: "随着年龄") — checked
+  `routing.filter_cjk`/`_UNWANTED_SCRIPT_RE` and confirmed it IS wired into the live pipeline
+  (`server.py:446`), so these never reach the user's ears via TTS in production, only visible
+  in this raw-generation eval log.
+- **Logged, not acted on this round**: a logical self-contradiction in a Najdi reply (`G01`:
+  claims phone use before sleep is "very necessary for your health" then advises stopping
+  screen use before bed in the same reply); a garbled non-word in Egyptian (`E038`:
+  "بيتركونسوا", likely intended "بيتركزوا"); a confused connector in Najdi (`G05`: "وشنو
+  يرتبط بأمور أخرى" doesn't parse); a code-switching instruction violation (`CS10`: replied
+  100% English on a mixed-language turn, invisible to leak_lint since mixed/English turns skip
+  it entirely); a third recurrence of the منى→منا place-name misspelling (`N038`, `E039`,
+  clearing the recurrence bar, candidate for a future dialect-agnostic post-processing fix, not
+  attempted). Each either single-occurrence (doesn't clear the recurrence bar alone) or noted
+  as a candidate for later, not urgent.
+
+**Fix implemented**: `routing._en_dialect_req()` (feeds `_EGYPTIAN_REQUEST_RE`) now tolerates
+an optional object pronoun (`me`/`us`/`him`/`her`/`them`/`to me`/`to us`) between the request
+verb and "in/into/to <dialect>", via a new shared `_OBJ_PRONOUN_RE` fragment. Verified against
+the exact failing sentences plus the existing FROZEN proper-noun and negation guards (all still
+pass — `"The Egyptian Museum"`, `"Don't answer me in Masri"` both still correctly `False`). 3
+new regression pins added to `eval/test_routing.py`. Full 6-script gate suite green, zero
+routing-outcome change on any of the 66 `dialect_id_cases.jsonl` rows or 101 golden fixtures
+(this only affects the *explicit English request* pattern, a surface none of those exercise
+with a pronoun in this exact position).
+
+## 2026-07-27 (later still) — منى→منا place-name typo fix
+
+Owner asked to resolve the recurring منى (Mina) → منا misspelling (3 independent instances:
+2026-07-22's E039, this session's N038 and E039). Unlike the other repairs this session,
+this one is **dialect-agnostic** — seen on both Najdi- and Fusha-routed replies — so it can't
+live in `DIALECT_REPAIR_MAP` (keyed per-dialect). Also, same homograph risk as مرة: bare منا
+is ALSO the very common word "from us" (من+نا — واحد منا، طلب منا، قريب منا), so a blind
+substitution was never an option.
+
+All 3 confirmed real instances shared one shape: a domain noun immediately followed by منا
+("مخيمات منا", "منطقة منا"). Added `routing._MINA_MISSPELL_RE` — `\b(خزان|محطات?|مخيمات?|
+منطقة)\s+منا\b` — gated on that exact adjacency (these domain nouns don't parse as "from us"
+in natural Arabic, so the reading is unambiguous), wired into `apply_dialect_repairs()` as a
+new unconditional step applied regardless of dialect (including `None`/English-mixed turns,
+since a place name can appear in any turn). Verified against both real sentences (both now
+correctly fixed) and 3 false-positive safety checks (واحد منا، طلب منا، قريب منا all
+untouched). 6 new regression tests added to `eval/test_dialect_repair.py`. Full 6-script gate
+suite green — no other file needed a change (the existing two call sites of
+`apply_dialect_repairs` in `server.py`/`tts_omnivoice_v1.py` pick this up automatically since
+it lives inside the shared function, not a new call site).

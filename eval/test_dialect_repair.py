@@ -94,6 +94,29 @@ check("egyptian-jiddan-noop",
 check("none-dialect-noop", routing.apply_dialect_repairs("الجو حار جداً اليوم", None),
       "الجو حار جداً اليوم")
 
+# ── منى/منا place-name typo — dialect-agnostic, real transcript sentences (2026-07-27) ────
+# 3 independent instances found across manual eval review, always domain-noun + منا.
+
+check("mina-typo-mukhayyamat-najdi",
+      routing.apply_dialect_repairs("الماي ينقطع كثير في مخيمات منا زمان الموسم", "Najdi"),
+      "الماي ينقطع كثير في مخيمات منى زمان الموسم")
+check("mina-typo-mantiqa-fusha",
+      routing.apply_dialect_repairs(
+          "تم تعزيز كفاءة أنظمة ضخ المياه في محطات منطقة منا استعداداً", "Fusha"),
+      "تم تعزيز كفاءة أنظمة ضخ المياه في محطات منطقة منى استعداداً")
+check("mina-typo-applies-with-none-dialect",
+      routing.apply_dialect_repairs("خزان منا يحتاج صيانة", None),
+      "خزان منى يحتاج صيانة")
+
+# ── منا false-positive safety: bare "from us" (من+نا) must NEVER be touched ────────────────
+
+check("mina-fp-wahid-minna", routing.apply_dialect_repairs("واحد منا لازم يتصل", "Najdi"),
+      "واحد منا لازم يتصل")
+check("mina-fp-talab-minna", routing.apply_dialect_repairs("الفني طلب منا نغلق الصنبور", "Najdi"),
+      "الفني طلب منا نغلق الصنبور")
+check("mina-fp-qariba-minna", routing.apply_dialect_repairs("المحطة قريبة منا شوي", "Najdi"),
+      "المحطة قريبة منا شوي")
+
 # ── Anti-drift invariants ───────────────────────────────────────────────────────────────
 
 _CARDS = {"Najdi": routing.NAJDI_GLOSSARY, "Egyptian": routing.EGYPTIAN_CARD}

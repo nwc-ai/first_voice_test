@@ -126,6 +126,12 @@ check("in Egyptian dialect",             Q("tell me about Egypt in Egyptian dial
 check("Egyptian arabic noun-context",    Q("can you use Egyptian arabic here"), True)
 check("say it in Masri",                 Q("say it in Masri"), True)
 check("switch to Egyptian",              Q("switch to Egyptian from now on"), True)
+# Object-pronoun tolerance (found via manual eval review, 2026-07-27: "Answer me in Masri
+# please" failed to match, so the model never saw it was an explicit Egyptian request and
+# invented a confused excuse instead of replying in Egyptian — a real, user-facing miss):
+check("answer me in Masri",              Q("Answer me in Masri please."), True)
+check("reply to me in Egyptian",         Q("Reply to me in Egyptian please."), True)
+check("neg: don't answer me in Masri",   Q("Don't answer me in Masri."), False)
 # FP guards (FROZEN — confirmed live false positives on the old branch):
 check("guard: Egyptian Museum",          Q("The Egyptian Museum is in Cairo"), False)
 check("guard: المتحف المصري",            Q("وين المتحف المصري"), False)
@@ -254,24 +260,27 @@ check("explicit egyptian request",      M("رد بالمصري", "ar"),
 check("resolved: former collision now egyptian-detected", M("إيه اللي حصل النهاردة؟", "ar"),
       {"requested": None, "detected": "egyptian", "explicit_arabic": False})
 
-# ── History clearing at the Egyptian boundary (Step 5) ───────────────────────────────────
-print("\n== crosses_egyptian_boundary ==")
-B = llm.crosses_egyptian_boundary
+# ── History clearing at Arabic-dialect boundaries (Step 5; generalized 2026-07-27) ────────
+print("\n== crosses_dialect_boundary ==")
+B = llm.crosses_dialect_boundary
 L = llm.turn_dialect_label
 check("label: najdi arabic",            L("najdi arabic"), "najdi")
 check("label: egyptian arabic",         L("egyptian arabic"), "egyptian")
 check("label: standard arabic",         L("standard arabic"), "fusha")
 check("label: None (EN/mixed)",         L(None), "en")
-# THE INVARIANT: without an Egyptian turn anywhere, clearing can never fire —
-# Najdi↔Fusha and Arabic↔English switches keep history exactly as before Egyptian existed.
+# THE INVARIANT: clearing fires iff the current turn's Arabic dialect differs from some
+# Arabic dialect already in history. Same-dialect repeats never clear. English turns never
+# clear and never count as a boundary (no Arabic dialect to protect either way).
 check("najdi after najdi: keep",        B("najdi", ["najdi", "najdi"]), False)
-check("najdi after fusha: keep",        B("najdi", ["fusha"]), False)
-check("fusha after najdi: keep",        B("fusha", ["najdi", "en"]), False)
+check("najdi after fusha: CLEAR (generalized 2026-07-27)", B("najdi", ["fusha"]), True)
+check("fusha after najdi: CLEAR (generalized 2026-07-27)", B("fusha", ["najdi", "en"]), True)
 check("en after anything: keep",        B("en", ["najdi", "fusha", "egyptian"]), False)
 check("empty history: keep",            B("egyptian", []), False)
 check("egyptian after egyptian: keep",  B("egyptian", ["egyptian", "egyptian"]), False)
 check("egyptian after en-only: keep",   B("egyptian", ["en", "en"]), False)
-# Crossing the boundary — both directions clear:
+# English interspersed doesn't mask an Arabic-dialect difference elsewhere in history:
+check("fusha after najdi+en: CLEAR",    B("fusha", ["en", "najdi"]), True)
+# Crossing any Arabic-dialect boundary clears, in every direction:
 check("egyptian after najdi: CLEAR",    B("egyptian", ["najdi"]), True)
 check("egyptian after fusha: CLEAR",    B("egyptian", ["fusha", "en"]), True)
 check("najdi after egyptian: CLEAR",    B("najdi", ["egyptian"]), True)

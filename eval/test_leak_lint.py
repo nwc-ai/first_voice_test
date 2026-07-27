@@ -82,6 +82,40 @@ check("dowal-khaleej-not-a-leak-najdi", "دول" in _dowal_najdi_leaks, False)
 _dowal_fusha_leaks, _ = leak_lint.find_leaks("العالم اليوم فيه دول كثيرة تواجه هذا التحدي", "Fusha")
 check("dowal-aalam-not-a-leak-fusha", "دول" in _dowal_fusha_leaks, False)
 
+# ── مرة false-positive fix (2026-07-27): another جداً/دول-shaped homograph mistake ─────────
+# Checked all 10 real occurrences flagged across the 2026-07-22/27 full-eval runs
+# (eval/BASELINES.md) — every single one was the "time/occurrence" sense (أول مرة، كل مرة،
+# مرة واحدة، مرة ثانية), never the genuine Gulf/Levantine "very" leak. Real sentences below.
+
+_marra_awwal, _ = leak_lint.find_leaks(
+    "لما يشوفوها يقفزوا عليها ويمسكوها من أول مرة", "Egyptian")
+check("marra-awwal-marra-not-a-leak", "مرة" in _marra_awwal, False)
+
+_marra_kul, _ = leak_lint.find_leaks(
+    "لازم تركز على مهمة واحدة كل مرة بدل ما تتشتت", "Egyptian")
+check("marra-kul-marra-not-a-leak", "مرة" in _marra_kul, False)
+
+_marra_kul_glued, _ = leak_lint.find_leaks(
+    "فكل مرة تقابل فيها جاراك وتسلم عليه بإخاء", "Egyptian")
+check("marra-glued-prefix-kul-marra-not-a-leak", "مرة" in _marra_kul_glued, False)
+
+_marra_wahda, _ = leak_lint.find_leaks(
+    "بدل ما تحط هدف كبير مرة واحدة", "Egyptian")
+check("marra-wahda-not-a-leak", "مرة" in _marra_wahda, False)
+
+_marra_tania, _ = leak_lint.find_leaks(
+    "جرب تعمل فحص عشان يترتب الضغط مرة ثانية ويوصل للمستوى الطبيعي", "Egyptian")
+check("marra-tania-not-a-leak", "مرة" in _marra_tania, False)
+
+# ── مرة true-positive: the genuine Gulf/Levantine "very" leak must still be caught ─────────
+
+_marra_intensifier, _ = leak_lint.find_leaks("الأكل ده حلو مرة والزحمة كانت مرة النهاردة", "Egyptian")
+check("marra-intensifier-still-a-leak", "مرة" in _marra_intensifier, True)
+
+# مرة is Najdi's CORRECT word for "very" (DIALECT_REPAIR_MAP: جداً→مرة) — never forbidden there.
+_marra_najdi_ok, _ = leak_lint.find_leaks("الجو حار مرة اليوم", "Najdi")
+check("marra-intensifier-allowed-in-najdi", "مرة" in _marra_najdi_ok, False)
+
 # ── summary ───────────────────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")
 if FAILURES:

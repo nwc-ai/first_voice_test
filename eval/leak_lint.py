@@ -104,15 +104,44 @@ _TSAWWA_RE = re.compile(
 )
 _TSAWWA_FORBIDDEN_IN = {"Egyptian", "Fusha"}   # سوى-family allowed only in Najdi
 
+# مرة — "very" IS a genuine leak in Egyptian (Gulf/Levantine usage; EGYPTIAN_CARD teaches
+# أوي/جداً instead), but a plain word-set match can't tell that sense apart from the vastly
+# more common, completely legitimate "time/occurrence" sense (أول مرة، كل مرة، مرة واحدة،
+# مرة ثانية...). Checked every real occurrence flagged across three eval runs (10 total,
+# 2026-07-22/27, eval/BASELINES.md) — ALL TEN were "time" usage, zero genuine intensifier
+# leaks found. Same shape of mistake as جداً/دول (see routing.py's DIALECT_REPAIR_MAP
+# comment and _EGY's دول note above) — removed from the plain FORBIDDEN set below, replaced
+# with a context-aware regex so a genuine leak (if one ever occurs) is still caught, while
+# the ubiquitous "time" sense no longer false-flags.
+_MARRA_TIME_RE = re.compile(
+    # [وفل]? — Arabic glues و/ف/ل (and/so/for) directly onto the next word with no space
+    # («فكل مرة», «وكل مرة», «لكل مرة»); optional so a bare trigger word still matches too.
+    r"\b[وفل]?(?:أول|كل|آخر|تاني|ثاني|كام|من)\s+مرة\b"
+    r"|\bمرة\s+(?:واحدة|تانية|ثانية|أخرى|كمان)\b"
+)
+_MARRA_BARE_RE = re.compile(r"\bمرة\b")
+
+
+def _marra_leaks(text: str) -> bool:
+    """True if `text` contains مرة used OUTSIDE a known time-of-occurrence construction —
+    i.e. the genuine Gulf/Levantine "very" leak, not the ordinary "time" sense."""
+    safe_spans = [m.span() for m in _MARRA_TIME_RE.finditer(text)]
+    return any(not any(a <= s and e <= b for a, b in safe_spans)
+               for s, e in (m.span() for m in _MARRA_BARE_RE.finditer(text)))
+
+
+_MARRA_FORBIDDEN_IN = {"Egyptian"}   # مرة-as-"time" is fine everywhere; only Egyptian
+                                     # forbids the intensifier sense (Najdi's is correct).
+
 # What is forbidden INSIDE a reply routed to each dialect. إيش/حاجة notes: إيش is acceptable
 # Najdi on this branch (rule 2 says وش/إيش); حاجة is Najdi-forbidden (Najdi=شي).
 FORBIDDEN: dict[str, set] = {
     "Najdi":    _EGY | _HIJAZI_ONLY | _JIDDAN | {"وايد", "شنو", "كمان", "بدي", "حاجة"},
-    # مرة، كثير added — EGYPTIAN_CARD (routing.py) explicitly forbids both ("a lot=كتير
-    # never كثير/وايد", and مرة is never natural Egyptian for "very" either — see the
-    # very=أوي-or-جداً correction below) but neither was in this set before; a leaking
-    # مرة/كثير in an Egyptian reply passed undetected. Found by direct diff against
-    # routing.py's glossary prose (najdi-q2-wrong-elegant-papert.md, Part B.3).
+    # كثير added — EGYPTIAN_CARD (routing.py) explicitly forbids it ("a lot=كتير never
+    # كثير/وايد") but it wasn't in this set before; a leaking كثير in an Egyptian reply
+    # passed undetected. Found by direct diff against routing.py's glossary prose
+    # (najdi-q2-wrong-elegant-papert.md, Part B.3). مرة is handled separately below
+    # (_marra_leaks) — it's a homograph a plain word-set can't disambiguate.
     # NOTE: _JIDDAN deliberately excluded here (unlike Najdi/Fusha above/below) — see
     # the 2026-07-22 correction: جداً/جدا is genuinely correct Egyptian for "very", it
     # was wrongly forbidden for two prior sessions.
@@ -120,7 +149,7 @@ FORBIDDEN: dict[str, set] = {
     # (routing.py, 2026-07-22 live-testing review) forbid all three but none were in this
     # set before.
     "Egyptian": _NAJDI_GULF | _HIJAZI_ONLY | {"إيش", "ايش", "زين", "وين", "مشكور",
-                                              "مرة", "كثير", "الذي", "تمشى", "تأكل"},
+                                              "كثير", "الذي", "تمشى", "تأكل"},
     # Fusha must contain no dialect function words at all:
     "Fusha":    (_EGY | _NAJDI_GULF | _HIJAZI_ONLY
                  | {"إيش", "ايش", "كمان", "بدي", "يلا", "معليش"}),
@@ -158,6 +187,8 @@ def find_leaks(text: str, dialect: str) -> tuple[list[str], list[str]]:
     if dialect in _TSAWWA_FORBIDDEN_IN:
         for m in _TSAWWA_RE.findall(text):
             leaks.append(f"سوى-verb:{m}")
+    if dialect in _MARRA_FORBIDDEN_IN and _marra_leaks(text):
+        leaks.append("مرة")
     drift_set = _MSA_DRIFT | (_EGY_DRIFT_EXTRA if dialect == "Egyptian" else set())
     drift = sorted(words & drift_set) if dialect in ("Najdi", "Egyptian") else []
     return leaks, drift

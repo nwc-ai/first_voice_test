@@ -265,7 +265,7 @@ def build_turn(text: str, lang: str) -> tuple[str, Optional[str], dict[str, Any]
     return turn_content, tts_language, route_meta
 
 
-# ── History policy: clearing at the Egyptian boundary ─────────────────────────
+# ── History policy: clearing at Arabic-dialect boundaries ─────────────────────
 
 def turn_dialect_label(tts_language: Optional[str]) -> str:
     """Coarse per-turn dialect label for history bookkeeping: the routed Arabic dialect,
@@ -274,25 +274,33 @@ def turn_dialect_label(tts_language: Optional[str]) -> str:
             "standard arabic": "fusha"}.get(tts_language or "", "en")
 
 
-def crosses_egyptian_boundary(turn_label: str, history_dialects: list[str]) -> bool:
-    """True when this turn crosses INTO or OUT OF Egyptian relative to the committed
-    history — the trigger for clearing the rolling history (owner decision 2026-07-20).
+_ARABIC_DIALECTS = {"najdi", "fusha", "egyptian"}
 
-    Scope is deliberately the Egyptian boundary ONLY: Najdi↔Fusha and Arabic↔English
-    switches never clear (that is today's behavior, frozen). In a conversation with no
-    Egyptian-routed turn this can never return True — the invariant. English turns in
-    history don't count as a boundary in either direction (no Arabic dialect to protect).
+
+def crosses_dialect_boundary(turn_label: str, history_dialects: list[str]) -> bool:
+    """True when this turn crosses from one Arabic dialect to a DIFFERENT one relative to
+    the committed history — the trigger for clearing the rolling history (owner decision
+    2026-07-20 for Egyptian only, generalized to all Arabic-dialect pairs 2026-07-27).
+
+    English/mixed turns never trigger clearing in either direction — no Arabic dialect to
+    protect. Same-dialect repeats never clear. In a conversation using only one Arabic
+    dialect (or none) this can never return True.
 
     Why clearing at all: the old branch's documented live bug — with cross-dialect history
     in context, a "Najdi" answer came back as the earlier Egyptian answer nearly verbatim,
-    and in-context Egyptian exemplars were the mechanism behind the pre-cards 67% Najdi
-    leak rate. Accepted cost: a follow-up like «وش يعني؟» right after a dialect switch
-    loses its referent."""
-    if turn_label == "egyptian":
-        return any(d in ("najdi", "fusha") for d in history_dialects)
-    if turn_label in ("najdi", "fusha"):
-        return "egyptian" in history_dialects
-    return False   # English/mixed turns never clear
+    and in-context Egyptian exemplars were the mechanism behind the pre-cards 67% Najdi leak
+    rate. Originally scoped to the Egyptian boundary only for rollout byte-invariance reasons
+    (that rollout is done); generalized because the underlying imitation mechanism is not
+    Egyptian-specific — Najdi↔Fusha switches carry the same risk. Accepted cost: a follow-up
+    like «وش يعني؟» right after ANY Arabic-to-different-Arabic-dialect switch loses its
+    referent (now also true for Najdi↔Fusha, not just Egyptian crossings) — plus a higher
+    spurious-clear rate specifically for Najdi↔Fusha than Egyptian ever had, since Fusha is
+    the default fallback and Najdi recall (82%, eval/dialect_id_eval.py) misses some
+    genuinely-Najdi turns to "no marker detected" rather than a real register switch. Accepted
+    tradeoff, not a bug — see eval/BASELINES.md's 2026-07-27 entry."""
+    if turn_label not in _ARABIC_DIALECTS:
+        return False
+    return any(d in _ARABIC_DIALECTS and d != turn_label for d in history_dialects)
 
 
 # ── LLM token generator ───────────────────────────────────────────────────────

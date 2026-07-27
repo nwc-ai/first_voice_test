@@ -162,13 +162,21 @@ def _negated(text: str, start: int) -> bool:
     return bool(_NEG_BEFORE_RE.search(text[max(0, start - 20):start]))
 
 
+_OBJ_PRONOUN_RE = r"(?:\s+(?:to\s+)?(?:me|us|him|her|them))?"   # "answer ME in X", "reply TO ME in X"
+
+
 def _en_dialect_req(name_re: str) -> str:
     """English dialect-name request pattern. The bare name only counts WITH request
     context — a dialect noun ('<name> arabic/dialect/accent') or a speak-verb
     ('reply/speak/say it in <name>') — so proper nouns ('the Egyptian Museum') never
-    trigger a dialect request."""
+    trigger a dialect request. _OBJ_PRONOUN_RE tolerates an object pronoun between the
+    verb and "in <name>" (found via manual eval review, 2026-07-27: "answer me in Masri
+    please" and "reply to me in Egyptian" both failed to match without this — a real,
+    user-facing miss, since the model then has no idea it was asked for Egyptian at all
+    and can invent a confused excuse instead)."""
     return (rf"\b(?:{name_re})\s+(?:arabic|dialect|accent)\b"
-            rf"|\b(?:reply|respond|answer|speak|say\s+it|talk|switch(?:\s+to)?|use)\s+"
+            rf"|\b(?:reply|respond|answer|speak|say\s+it|talk|switch(?:\s+to)?|use)\b"
+            rf"{_OBJ_PRONOUN_RE}\s+"
             rf"(?:in\s+|into\s+|to\s+)?(?:the\s+)?(?:{name_re})\b")
 
 
@@ -331,12 +339,31 @@ _REPAIR_PATTERNS: dict[str, list[tuple[Any, str]]] = {
 }
 
 
+# منى (Mina, the Hajj site) recurrently misspelled as منا — 3 independent instances found
+# across manual eval review (2026-07-22/27, eval/BASELINES.md), always in the exact same
+# shape: a domain noun immediately followed by منا ("مخيمات منا", "منطقة منا"). Dialect-
+# AGNOSTIC (seen on both Najdi- and Fusha-routed replies) so this can't live in
+# DIALECT_REPAIR_MAP, which is keyed per-dialect.
+#
+# NOT a blind منا->منى substitution: bare منا is ALSO the extremely common word "from us"
+# (من+نا — "واحد منا" one of us, "طلب منا" asked of us, "قريب منا" close to us) — same
+# homograph shape as مرة, and blindly replacing it would corrupt every legitimate "from us"
+# sentence. Gated on the specific domain-noun-adjacency pattern actually observed (a place
+# name in construct-state position directly after a Hajj/utility noun) — "خزان منا"/"منطقة
+# منا" don't parse as "from us" in natural Arabic, so this reading is unambiguous.
+_MINA_MISSPELL_RE = re.compile(r"\b(خزان|محطات?|مخيمات?|منطقة)\s+منا\b")
+
+
 def apply_dialect_repairs(text: str, dialect: Optional[str]) -> str:
-    """Deterministic post-processing substitution pass for a ROUTED dialect label
-    ("Najdi"/"Egyptian"/"Fusha"/None — use TTS_LANG_TO_DIALECT.get(tts_language) to get
-    one from a tts_language value). No-ops for Fusha/None/unrecognized labels."""
+    """Deterministic post-processing substitution pass. Two layers:
+    (1) dialect-specific, keyed by the ROUTED dialect label ("Najdi"/"Egyptian"/"Fusha"/
+    None — use TTS_LANG_TO_DIALECT.get(tts_language) to get one from a tts_language value),
+    no-ops for Fusha/None/unrecognized labels; (2) a small set of global, dialect-agnostic
+    fixes (currently just the منى/منا place-name typo) applied regardless of dialect,
+    including None (English/mixed turns) — a place name can appear in any turn."""
     for pattern, right_word in _REPAIR_PATTERNS.get(dialect or "", []):
         text = pattern.sub(right_word, text)
+    text = _MINA_MISSPELL_RE.sub(r"\1 منى", text)
     return text
 
 
