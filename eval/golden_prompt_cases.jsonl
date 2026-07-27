@@ -1,0 +1,101 @@
+{"id": "en-weather", "text": "What's the weather like today?", "lang": "en"}
+{"id": "en-capital", "text": "What is the capital of Australia?", "lang": "en"}
+{"id": "en-meter", "text": "My water meter reading looks wrong, what should I do?", "lang": "en"}
+{"id": "en-thanks", "text": "Okay, thank you. That's all for today.", "lang": "en"}
+{"id": "en-long", "text": "Can you explain how the water distribution network in a big city actually works, from the main station to the customer's tap?", "lang": "en"}
+{"id": "en-egyptian-museum", "text": "The Egyptian Museum is in Cairo, right?", "lang": "en", "note": "FROZEN guard: proper noun must never become a dialect request"}
+{"id": "en-egyptian-history", "text": "Tell me about Egyptian history in the twentieth century.", "lang": "en", "note": "FROZEN guard: bare adjective without request context"}
+{"id": "en-egyptian-revolution", "text": "What happened in the Egyptian revolution of 1919?", "lang": "en", "note": "FROZEN guard"}
+{"id": "en-req-arabic", "text": "Tell me about Riyadh in Arabic.", "lang": "en"}
+{"id": "en-req-najdi", "text": "Reply in Najdi please.", "lang": "en"}
+{"id": "en-req-najdi-dialect", "text": "Tell me the history of coffee in Najdi dialect.", "lang": "en"}
+{"id": "en-req-msa", "text": "Say that in MSA please.", "lang": "en"}
+{"id": "en-req-classical", "text": "Use classical Arabic for your answer.", "lang": "en"}
+{"id": "en-req-saudi-dialect", "text": "Tell me that in Saudi dialect.", "lang": "en", "note": "FROZEN: 'Saudi' is not a recognized dialect name on this branch; routes English today and must stay"}
+{"id": "en-req-egyptian-dialect", "text": "Tell me about Egypt in Egyptian dialect.", "lang": "en", "may_move": true, "expected_v1": "egyptian arabic", "note": "explicit Egyptian request — moves at Step 4"}
+{"id": "en-req-masri", "text": "Say it in Masri.", "lang": "en", "may_move": true, "expected_v1": "egyptian arabic"}
+{"id": "en-req-switch-egyptian", "text": "Switch to Egyptian from now on.", "lang": "en", "may_move": true, "expected_v1": "egyptian arabic"}
+{"id": "en-req-negated-egyptian", "text": "Don't reply in Egyptian, reply in Fusha.", "lang": "en", "note": "FROZEN: Fusha pattern wins; negation guard must keep Egyptian out"}
+{"id": "en-req-hijazi", "text": "Speak Hijazi Arabic please.", "lang": "en", "note": "FROZEN: Hijazi unsupported, stays English routing"}
+{"id": "ar-req-arabi", "text": "رد بالعربي لو سمحت، وش يعني تسريب؟", "lang": "ar"}
+{"id": "ar-req-fusha", "text": "رد بالفصحى عن تاريخ القهوة", "lang": "ar"}
+{"id": "ar-req-najdi", "text": "تكلم باللهجة النجدية وقل لي وش صار", "lang": "ar"}
+{"id": "ar-req-najdi-bare", "text": "رد نجدي لو سمحت", "lang": "ar"}
+{"id": "ar-req-masri", "text": "رد بالمصري", "lang": "ar", "may_move": true, "expected_v1": "egyptian arabic"}
+{"id": "ar-req-lahga-masria", "text": "اشرح لي الفاتورة باللهجة المصرية", "lang": "ar", "may_move": true, "expected_v1": "egyptian arabic", "note": "today: باللهجة → generic explicit-Arabic → Fusha; Step 2: Egyptian pattern wins"}
+{"id": "ar-req-negated-masri-fusha", "text": "لا ترد باللهجة المصرية، رد بالفصحى", "lang": "ar", "note": "FROZEN: resolves Fusha today and forever"}
+{"id": "ar-req-negated-masri-alone", "text": "لا ترد بالمصري", "lang": "ar", "note": "FROZEN: negation guard must keep this at standard arabic after Step 2"}
+{"id": "ar-req-khaleeji", "text": "رد بالخليجي عن الطقس", "lang": "ar", "note": "FROZEN: Gulf unsupported"}
+{"id": "mixed-yalla", "text": "يلا let's go to the mall", "lang": "mixed"}
+{"id": "mixed-najdi-marked", "text": "أبغى أعرف metres كم قراءة العداد", "lang": "mixed"}
+{"id": "mixed-unmarked", "text": "هذا ال meeting كان طويل", "lang": "mixed"}
+{"id": "mixed-egyptian-marked", "text": "عايز أحجز appointment بكرة", "lang": "mixed", "note": "FROZEN: mixed branch is deferred — Egyptian markers in mixed turns change nothing in v1"}
+{"id": "mixed-english-heavy", "text": "The pressure قراءة is too high I think", "lang": "mixed"}
+{"id": "mixed-question", "text": "وش معنى pipeline بالعربي؟", "lang": "mixed"}
+{"id": "najdi-base-wish", "text": "وش أفضل مطعم بالرياض؟ أبغى أجرب شي جديد", "lang": "ar"}
+{"id": "najdi-alhin", "text": "أبغى أروح البيت الحين، تعبت مرة", "lang": "ar"}
+{"id": "najdi-3ad", "text": "ما أدري والله، عاد أنت أدرى", "lang": "ar"}
+{"id": "najdi-zain-yabeelak", "text": "زين سويت، هذا اللي يبيلك", "lang": "ar"}
+{"id": "najdi-malah", "text": "وش فيه؟ ماله داعي هالكلام", "lang": "ar"}
+{"id": "najdi-sij", "text": "صج انك ما تمل", "lang": "ar"}
+{"id": "najdi-eish", "text": "إيش رايك في هالفكرة؟", "lang": "ar"}
+{"id": "najdi-tabgha", "text": "تبغى قهوة ولا شاهي؟", "lang": "ar"}
+{"id": "najdi-nshoof", "text": "خلنا نشوف الوضع بكرة", "lang": "ar"}
+{"id": "najdi-sawwet", "text": "سويت اللي علي وخلصت", "lang": "ar"}
+{"id": "najdi-elli", "text": "هذا اللي قلت لك عنه أمس", "lang": "ar", "note": "RESOLVES TO STANDARD ARABIC as of 2026-07-24 — اللي removed from _NAJDI_MARKERS (pan-dialect); accepted, this sentence has no other marker"}
+{"id": "najdi-lissa", "text": "لسه ما وصلت الفاتورة", "lang": "ar", "note": "RESOLVES TO STANDARD ARABIC as of 2026-07-24 — لسه removed from _NAJDI_MARKERS (pan-dialect); accepted regression, this genuinely-Najdi sentence has no other marker"}
+{"id": "najdi-moya", "text": "المويه مقطوعة عندنا من الصبح", "lang": "ar"}
+{"id": "najdi-almay", "text": "الماي واقف عندنا اليوم", "lang": "ar", "note": "article-stripping path"}
+{"id": "najdi-3yal", "text": "عيالنا في المدرسة الحين", "lang": "ar"}
+{"id": "najdi-3ashan", "text": "عشان كذا قلت لك من البداية", "lang": "ar", "note": "RESOLVES TO STANDARD ARABIC as of 2026-07-24 — عشان removed from _NAJDI_MARKERS (pan-dialect); no longer a false positive on this ambiguous text"}
+{"id": "najdi-yalla", "text": "يلا بينا نمشي", "lang": "ar", "note": "RESOLVES TO STANDARD ARABIC as of 2026-07-24 — يلا removed from _NAJDI_MARKERS (pan-dialect); no longer a false positive on this ambiguous text"}
+{"id": "najdi-hamza-drop", "text": "ابغى موعد عند الدكتور بكرة الصبح", "lang": "ar"}
+{"id": "najdi-punct-glued", "text": "وين المحطة؟", "lang": "ar"}
+{"id": "najdi-comma-glued", "text": "زين، اتفقنا على كذا", "lang": "ar"}
+{"id": "najdi-diacritized", "text": "أَبْغَى أَرُوحُ السُّوقَ", "lang": "ar"}
+{"id": "najdi-phrase-mafi", "text": "ما في أحد رد علي", "lang": "ar"}
+{"id": "najdi-phrase-kaifalhal", "text": "كيف الحال يا جماعة", "lang": "ar"}
+{"id": "najdi-water-kharban", "text": "العداد خربان والضغط واطي", "lang": "ar"}
+{"id": "najdi-water-shwai", "text": "التدفق ضعيف شوي اليوم", "lang": "ar"}
+{"id": "najdi-long", "text": "وش الطريقة الصحيحة أقدم فيها بلاغ عن تسريب؟ أبغى أعرف وين أروح ومين أكلم لأن المشكلة صارلها اسبوع وما أحد رد علي", "lang": "ar"}
+{"id": "najdi-short", "text": "هيه، صحيح", "lang": "ar"}
+{"id": "najdi-collision-elli-eeh", "text": "إيه اللي حصل النهاردة؟", "lang": "ar", "may_move": true, "expected_v1": "egyptian arabic", "note": "RESOLVED to Egyptian as of 2026-07-24 — اللي removed from _NAJDI_MARKERS (pan-dialect); إيه+النهاردة now correctly carry it"}
+{"id": "najdi-collision-lissa", "text": "لسه مش عارف أعمل إيه", "lang": "ar", "may_move": true, "expected_v1": "egyptian arabic", "note": "RESOLVED to Egyptian as of 2026-07-24 — لسه removed from _NAJDI_MARKERS; إيه now correctly carries it"}
+{"id": "najdi-collision-3ashan", "text": "عايز أروح البيت عشان تعبت", "lang": "ar", "may_move": true, "expected_v1": "egyptian arabic", "note": "RESOLVED to Egyptian as of 2026-07-24 — عشان removed from _NAJDI_MARKERS; عايز now correctly carries it"}
+{"id": "najdi-collision-yalla-dilwaqti", "text": "يلا بينا نمشي دلوقتي", "lang": "ar", "may_move": true, "expected_v1": "egyptian arabic", "note": "RESOLVED to Egyptian as of 2026-07-24 — يلا removed from _NAJDI_MARKERS; دلوقتي now correctly carries it"}
+{"id": "najdi-collision-elli-haga", "text": "هي دي الحاجة اللي كنت أدور عليها", "lang": "ar", "note": "RESOLVES TO STANDARD ARABIC as of 2026-07-24 — اللي removed from _NAJDI_MARKERS stops this being wrongly Najdi, but this wording (no عايز) does NOT reach Egyptian either — a separate, documented, out-of-scope gap (see eval/dialect_id_cases.jsonl's unresolved-gap row)"}
+{"id": "najdi-req-masri-with-wish", "text": "رد بالمصري وش يعني ضغط الماء", "lang": "ar", "may_move": true, "expected_v1": "egyptian arabic", "note": "explicit Egyptian request beats spoken Najdi markers at Step 4 (explicit always wins — old-branch semantics)"}
+{"id": "fusha-howareyou", "text": "كيف حالك اليوم؟", "lang": "ar"}
+{"id": "fusha-history", "text": "أريد أن أعرف المزيد عن تاريخ المنطقة", "lang": "ar"}
+{"id": "fusha-capital", "text": "ما هي عاصمة أستراليا؟", "lang": "ar"}
+{"id": "fusha-ai", "text": "أخبرني عن الذكاء الاصطناعي", "lang": "ar"}
+{"id": "fusha-thanks", "text": "شكراً جزيلاً على المساعدة", "lang": "ar"}
+{"id": "fusha-kingdom", "text": "متى تأسست المملكة العربية السعودية؟", "lang": "ar"}
+{"id": "fusha-explain", "text": "هل يمكنك أن تشرح لي هذه الفكرة؟", "lang": "ar"}
+{"id": "fusha-khalas", "text": "خلاص بس لا تزعل", "lang": "ar", "note": "FROZEN: خلاص/بس are excluded pan-Arabic words, no dialect fires"}
+{"id": "fusha-water-msa", "text": "عندنا مشكلة في الضغط والتدفق منخفض في الخزان", "lang": "ar"}
+{"id": "fusha-billing", "text": "لماذا ارتفعت فاتورة المياه هذا الشهر؟", "lang": "ar"}
+{"id": "fusha-aywa", "text": "أيوه يا فندم، اتفضل", "lang": "ar", "note": "FROZEN: أيوه is not an Egyptian marker; must stay standard arabic"}
+{"id": "fusha-dah-single-weak", "text": "ده كتاب جميل", "lang": "ar", "note": "FROZEN: single weak marker (0.5) must NOT fire Egyptian after Step 2"}
+{"id": "fusha-mish-single-weak", "text": "مش عارف كيف أروح", "lang": "ar", "note": "FROZEN: single weak marker must NOT fire (old-branch REGR pin)"}
+{"id": "fusha-long", "text": "أرجو أن تشرح لي بالتفصيل كيف تتم معالجة مياه الشرب في المحطات الحديثة وما هي المراحل الأساسية التي تمر بها المياه قبل وصولها إلى المنازل", "lang": "ar"}
+{"id": "egy-izay-airport", "text": "عايز أعرف إزاي أروح المطار من هنا", "lang": "ar", "may_move": true, "expected_v1": "egyptian arabic"}
+{"id": "egy-izzayak", "text": "إزيك؟ عامل إيه النهاردة؟", "lang": "ar", "may_move": true, "expected_v1": "egyptian arabic"}
+{"id": "egy-dilwaqti", "text": "مش عارف والله، بس هشوف دلوقتي", "lang": "ar", "may_move": true, "expected_v1": "egyptian arabic"}
+{"id": "egy-keda-brdo", "text": "كده برضه يا عم؟ ده أنا كنت مستنيك", "lang": "ar", "may_move": true, "expected_v1": "egyptian arabic"}
+{"id": "egy-embare7", "text": "الفيلم ده حلو قوي، شفته إمبارح", "lang": "ar", "may_move": true, "expected_v1": "egyptian arabic", "note": "شفته is suffixed — not a Najdi token hit; إمبارح fires Egyptian"}
+{"id": "egy-bekam", "text": "بكام الكيلو ده؟ غالي قوي كده", "lang": "ar", "may_move": true, "expected_v1": "egyptian arabic"}
+{"id": "egy-fein-3alashan", "text": "فين أقرب صيدلية علشان محتاج دوا", "lang": "ar", "may_move": true, "expected_v1": "egyptian arabic", "note": "علشان (with ل) is not the Najdi marker عشان"}
+{"id": "egy-eh-akhbar", "text": "إيه الأخبار؟ كله تمام؟", "lang": "ar", "may_move": true, "expected_v1": "egyptian arabic"}
+{"id": "egy-elgaw", "text": "هو الجو حر كده ليه النهاردة؟", "lang": "ar", "may_move": true, "expected_v1": "egyptian arabic"}
+{"id": "egy-3awez-tazkara", "text": "أنا عاوز أحجز تذكرة قطر للإسكندرية", "lang": "ar", "may_move": true, "expected_v1": "egyptian arabic"}
+{"id": "egy-elnaharda-shoghl", "text": "النهاردة عندي شغل كتير في المحطة", "lang": "ar", "may_move": true, "expected_v1": "egyptian arabic"}
+{"id": "egy-3ayza-haga", "text": "عايزة أعرف حاجة عن الفاتورة", "lang": "ar", "may_move": true, "expected_v1": "egyptian arabic"}
+{"id": "egy-dol-nas", "text": "دول ناس كويسين، مش كده؟", "lang": "ar", "may_move": true, "expected_v1": "egyptian arabic", "note": "دول is WEAK (MSA construct-state collision) — this case pairs it with مش+كده"}
+{"id": "fusha-duwal-msa", "text": "كم عدد دول مجلس التعاون الخليجي؟", "lang": "ar", "note": "FROZEN guard: bare دول is everyday MSA and must NEVER fire Egyptian"}
+{"id": "egy-embare7-hamzadrop", "text": "امبارح رحت السوق واشتريت حاجات", "lang": "ar", "may_move": true, "expected_v1": "egyptian arabic"}
+{"id": "egy-izay-shakwa", "text": "إزاي أقدم شكوى عن العداد؟", "lang": "ar", "may_move": true, "expected_v1": "egyptian arabic"}
+{"id": "egy-mayya", "text": "المية مقطوعة عندنا من امبارح", "lang": "ar", "may_move": true, "expected_v1": "egyptian arabic"}
+{"id": "egy-watch-najdi-yes", "text": "إيه، صحيح كلامك", "lang": "ar", "may_move": true, "expected_v1": "egyptian arabic", "note": "WATCH accepted-FP: bare ايه is also the Najdi 'yes' — if this bites live, v1.1 demotes bare ايه"}
+{"id": "egy-watch-weak-pair", "text": "المشروع ده مش واضح", "lang": "ar", "may_move": true, "expected_v1": "egyptian arabic", "note": "WATCH accepted-FP: two weak markers (ده+مش=1.0) fire — ported old-branch semantics"}
+{"id": "egy-watch-stt-hallucination", "text": "ما هو الوضع في دلوقتي الإيجابية؟", "lang": "ar", "may_move": true, "expected_v1": "egyptian arabic", "note": "WATCH accepted-FP: simulates the observed live STT hallucination (2026-07-04) that inserted دلوقتي into an MSA transcript"}

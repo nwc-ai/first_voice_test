@@ -1,0 +1,66 @@
+{"text": "وش رايك نروح نتقهوى بعد الدوام؟", "dialect": "Najdi", "expect": "Najdi", "source": "seed"}
+{"text": "أبغى أروح البيت الحين، تعبت مرة", "dialect": "Najdi", "expect": "Najdi", "source": "seed"}
+{"text": "ما أدري والله، عاد أنت أدرى", "dialect": "Najdi", "expect": "Najdi", "source": "seed"}
+{"text": "زين سويت، هذا اللي يبيلك", "dialect": "Najdi", "expect": "Najdi", "source": "seed"}
+{"text": "وش فيه؟ ماله داعي هالكلام", "dialect": "Najdi", "expect": "Najdi", "source": "seed"}
+{"text": "هلا والله، وش الأخبار؟", "dialect": "Najdi", "expect": "Najdi", "source": "seed"}
+{"text": "صج انك ما تمل", "dialect": "Najdi", "expect": "Najdi", "source": "seed"}
+{"text": "الحين وين نلقى مطعم زين هالوقت؟", "dialect": "Najdi", "expect": "Najdi", "source": "seed"}
+{"text": "أبغى موعد عند الدكتور بكرة الصبح", "dialect": "Najdi", "expect": "Najdi", "source": "seed"}
+{"text": "خلاص يا شيخ لا تعورني راسي", "dialect": "Najdi", "expect": "None", "source": "seed-no-marker", "note": "precision-first design: marker-less Najdi is an EXPECTED miss"}
+{"text": "تبغين شاهي ولا قهوة؟", "dialect": "Najdi", "expect": "Najdi", "source": "marker-expansion"}
+{"text": "خلنا نشوف الوضع بكرة", "dialect": "Najdi", "expect": "Najdi", "source": "marker-expansion"}
+{"text": "المويه مقطوعة عندنا من الصبح", "dialect": "Najdi", "expect": "Najdi", "source": "marker-expansion"}
+{"text": "الماي واقف عندنا اليوم", "dialect": "Najdi", "expect": "Najdi", "source": "marker-expansion-article-strip"}
+{"text": "لسه ما وصلت الفاتورة", "dialect": "Najdi", "expect": "None", "source": "marker-removal-regression", "note": "ACCEPTED REGRESSION (2026-07-24): لسه removed from _NAJDI_MARKERS (pan-dialect, not Najdi-exclusive) — this genuinely-Najdi sentence has no other marker and now goes undetected. Traded off against fixing rows 44-47/59-60 below."}
+{"text": "عيالنا في المدرسة الحين", "dialect": "Najdi", "expect": "Najdi", "source": "marker-expansion"}
+{"text": "إيش رايك في هالفكرة؟", "dialect": "Hijazi", "expect": "Najdi", "source": "hijazi-seed", "note": "إيش is Najdi-family on this branch (rule 2: وش/إيش) — Hijazi speech with إيش routes Najdi by design"}
+{"text": "إيش تبغى تاكل؟ قول لي دحين", "dialect": "Hijazi", "expect": "Najdi", "source": "hijazi-seed"}
+{"text": "أبي أروح السوق دحين", "dialect": "Hijazi", "expect": "None", "source": "hijazi-seed", "note": "أبي/دحين are not markers here — falls to Fusha (Hijazi unsupported)"}
+{"text": "كيفك؟ مشكور على السؤال", "dialect": "Hijazi", "expect": "None", "source": "hijazi-seed"}
+{"text": "مشكور يا غالي، ما قصرت", "dialect": "Hijazi", "expect": "None", "source": "hijazi-seed"}
+{"text": "دحين كيف أوصل للبلد من هنا؟", "dialect": "Hijazi", "expect": "None", "source": "hijazi-seed"}
+{"text": "والله ما أقدر أجي بكرة، عندي شغل", "dialect": "Hijazi", "expect": "None", "source": "hijazi-seed-no-marker"}
+{"text": "إزيك؟ عامل إيه النهاردة؟", "dialect": "Egyptian", "expect": "Egyptian", "source": "seed"}
+{"text": "عايز أعرف إزاي أروح المطار من هنا", "dialect": "Egyptian", "expect": "Egyptian", "source": "seed"}
+{"text": "مش عارف والله، بس هشوف دلوقتي", "dialect": "Egyptian", "expect": "Egyptian", "source": "seed"}
+{"text": "كده برضه يا عم؟ ده أنا كنت مستنيك", "dialect": "Egyptian", "expect": "Egyptian", "source": "seed"}
+{"text": "الفيلم ده حلو قوي، شفته إمبارح", "dialect": "Egyptian", "expect": "Egyptian", "source": "seed", "note": "شفته is suffixed, not the Najdi token شفت"}
+{"text": "بكام الكيلو ده؟ غالي قوي كده", "dialect": "Egyptian", "expect": "Egyptian", "source": "seed"}
+{"text": "فين أقرب صيدلية علشان محتاج دوا", "dialect": "Egyptian", "expect": "Egyptian", "source": "seed", "note": "علشان ≠ عشان: no Najdi hit"}
+{"text": "إيه الأخبار؟ كله تمام؟", "dialect": "Egyptian", "expect": "Egyptian", "source": "seed"}
+{"text": "أيوه يا فندم، تحت أمرك", "dialect": "Egyptian", "expect": "None", "source": "seed-no-marker", "note": "أيوه is deliberately not a marker (pan-dialect yes)"}
+{"text": "هو الجو حر كده ليه النهاردة؟", "dialect": "Egyptian", "expect": "Egyptian", "source": "seed"}
+{"text": "أنا عاوز أحجز تذكرة قطر للإسكندرية", "dialect": "Egyptian", "expect": "Egyptian", "source": "seed"}
+{"text": "معلش يا باشا، حصل خير", "dialect": "Egyptian", "expect": "None", "source": "seed-no-marker"}
+{"text": "النهاردة عندي شغل كتير في المحطة", "dialect": "Egyptian", "expect": "Egyptian", "source": "field"}
+{"text": "عايزة أعرف حاجة عن الفاتورة", "dialect": "Egyptian", "expect": "Egyptian", "source": "field"}
+{"text": "دول ناس كويسين، مش كده؟", "dialect": "Egyptian", "expect": "Egyptian", "source": "seed", "note": "دول demoted to weak (MSA collision) — fires here via مش+كده support"}
+{"text": "كم عدد دول مجلس التعاون الخليجي؟", "dialect": null, "expect": "None", "source": "msa-duwal-guard", "note": "bare دول is everyday MSA construct-state plural — must never fire"}
+{"text": "امبارح رحت السوق واشتريت حاجات", "dialect": "Egyptian", "expect": "Egyptian", "source": "seed-hamza-drop"}
+{"text": "إزاي أقدم شكوى عن العداد؟", "dialect": "Egyptian", "expect": "Egyptian", "source": "field"}
+{"text": "المية مقطوعة عندنا من امبارح", "dialect": "Egyptian", "expect": "Egyptian", "source": "field"}
+{"text": "هتيجي معانا ولا لأ؟", "dialect": "Egyptian", "expect": "None", "source": "seed-no-marker", "note": "هـ-future alone is not a detection marker (lint-only signal); expected miss"}
+{"text": "إيه اللي حصل النهاردة؟", "dialect": "Egyptian", "expect": "Egyptian", "source": "collision-resolved", "note": "RESOLVED (2026-07-24): اللي removed from _NAJDI_MARKERS (pan-dialect); إيه+النهاردة now correctly carry this to Egyptian"}
+{"text": "لسه مش عارف أعمل إيه", "dialect": "Egyptian", "expect": "Egyptian", "source": "collision-resolved", "note": "RESOLVED (2026-07-24): لسه removed from _NAJDI_MARKERS; إيه now correctly carries this to Egyptian"}
+{"text": "عايز أروح البيت عشان تعبت", "dialect": "Egyptian", "expect": "Egyptian", "source": "collision-resolved", "note": "RESOLVED (2026-07-24): عشان removed from _NAJDI_MARKERS; عايز now correctly carries this to Egyptian"}
+{"text": "يلا بينا نمشي دلوقتي", "dialect": "Egyptian", "expect": "Egyptian", "source": "collision-resolved", "note": "RESOLVED (2026-07-24): يلا removed from _NAJDI_MARKERS; دلوقتي now correctly carries this to Egyptian"}
+{"text": "هي دي الحاجة اللي كنت عايزها", "dialect": "Egyptian", "expect": "None", "source": "unresolved-gap", "note": "NOT the same as the rows above: اللي removed from _NAJDI_MARKERS stops this being wrongly Najdi, but it does NOT become Egyptian either — عايزها (عايز + attached object-suffix) doesn't exact-token-match the bare عايز marker in _EGYPTIAN_MARKERS. A separate, real, out-of-scope gap (same class as the _TSAWWA_RE / و-ف-ب-prefix fixes) — documented, not fixed here."}
+{"text": "شفت الماتش امبارح؟ كان جامد أوي", "dialect": "Egyptian", "expect": "Najdi", "source": "collision", "note": "bare شفت is a Najdi marker token"}
+{"text": "كيف حالك اليوم؟", "dialect": null, "expect": "None", "source": "seed"}
+{"text": "أريد أن أعرف المزيد عن تاريخ المنطقة", "dialect": null, "expect": "None", "source": "seed"}
+{"text": "ما هي عاصمة أستراليا؟", "dialect": null, "expect": "None", "source": "seed"}
+{"text": "أخبرني عن الذكاء الاصطناعي", "dialect": null, "expect": "None", "source": "seed"}
+{"text": "شكراً جزيلاً على المساعدة", "dialect": null, "expect": "None", "source": "seed"}
+{"text": "متى تأسست المملكة العربية السعودية؟", "dialect": null, "expect": "None", "source": "seed"}
+{"text": "هل يمكنك أن تشرح لي هذه الفكرة؟", "dialect": null, "expect": "None", "source": "seed"}
+{"text": "لماذا ارتفعت فاتورة المياه هذا الشهر؟", "dialect": null, "expect": "None", "source": "field-msa"}
+{"text": "عندنا مشكلة في الضغط والتدفق منخفض", "dialect": null, "expect": "None", "source": "field-msa"}
+{"text": "عشان كذا قلت لك من البداية", "dialect": null, "expect": "None", "source": "shared-word-resolved", "note": "RESOLVED (2026-07-24): عشان removed from _NAJDI_MARKERS (pan-dialect) — no longer a false positive on this ambiguous text"}
+{"text": "يلا بينا نمشي", "dialect": null, "expect": "None", "source": "shared-word-resolved", "note": "RESOLVED (2026-07-24): يلا removed from _NAJDI_MARKERS (pan-dialect) — no longer a false positive on this ambiguous text"}
+{"text": "خلاص بس لا تزعل", "dialect": null, "expect": "None", "source": "shared-word"}
+{"text": "ده كتاب جميل", "dialect": null, "expect": "None", "source": "weak-single", "note": "single weak Egyptian marker (0.5 < 1.0) must never fire"}
+{"text": "مش عارف كيف أروح", "dialect": null, "expect": "None", "source": "weak-single", "note": "old-branch REGR pin: bare مش can never fire alone"}
+{"text": "المشروع ده مش واضح", "dialect": null, "expect": "Egyptian", "accepted_fp": true, "source": "weak-pair-watch", "note": "WATCH: two weak markers reach the 1.0 threshold (ported old-branch semantics) — revisit if it bites live"}
+{"text": "إيه، صحيح كلامك", "dialect": "Najdi", "expect": "Egyptian", "accepted_fp": true, "source": "najdi-yes-watch", "note": "WATCH accepted-FP: bare ايه is also the Najdi 'yes' — v1.1 candidate: demote bare ايه"}
+{"text": "ما هو الوضع في دلوقتي الإيجابية؟", "dialect": null, "expect": "Egyptian", "accepted_fp": true, "source": "stt-hallucination-watch", "note": "WATCH accepted-FP: simulates the live 2026-07-04 Whisper hallucination that inserted دلوقتي into MSA"}

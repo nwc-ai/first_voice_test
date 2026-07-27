@@ -13,10 +13,13 @@ from typing import Any, Optional
 import httpx
 
 from routing import (
+    EGYPTIAN_CARD,
+    EGYPTIAN_GRAMMAR_RULE,
     NAJDI_GLOSSARY,
     NAJDI_GRAMMAR_RULE,
     WANTS_ARABIC_RE,
     WANTS_ENGLISH_RE,
+    looks_egyptian,
     looks_najdi,
     requested_dialect,
 )
@@ -69,7 +72,16 @@ SYSTEM_PROMPT = (
     "13. NEVER claim to perform, schedule, or confirm a real-world physical action (e.g. dispatching a "
     "    maintenance team, sending a truck, opening a ticket, fixing something). You are a voice assistant "
     "    with no ability to do any of that. If asked, clearly say you cannot perform the action yourself and "
-    "    direct the user to contact the relevant team or service channel instead."
+    "    direct the user to contact the relevant team or service channel instead. "
+    "14. When giving advice, suggestions, or directions, address the listener directly — a second-person "
+    "    imperative or a general recommendation. NEVER phrase advice as a first-person statement of your "
+    "    own intention or want (announcing what YOU plan to do, instead of telling the LISTENER what to "
+    "    do). GOOD: 'لازم تسوي كذا' or 'you should do this' (speaks directly to the listener). This "
+    "    applies in every language and dialect you reply in. "
+    "15. Arabic replies must address the listener with ONE consistent grammatical gender (masculine OR "
+    "    feminine second-person forms) from the first word to the last — never switch between masculine "
+    "    and feminine endings within the same reply. If you are unsure of the caller's gender, pick either "
+    "    form and hold it consistently for the whole response; consistency matters far more than guessing right."
 )
 
 # ── Per-model configuration ───────────────────────────────────────────────────
@@ -131,33 +143,51 @@ def get_model_config(model_name: str) -> dict[str, Any]:
 
 # ── Per-turn language routing → LLM instruction + TTS language ────────────────
 
-def build_turn(text: str, lang: str) -> tuple[str, Optional[str]]:
+def build_turn(text: str, lang: str) -> tuple[str, Optional[str], dict[str, Any]]:
     """Decide this turn's reply-language instruction and TTS language.
 
-    Returns (turn_content, tts_language):
+    Returns (turn_content, tts_language, route_meta):
       turn_content — the wrapped user message sent to the LLM (instruction + style
         rules + the raw text). Only the CLEAN text is stored in history, so these
         per-turn instructions never accumulate across turns.
       tts_language — gates CATT tashkeel to Fusha (the TTS module re-checks each
         synthesized sentence with the same Najdi detector, so a reply that comes
         back Najdi is never MSA-diacritized regardless of this value).
+      route_meta — how the decision was reached, for the interactions.jsonl route
+        block (the purity linter's ground truth): requested = explicitly named
+        dialect or None; detected = spoken-dialect detection result ("najdi"/None)
+        on plain-Arabic turns; explicit_arabic = an explicit Arabic request fired.
     """
-    # A named dialect (Najdi/Fusha) counts as an Arabic request on its own — even
-    # when "Arabic" isn't said, e.g. "in Najdi Arabic". Other named dialects
-    # (Gulf, Hijazi, ...) aren't recognized here and fall through to the
-    # lang-detected routing below (Fusha, unless Najdi markers are present).
+    # A named dialect (Najdi/Fusha/Egyptian) counts as an Arabic request on its own —
+    # even when "Arabic" isn't said, e.g. "in Najdi Arabic". Other named dialects
+    # (Gulf, Hijazi, ...) aren't recognized and fall through to the lang-detected
+    # routing below (Fusha, unless dialect markers are present).
     req_name, req_phrase = requested_dialect(text)
     wants_arabic = req_name is not None or bool(WANTS_ARABIC_RE.search(text))
+    detected: Optional[str] = None
 
     if req_name == "Najdi":
         tts_language = "najdi arabic"
+    elif req_name == "Egyptian":
+        tts_language = "egyptian arabic"
     elif wants_arabic:
         tts_language = "standard arabic"   # Fusha, explicitly named or default
     elif lang == "ar":
-        tts_language = "najdi arabic" if looks_najdi(text) else "standard arabic"
+        # Spoken-dialect detection. NAJDI FIRST, short-circuit — the frozen invariant
+        # (owner decision 2026-07-20): any utterance that routed Najdi before Egyptian
+        # existed keeps routing Najdi, including Egyptian speech carrying pan-dialect
+        # Najdi markers (اللي/عشان/لسه/يلا) — that recall cap is measured in eval/.
+        # looks_egyptian is only ever consulted on turns that previously routed Fusha.
+        detected = ("najdi" if looks_najdi(text)
+                    else "egyptian" if looks_egyptian(text)
+                    else None)
+        tts_language = {"najdi": "najdi arabic",
+                        "egyptian": "egyptian arabic"}.get(detected, "standard arabic")
     else:
-        tts_language = None   # English or mixed AR+EN
+        tts_language = None   # English or mixed AR+EN (mixed deliberately unchanged in v1)
     print(f"  [tts-lang] {tts_language}")
+    route_meta: dict[str, Any] = {"requested": req_name, "detected": detected,
+                                  "explicit_arabic": wants_arabic}
 
     if wants_arabic:
         dialect = req_phrase or "Modern Standard Arabic (Fusha)"
@@ -182,10 +212,16 @@ def build_turn(text: str, lang: str) -> tuple[str, Optional[str]]:
             "Do NOT force a reply into all-Arabic or all-English."
         )
     elif lang == "ar":
-        if looks_najdi(text):
+        if detected == "najdi":
             lang_instruction = (
                 "The user spoke Najdi Arabic. Reply ONLY in the Najdi dialect — "
                 "do not switch to Fusha/MSA and do not mix in other dialects."
+            )
+        elif detected == "egyptian":
+            lang_instruction = (
+                "The user spoke EGYPTIAN Arabic (Masri). Reply ONLY in natural spoken "
+                "Egyptian — do NOT drift to Fusha/MSA mid-reply and never mix in "
+                "another dialect."
             )
         else:
             lang_instruction = (
@@ -199,10 +235,14 @@ def build_turn(text: str, lang: str) -> tuple[str, Optional[str]]:
     # vocabulary glossary so replies use authentic word choices instead of
     # MSA scaffolding with dialect sprinkles, plus a grammar rule against the
     # Levantine/Egyptian بـ-prefix leak found via eval.
+    # Egyptian turns get their own card the same way — and ONLY Egyptian turns:
+    # nothing Egyptian may ever be appended on a Najdi turn (pink-elephant result).
     # NAJDI_NO_OTHER_DIALECTS_RULE (باش/ش-negation) was tried and REVERTED — see
     # its docstring in routing.py, it measurably increased the leak it targeted.
     if tts_language == "najdi arabic":
         lang_instruction += "\n" + NAJDI_GLOSSARY + "\n" + NAJDI_GRAMMAR_RULE
+    elif tts_language == "egyptian arabic":
+        lang_instruction += "\n" + EGYPTIAN_CARD + "\n" + EGYPTIAN_GRAMMAR_RULE
 
     # Per-turn wrapper: lang routing + style + anti-hallucination. This wraps ONLY
     # the current user message; the clean `text` is what gets stored in history,
@@ -215,10 +255,44 @@ def build_turn(text: str, lang: str) -> tuple[str, Optional[str]]:
         "Do NOT ask for clarification — answer directly and completely. "
         "If you are not certain of a fact, say you are not sure rather than guessing. "
         "Do NOT invent names, dates, places, or events. "
+        "When you mention a specific street, building, neighborhood, person's name, or historical date "
+        "tied to a real place, only include it if you are highly confident it is factually correct. If "
+        "you are not, describe it in general terms instead of inventing a specific-sounding name or claim "
+        "to fill the gap — a true general answer is better than a precise-sounding wrong one. "
         "No markdown.\n\n"
         f"User: {text}"
     )
-    return turn_content, tts_language
+    return turn_content, tts_language, route_meta
+
+
+# ── History policy: clearing at the Egyptian boundary ─────────────────────────
+
+def turn_dialect_label(tts_language: Optional[str]) -> str:
+    """Coarse per-turn dialect label for history bookkeeping: the routed Arabic dialect,
+    or "en" for English/mixed turns (tts_language None)."""
+    return {"najdi arabic": "najdi", "egyptian arabic": "egyptian",
+            "standard arabic": "fusha"}.get(tts_language or "", "en")
+
+
+def crosses_egyptian_boundary(turn_label: str, history_dialects: list[str]) -> bool:
+    """True when this turn crosses INTO or OUT OF Egyptian relative to the committed
+    history — the trigger for clearing the rolling history (owner decision 2026-07-20).
+
+    Scope is deliberately the Egyptian boundary ONLY: Najdi↔Fusha and Arabic↔English
+    switches never clear (that is today's behavior, frozen). In a conversation with no
+    Egyptian-routed turn this can never return True — the invariant. English turns in
+    history don't count as a boundary in either direction (no Arabic dialect to protect).
+
+    Why clearing at all: the old branch's documented live bug — with cross-dialect history
+    in context, a "Najdi" answer came back as the earlier Egyptian answer nearly verbatim,
+    and in-context Egyptian exemplars were the mechanism behind the pre-cards 67% Najdi
+    leak rate. Accepted cost: a follow-up like «وش يعني؟» right after a dialect switch
+    loses its referent."""
+    if turn_label == "egyptian":
+        return any(d in ("najdi", "fusha") for d in history_dialects)
+    if turn_label in ("najdi", "fusha"):
+        return "egyptian" in history_dialects
+    return False   # English/mixed turns never clear
 
 
 # ── LLM token generator ───────────────────────────────────────────────────────

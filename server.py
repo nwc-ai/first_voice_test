@@ -248,6 +248,10 @@ async def websocket_endpoint(ws: WebSocket):
     # Rolling conversation memory for this connection (clean turns, no per-turn wrappers).
     # Enables natural follow-ups ("وش يعني؟", "tell me more") instead of stateless replies.
     history: list[dict[str, str]] = []
+    # Parallel per-PAIR dialect labels for the committed turns above (one label per
+    # user+assistant pair): "egyptian" | "najdi" | "fusha" | "en". Used ONLY to clear
+    # history at the Egyptian boundary — see llm.crosses_egyptian_boundary.
+    history_dialects: list[str] = []
 
     async def on_speech_start():
         """Called by VAD when speech onset is confirmed.
@@ -404,7 +408,18 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.send_json({"event": "transcript", "text": text, "lang": lang})
                 print(f"LLM start: {text!r}")
 
-                turn_content, tts_language = llm.build_turn(text, lang)
+                turn_content, tts_language, route_meta = llm.build_turn(text, lang)
+
+                # History clearing at the EGYPTIAN BOUNDARY — rationale, scope, and the
+                # never-fires-without-Egyptian invariant documented on
+                # llm.crosses_egyptian_boundary (unit-pinned in eval/test_routing.py).
+                turn_label = llm.turn_dialect_label(tts_language)
+                if history and llm.crosses_egyptian_boundary(turn_label, history_dialects):
+                    print(f"  [history] cleared at Egyptian boundary "
+                          f"({history_dialects} → {turn_label})")
+                    history.clear()
+                    history_dialects.clear()
+
                 # Full message list for /api/chat: system + rolling history + this wrapped turn.
                 messages = (
                     [{"role": "system", "content": llm.SYSTEM_PROMPT}]
@@ -475,10 +490,23 @@ async def websocket_endpoint(ws: WebSocket):
                         # Commit the completed turn to rolling memory — CLEAN user text
                         # (not the wrapped prompt) so per-turn instructions never accumulate.
                         # Barge-in (cancelled, partial answer) is intentionally NOT stored.
+                        # Match what was actually SPOKEN (tts_omnivoice_v1's synthesis-side
+                        # dialect-repair pass, routing.apply_dialect_repairs) — keeps a
+                        # follow-up turn from seeing the model's own raw leak usage (e.g.
+                        # جداً) reinforced in its own rolling context. The logged `response`
+                        # field and the printed line below intentionally stay RAW —
+                        # eval/dialect_purity_lint.py reads logs/interactions.jsonl to
+                        # measure the true LLM leak rate; silently "fixing" the log would
+                        # blind that measurement.
+                        history_response = routing.apply_dialect_repairs(
+                            final_response, routing.TTS_LANG_TO_DIALECT.get(tts_language)
+                        )
                         history.append({"role": "user", "content": text})
-                        history.append({"role": "assistant", "content": final_response})
+                        history.append({"role": "assistant", "content": history_response})
+                        history_dialects.append(turn_label)
                         if len(history) >= llm.MAX_HISTORY_TURNS * 2:
                             del history[: len(history) - llm.MAX_HISTORY_TURNS * 2]
+                            del history_dialects[: len(history_dialects) - llm.MAX_HISTORY_TURNS]
 
                     if final_response:
                         # OmniVoice prints nothing during synthesis, so log the
@@ -500,6 +528,14 @@ async def websocket_endpoint(ws: WebSocket):
                         "lang":         lang,
                         "transcript":   text,
                         "response":     "".join(response_tokens),
+                        # Routing ground truth for eval/dialect_purity_lint (labels only —
+                        # no content beyond what this row already logs).
+                        "route": {
+                            "tts_language":    tts_language,
+                            "detected":        route_meta["detected"],
+                            "requested":       route_meta["requested"],
+                            "explicit_arabic": route_meta["explicit_arabic"],
+                        },
                         "latency": {
                             "denoise_ms":    denoise_ms,
                             "stt_ms":        stt_ms,
