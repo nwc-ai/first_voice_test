@@ -671,3 +671,108 @@ Full 6-script gate suite (`test_routing.py`, `dialect_id_eval.py`, `golden_promp
 Najdi marker) now gets CATT tashkeel applied where it previously didn't — no test currently
 pins this either way, `eval/test_tts_args.py`'s fixed Arabic strings don't contain any of the
 4 words so G4 stayed green untouched, but flagging it so it isn't "discovered" as a surprise.
+
+## 2026-07-27 — Offline A/B: Fanar-2-27B-Instruct vs. qwen3.5:27b (evaluation-only, not a swap)
+
+A 2026-07-10 finding (this file's earlier entries) plus this session's own reactive fixes both
+pointed at the same ceiling: qwen3.5's Najdi output has a genuine **verb-morphology** leak —
+the بـ+imperfective prefix (بيوصلوا، بيحفظ، بيخونك — Levantine/Egyptian grammar, not Najdi) and
+a هـ-future variant (هتلاقي، هيساعدك) — that no glossary/prompt fix can reach, since it's
+grammatical, not lexical. Fanar-2-27B-Instruct (QCRI/HBKU, Apache 2.0, `google/gemma-3-27b-pt`
+base, 32k ctx) explicitly claims Gulf/Levantine/Egyptian dialect training and was the deferred
+candidate for testing this. Ran per the approved plan (`najdi-q2-wrong-elegant-papert.md`):
+offline only, via `dialect_eval_full.py --model` against Ollama's `/api/chat` directly — `llm.py`,
+`server.py`, `routing.py`, `tts_omnivoice_v1.py` untouched, zero production risk.
+
+**Blocker fixed first, not a config problem**: the GGUF pulled from
+`hf.co/mradermacher/Fanar-2-27B-Instruct-i1-GGUF:i1-Q4_K_M` crashed Ollama/llama-server's
+Jinja-subset parser on load (`Unknown statement: raw`) — its embedded `tokenizer.chat_template`
+contains a `{% raw %}...{% endraw %}` tool-calling block the parser doesn't support. An Ollama
+Modelfile `TEMPLATE` override does NOT reach this (confirmed: `llama-server` reads the GGUF's
+own embedded Jinja template directly, regardless of any Modelfile-level Go-template override —
+two separate template systems). Fixed at the source: patched the GGUF blob's
+`tokenizer.chat_template` KV string in place (pure-Python `struct`, no `gguf` package available
+without pip/sudo) — removed the unused tool-calling section and made the `no_thinking`
+empty-`<think></think>` injection unconditional, same byte length so no other GGUF offset
+moved. Verified byte-for-byte post-write. This lives in the blob itself, so it applies to any
+Ollama tag pointing at it.
+
+**Harness change** (`eval/dialect_eval_full.py`, diff-reviewable, additive only): `--model` flag
+(omitted = today's exact unchanged behavior, confirmed via a no-flag run); a neutral
+`_ALT_MODEL_CONFIG` used only when `--model` is passed (temp 0.7/top_p 0.9/top_k 40 — from
+`MODEL_CONFIGS["default"]`, deliberately NOT qwen3.5's reverse-engineered tuning, to avoid
+confounding "better dialect training" with "likes qwen's own sampling knobs" — `num_predict`
+raised to 4000, a functional precondition for a thinking-by-default model, not a quality
+choice); `strip_think()` removes a closed `<think>...</think>` block and flags an **unclosed**
+one `invalid` rather than scoring the truncated reasoning fragment as a reply (leak_lint's
+Arabic-word check can't tell a reasoning trace from a real reply — both are well-formed
+Arabic). No `llm.py`/`MODEL_CONFIGS` change — keeps `golden_prompts.py`'s G3 gate (which hashes
+that surface) untouched; reconfirmed `GOLDEN GATES G1/G2/G3 GREEN`, same hash as before this
+work.
+
+**Full 245-question run** (`eval/dialect_eval_questions.json` + `..._holdout_questions.json`,
+same set as the 2026-07-27 qwen3.5 run this compares against — `logs/ab_runs/2026-07-27_1302-
+2026-07-27-post-history-fix-full.md`), `keep_alive:-1`, sequential (qwen3.5 stopped first, no
+interleaving):
+
+| model | leaky | drifty | invalid | routing-bad | avg sec/turn (general/general) |
+|---|---|---|---|---|---|
+| qwen3.5:27b | 38 | 1 | 0 | 37 | 2.2 |
+| Fanar-2-27B | 31 | 1 | 0 | 37 | 2.2 |
+
+Report: `logs/ab_runs/2026-07-27_1930-fanar2-27b-vs-qwen35-full.md` (local only). **Routing-bad
+is line-for-line identical (37/37, same cases both runs)** — confirms `looks_najdi`/
+`looks_egyptian` are a pure function of input text, model-independent, exactly as the plan
+assumed. `invalid` stayed 0 for Fanar across all 245 cases — the GGUF-level `no_thinking` patch
+fully suppressed `<think>` output; no truncated-reasoning artifacts anywhere in the run.
+
+**The actual question — does Fanar reduce the verb-morphology leak class? Manual read of every
+Najdi general+holdout reply (both reports, same 100+ turns), grep-verified, not eyeballed:**
+
+- **بـ-imperfective verb forms** (excluding ordinary nouns like بيئة/بيانات/بناء that just start
+  with the same letters): qwen3.5 ≈20 real instances (بيصير، بيجيب، بتقلل، بتعلم، بتعطي، بتصير،
+  بتسبب، بتسافر، بتخدم، بتجف، بتبقى، بيقبل، بيعمل، بيضرب، بيشد، بيزيد، بيجي, etc.) vs. Fanar-2
+  **6** (بيوصلوا، بيحفظ، بيخونك، بيؤثر ×2، بتتعلمين) — roughly a **70% reduction**.
+- **هـ-future verb forms**: qwen3.5 has real instances (هتلاقي ×4، هيساعدك، هتقدر); Fanar-2 has
+  **zero** real instances (every ه-prefixed hit on manual check was a false-positive noun,
+  اهتمام/اهتمامات — not a verb).
+- **Verdict: confirmed.** Fanar-2 genuinely reduces the specific grammatical leak class that
+  motivated this test — this is a real, structural improvement `leak_lint`'s word-list checks
+  never measured (both runs show 0 detector hits for this class; the raw 38→31 leak count
+  actually understates the improvement, since it's dominated by vocabulary hits, not morphology).
+
+**New leak class, not present in qwen3.5 at all — Egyptian vocabulary bleeding into Najdi/Fusha:**
+`كويس` (Egyptian "good/well") appears **14 times** in Fanar's Najdi output (general + holdout) vs.
+**0** times in qwen3.5's — same question set. This is a real, substantial regression, distinct
+from (and larger than) `leak_lint`'s own per-turn LEAK-count for `كويس` (~7 flagged turns; it
+fires once per turn even when a reply uses the word twice). Gulf/Khaleeji `وايد` also appears
+(4× Fanar vs. 1× qwen3.5 on the same set) — smaller numbers, same direction, out-of-scope
+vocabulary per CLAUDE.md's dialect list either way.
+
+**Known `leak_lint` false positive, not new, already documented (2026-07-22 entry above)**:
+`مرة` fired on Fanar Egyptian turn `EG15` for "من أول مرة"/"المرة الجاية" (ordinary "time/occurrence"
+usage, not the forbidden Najdi-intensifier sense) — the same unfixed positional-ambiguity gap
+recorded on 2026-07-22 ("needs a purpose-built positional regex... documented, not fixed"),
+recurring here on a different model, not a new bug.
+
+**Fluency/general quality, by direct reading**: both models produce grammatically sound,
+fluent Najdi and Egyptian text; no invented words or broken negation noticed in either report on
+this pass. One Fanar-specific instruction-following miss, seen in the earlier 5-question smoke
+test (`logs/ab_runs/2026-07-27_1928-fanar2-smoketest-full.md`, F001): opens with "بالتأكيد،
+إليك..." ("Certainly, here are...") — the exact AI-boilerplate opener `SYSTEM_PROMPT` explicitly
+tells the model not to use; qwen3.5 follows this instruction reliably. Latency is comparable
+between the two models across every group in the summary table (both ~1-2s/turn; Fanar is
+faster on `short_utterance`, 0.5s vs 1.0s) — the `num_predict:4000`/thinking-mode risk this test
+was designed around did not materialize as a latency cost, because the GGUF patch suppressed
+`<think>` entirely.
+
+**Overall conclusion**: Fanar-2 is a real, measurable improvement specifically on the
+grammatical-morphology axis that motivated this test (بـ-prefix/هـ-future), at the cost of a new
+vocabulary-level leak (Egyptian words in Najdi/Fusha output) that this project's own tooling
+(`DIALECT_REPAIR_MAP`, `leak_lint.FORBIDDEN`) is already structurally built to catch and patch —
+unlike morphology, which the project's own `EGYPTIAN_GRAMMAR_RULE`/`NAJDI_GRAMMAR_RULE` prompt
+patterns can only nudge, not fix. **Not acted on this round** — this was an evaluation-only
+comparison per the approved plan, not a production swap decision; a swap would additionally need
+a real production-swap plan (Modelfile/`MODEL_CONFIGS` entry, `golden_prompts.py` G3 recapture,
+the CATT/TTS-voice-prompt interaction re-checked, `LLM_NUM_CTX` behavior with a real 32k-context
+model) — none of that is in scope here.
