@@ -13,6 +13,20 @@ catt-tashkeel==1.0.2    # Arabic diacritization (tashkeel) for Fusha replies onl
                         # Gated to Fusha only (Najdi excluded: CATT is MSA-trained and mangles
                         # dialect words); CATT_ENABLED=0 reverts to plain text.
 
+# VoiceTut-TTS (mohammedaly22/VoiceTut-TTS) — Egyptian-ONLY TTS engine, the DEFAULT since
+# 2026-08-13 (VOICETUT_TTS_ENABLED=0 reverts to OmniVoice's existing Egyptian clip+language-
+# id path). NO new package needed — it's a fine-tune of the SAME k2-fsa/OmniVoice class/
+# checkpoint format already installed above (confirmed via HF's own
+# base_model:k2-fsa/OmniVoice tag + config.json's model_type == "omnivoice"), downloaded on
+# demand via the existing `omnivoice` package's from_pretrained() — despite the model's own
+# GitHub repo claiming OmniVoice must be installed from source, that requirement did not
+# hold up in testing. Checkpoint is ~6.9GB (auto-downloads to the standard HF cache on first
+# use). See tts_omnivoice_v1.py's VOICETUT_ENABLED block and eval/BASELINES.md (2026-08-13):
+# Apache-2.0 confirmed in both the model card AND HF's structured license field (no
+# discrepancy), ~380h disclosed Egyptian training audio — replaced two prior Egyptian
+# candidates, Habibi-TTS and Lahgtna-OmniVoice, both fully removed (packages uninstalled,
+# checkpoints deleted) after live-testing found VoiceTut-TTS's quality better than both.
+
 # PyTorch — must match CUDA 13.0 on this machine
 # Install separately (see setup guide), not via pip install -r
 # torch==2.11.0+cu130

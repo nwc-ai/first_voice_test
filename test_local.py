@@ -2,13 +2,18 @@
 test_local.py — Full pipeline test for tts_omnivoice_v1.py
 ==========================================================
 No microphone needed. This script:
-  1. Sends a hardcoded question to Ollama (qwen3.5:27b) as the LLM
+  1. Sends a hardcoded question through the REAL llm.py path (llm.build_turn +
+     llm.ollama_chat_token_gen) — same model, same config, same message shape
+     server.py's respond_loop actually uses, so it inherits LLM_MODEL_OVERRIDE
+     for free and exercises the true streaming /api/chat path (not a hand-rolled
+     /api/generate call) — see eval/BASELINES.md's 2026-07-27 Fanar-2 live-test entry.
   2. Streams the LLM tokens through tts_omnivoice_v1.py
   3. Saves each synthesized sentence as an MP3 file in ./test_output/
   4. Prints timing info so you can see how fast each step is
 
 Run with:
     /home/taha/first_voice_test/.venv/bin/python test_local.py
+    LLM_MODEL_OVERRIDE=<ollama tag> /home/taha/first_voice_test/.venv/bin/python test_local.py
 """
 
 import asyncio
@@ -16,15 +21,13 @@ import os
 import sys
 import time
 
-import httpx
-
-# Add project root to path so we can import tts_omnivoice_v1
+# Add project root to path so we can import tts_omnivoice_v1 / llm / routing
 sys.path.insert(0, os.path.dirname(__file__))
+import llm
+import routing
 import tts_omnivoice_v1
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "test_output")
-OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL = "qwen3.5:27b"
 
 # The question we "ask" the AI — simulates what a user would say
 TEST_PROMPT = "اشرح لي ما هو الذكاء الاصطناعي في جملتين بالعربية"
@@ -59,31 +62,24 @@ class MockWebSocket:
         print(f"\n  [MP3 saved: {filename} — {len(data):,} bytes]")
 
 
-# ── Ollama token generator ────────────────────────────────────────────────────────────────
+# ── LLM token generator (mirrors server.py's respond_loop exactly) ────────────────────────
+# No hand-rolled /api/generate payload here anymore — this calls the same llm.py functions
+# the live server uses, so it's model-aware (LLM_MODEL_OVERRIDE) and exercises the real
+# streaming /api/chat path, not a separate one-off code path.
+
+_full_response_chars: list[str] = []   # collected across the run for the <think> leak check
+
 
 async def ollama_token_gen(prompt: str):
-    """Stream tokens from Ollama one at a time."""
-    payload = {
-        "model": MODEL,
-        "prompt": prompt,
-        "stream": True,
-        # Same as server.py's qwen3.5 config: thinking OFF for voice — with it on,
-        # the model spends its token budget reasoning and emits no spoken text.
-        "think": False,
-    }
-    async with httpx.AsyncClient(timeout=120) as client:
-        async with client.stream("POST", OLLAMA_URL, json=payload) as response:
-            response.raise_for_status()
-            async for line in response.aiter_lines():
-                if not line:
-                    continue
-                import json
-                chunk = json.loads(line)
-                token = chunk.get("response", "")
-                if token:
-                    yield token
-                if chunk.get("done"):
-                    break
+    turn_content, tts_language, route_meta = llm.build_turn(prompt, "ar")
+    print(f"  [route] {route_meta}  tts_language={tts_language}")
+    messages = [
+        {"role": "system", "content": llm.SYSTEM_PROMPT},
+        {"role": "user", "content": turn_content},
+    ]
+    async for tok in routing.filter_cjk(llm.ollama_chat_token_gen(messages, llm.MODEL)):
+        _full_response_chars.append(tok)
+        yield tok
 
 
 # ── Main test ─────────────────────────────────────────────────────────────────────────────
@@ -94,6 +90,7 @@ async def run_test():
     print("=" * 60)
     print("FULL PIPELINE TEST")
     print("=" * 60)
+    print(f"Model:    {llm.MODEL}")
     print(f"Question: {TEST_PROMPT}")
     print()
 
@@ -129,6 +126,14 @@ async def run_test():
 
     total_time = time.perf_counter() - t_start
 
+    # The offline eval (eval/dialect_eval_full.py) only ever checked the final NON-streamed
+    # response for a leftover <think> tag. The live path is stream:True, read token-by-token
+    # (llm.ollama_chat_token_gen) — whether Ollama could ever leak literal <think>/</think>
+    # tag characters into the streamed content deltas themselves was never actually observed
+    # either way. Check it here, on the real streamed text, before trusting a live run.
+    full_response = "".join(_full_response_chars)
+    think_leak = "<think" in full_response
+
     print()
     print("=" * 60)
     print("RESULTS")
@@ -138,11 +143,18 @@ async def run_test():
     print(f"MP3 files saved:      {ws.mp3_count}")
     print(f"Total audio bytes:    {ws.total_bytes:,}")
     print(f"Output directory:     {OUTPUT_DIR}")
+    print(f"<think> leak in streamed text: {'YES — FAIL' if think_leak else 'no'}")
     print()
     if ws.mp3_count > 0:
         print("To listen to the audio, copy the MP3 files to your local machine:")
         print(f"  scp taha@devserver:{OUTPUT_DIR}/*.mp3 ~/Desktop/")
     print("=" * 60)
+
+    assert not think_leak, (
+        f"Literal '<think' substring found in the streamed response text — "
+        f"the model/GGUF template is leaking reasoning-tag characters into the live "
+        f"token stream. Full response: {full_response!r}"
+    )
 
 
 if __name__ == "__main__":

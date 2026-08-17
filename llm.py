@@ -36,8 +36,14 @@ MAX_HISTORY_TURNS = 3   # rolling memory: keep only the last N user+assistant pa
 # warm-up and the chat requests so the model loads once at this size (no reload).
 LLM_NUM_CTX = int(os.environ.get("LLM_NUM_CTX", "8192"))
 
-MODEL = "qwen3.5:27b"   # the one and only LLM — warmed at startup so the first turn isn't a
-                        # cold load, and pinned in VRAM (a second model alongside it would OOM).
+MODEL = os.environ.get("LLM_MODEL_OVERRIDE", "qwen3.5:27b")
+                        # qwen3.5:27b is the one and only LLM in production — warmed at startup
+                        # so the first turn isn't a cold load, and pinned in VRAM (a second model
+                        # alongside it would OOM). LLM_MODEL_OVERRIDE exists ONLY for deliberate,
+                        # one-off local test runs (e.g. the Fanar-2 live test, see BASELINES.md) —
+                        # always pass it inline on the invocation line (`LLM_MODEL_OVERRIDE=... bash
+                        # start_server.sh`), never `export` it into a persistent shell, so it can
+                        # never silently linger and affect a later "normal" run.
 
 SYSTEM_PROMPT = (
     "You are a voice assistant that supports Arabic dialects and English ONLY. "
@@ -115,6 +121,29 @@ MODEL_CONFIGS: dict[str, dict[str, Any]] = {
             # the LLM_NUM_CTX env var as prompts grow (q8_0 KV cache makes it affordable).
             "num_ctx":          LLM_NUM_CTX,
             "stop":             _STOP_SEQUENCES,
+        },
+    },
+    "fanar-2": {
+        # Live-test-only entry (see BASELINES.md) — same temp/top_p/top_k/num_predict/stop
+        # as "default", which is the exact config the 245-question offline eval already
+        # validated Fanar-2 under (its "fanar" substring didn't match any key that existed
+        # before this one, so it fell through to "default" there too). Key is "fanar-2"
+        # specifically, not bare "fanar" — a "fanar-1" (Fanar-1-9B-Instruct) entry briefly
+        # existed alongside this one (2026-08-07) but was removed after owner live-testing
+        # found its instruction-following too weak to be worth pursuing further; see
+        # BASELINES.md's dated removal entry. The only addition here is num_ctx: left unset,
+        # Ollama loads Fanar-2 at its native 32768 context — the documented OOM combination
+        # with OmniVoice in-process on this GPU (see qwen3.5's num_ctx comment above). No
+        # "think": False — Fanar-2's thinking is already unconditionally suppressed at the
+        # GGUF chat-template level (binary-patched), not by this Ollama API field.
+        "extra":   {},
+        "options": {
+            "temperature": 0.7,
+            "top_p":       0.9,
+            "top_k":       40,
+            "num_predict": 300,
+            "num_ctx":     LLM_NUM_CTX,
+            "stop":        _STOP_SEQUENCES,
         },
     },
     "default": {

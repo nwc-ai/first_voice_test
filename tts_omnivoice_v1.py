@@ -1,6 +1,10 @@
-# ========================== WebSocket-ready TTS module (OmniVoice) =======================
+# ========================== WebSocket-ready TTS module (OmniVoice + VoiceTut-TTS) =========
 #
-# In-process TTS using k2-fsa/OmniVoice (omnilingual zero-shot voice cloning, 24 kHz).
+# In-process TTS using k2-fsa/OmniVoice (omnilingual zero-shot voice cloning, 24 kHz) for
+# Najdi/Fusha/English/mixed, and VoiceTut-TTS (an OmniVoice fine-tune, Egyptian-specialized
+# checkpoint) for Egyptian-routed turns specifically — see the VOICETUT_ENABLED block below
+# for why (promoted to the default 2026-08-13 after live-testing beat the two prior Egyptian
+# candidates, Habibi-TTS and Lahgtna-OmniVoice — both fully removed, see eval/BASELINES.md).
 #
 # Public API is identical to the previous Silma module (drop-in for server.py):
 #   await stream_tts_to_ws(token_gen, ws, cancel_event, on_first_audio=None)
@@ -9,10 +13,11 @@
 # sentence-queue + background synth worker, the on_first_audio / tts_end protocol,
 # and the 3-point cancellation are all carried over verbatim from the proven Silma
 # module (tts_silma_v1.py) — only the model load + the per-sentence synthesis call
-# are OmniVoice-specific.
+# are engine-specific.
 #
 # OmniVoice is a zero-shot voice-cloner: it needs a short reference clip + its
-# transcript to define the voice. We reuse the Saudi reference clip.
+# transcript to define the voice. We reuse the Saudi reference clip (default) and a
+# separate Egyptian reference clip (Egyptian-routed turns, OmniVoice fallback path only).
 # =========================================================================================
 
 import asyncio
@@ -34,6 +39,49 @@ from routing import apply_dialect_repairs, looks_najdi, TTS_LANG_TO_DIALECT
 # to plain (undiacritized) text in one env var without a code change.
 CATT_ENABLED = os.environ.get("CATT_ENABLED", "1") == "1"
 _TASHKEEL_LANGUAGES = {"standard arabic"}
+
+# ── VoiceTut-TTS (Egyptian-only second TTS engine — the DEFAULT Egyptian engine) ─────────
+# mohammedaly22/VoiceTut-TTS: a fine-tune of THIS project's own k2-fsa/OmniVoice base
+# (confirmed via HF's own structured tags: base_model:k2-fsa/OmniVoice +
+# base_model:finetune:k2-fsa/OmniVoice, and config.json's model_type == "omnivoice") — loads
+# through the ALREADY-INSTALLED omnivoice==0.1.5 PyPI package, zero new pip packages, verified
+# hands-on (despite the model's own GitHub repo claiming OmniVoice must be installed from
+# source — that claim did not hold up). No monkeypatches, no torchaudio shims, no dependency
+# conflicts.
+#
+# HISTORY (see eval/BASELINES.md for the full record): this project tried three Egyptian
+# engines in sequence — Habibi-TTS (SWivid/Habibi-TTS, F5-TTS architecture, the original
+# default from 2026-07-30) and Lahgtna-OmniVoice (oddadmix/lahgtna-omnivoice-v2, an opt-in
+# A/B candidate from the same date) — before VoiceTut-TTS. Owner live-tested all three by
+# ear; VoiceTut-TTS won, and Habibi/Lahgtna were both FULLY REMOVED 2026-08-13 (code,
+# packages, downloaded checkpoints) rather than left dormant — this is now the only Egyptian-
+# specialized engine in the pipeline, promoted from "opt-in A/B candidate #3" to the default.
+#
+# WHY IT WON: best license/training-data story of the three — Apache-2.0 confirmed in BOTH
+# the model card prose and HF's structured `license` API field (no discrepancy, unlike
+# Habibi's Apache-vs-cc-by-nc-sa-4.0 mismatch or Lahgtna's missing tag), and ~380h of
+# disclosed, dialect-tagged (arz) Egyptian YouTube podcast training audio — more Egyptian-
+# specific data than either prior candidate ever disclosed. Root cause this whole chain of
+# candidates exists for: OmniVoice's own base training data is only ~23h Egyptian vs ~204h
+# Najdi/~1484h MSA (2026-07-30 research, see eval/BASELINES.md). One honest caveat: the
+# downloaded checkpoint is ~6.9GB on disk, larger than its card-stated 0.6B-parameter
+# backbone would suggest — not a blocker (plenty of disk free), just a claim-vs-reality gap
+# worth noting for the record.
+#
+# VOICETUT_TTS_ENABLED=0 reverts Egyptian-routed turns to OmniVoice's own Egyptian clone
+# prompt (the pre-2026-07-30 behavior) in one env var, no code change needed.
+VOICETUT_ENABLED = os.environ.get("VOICETUT_TTS_ENABLED", "1") == "1"
+_VOICETUT_MODEL_ID = "mohammedaly22/VoiceTut-TTS"
+# Measured hands-on: VoiceTut-TTS's raw output runs on the quieter side (peak ~0.33-0.60
+# across 6 test sentences) than OmniVoice's own levels (~0.47-0.89). Peak-normalize so
+# Egyptian replies don't sound quieter than Najdi/Fusha ones.
+_VOICETUT_TARGET_PEAK = 0.75
+
+_voicetut_model = None
+_voicetut_clone_prompt = None
+_voicetut_lock = threading.Lock()
+_voicetut_load_failed = False   # sticky — don't retry a slow failing load on every single turn
+
 
 # ── Sentence boundary constants (verbatim from tts_silma_v1.py) ──────────────────────────
 HARD_BREAK = {'!', '?', '؟'}
@@ -135,6 +183,15 @@ def load_models():
         print("[tts] CATT tashkeel ready.")
     else:
         print("[tts] CATT tashkeel disabled (CATT_ENABLED=0) — replies stay undiacritized.")
+    if VOICETUT_ENABLED:
+        print("[tts] loading VoiceTut-TTS (Egyptian)...")
+        _get_voicetut_model()
+        if _voicetut_model is not None:
+            print("[tts] VoiceTut-TTS ready.")
+        # else: _get_voicetut_model() already printed why — soft-fail, Egyptian turns fall
+        # back to OmniVoice's existing clip+language-id path, never a startup failure.
+    else:
+        print("[tts] VoiceTut-TTS disabled (VOICETUT_TTS_ENABLED=0) — Egyptian stays on OmniVoice.")
 
 
 def _get_model():
@@ -150,6 +207,55 @@ def _get_model():
             if os.path.exists(_EGY_REF_AUDIO):
                 _egy_clone_prompt = _model.create_voice_clone_prompt(_EGY_REF_AUDIO, _EGY_REF_TEXT)
         return _model
+
+
+def _get_voicetut_model():
+    """Lazily load the VoiceTut-TTS checkpoint + build its voice-clone prompt from the SAME
+    Egyptian reference clip/transcript OmniVoice's own Egyptian voice uses — via the SAME
+    already-installed omnivoice PyPI package's OmniVoice class (verified hands-on: no new
+    package needed despite this model's own GitHub docs claiming otherwise). Third-party
+    checkpoint, not internal code: any failure is caught and sticky — logs once, returns
+    None forever after, never crashes startup or a turn."""
+    global _voicetut_model, _voicetut_clone_prompt, _voicetut_load_failed
+    with _voicetut_lock:
+        if _voicetut_model is not None or _voicetut_load_failed:
+            return _voicetut_model, _voicetut_clone_prompt
+        try:
+            from omnivoice import OmniVoice  # type: ignore[import-untyped]
+            _voicetut_model = OmniVoice.from_pretrained(_VOICETUT_MODEL_ID, device_map=_DEVICE,
+                                                         dtype=torch.float16)
+            _voicetut_clone_prompt = _voicetut_model.create_voice_clone_prompt(_EGY_REF_AUDIO, _EGY_REF_TEXT)
+        except Exception as e:
+            print(f"[tts] VoiceTut-TTS load failed, Egyptian turns will use the "
+                  f"next engine instead: {type(e).__name__}: {e}")
+            _voicetut_load_failed = True
+            _voicetut_model = None
+        return _voicetut_model, _voicetut_clone_prompt
+
+
+def _synthesize_egyptian_voicetut(text: str) -> Optional[np.ndarray]:
+    """Synthesize Egyptian-dialect text via VoiceTut-TTS. Returns a 24kHz mono float32
+    waveform (peak-normalized — see _VOICETUT_TARGET_PEAK), or None on ANY failure — caller
+    falls back to OmniVoice's existing Egyptian path exactly as if this engine were disabled."""
+    if not VOICETUT_ENABLED:
+        return None
+    model, clone_prompt = _get_voicetut_model()
+    if model is None:
+        return None
+    try:
+        # NOTE: no _gen_lock here — the caller (_synthesize_mp3_blocking) already holds it
+        # for the whole Egyptian branch; _gen_lock is a plain threading.Lock (not reentrant),
+        # so acquiring it again here would deadlock.
+        audio = model.generate(text=text, voice_clone_prompt=clone_prompt)
+        waveform = np.asarray(audio[0], dtype=np.float32)
+        peak = float(np.max(np.abs(waveform))) if waveform.size else 0.0
+        if peak > 1e-6:
+            waveform = np.clip(waveform * (_VOICETUT_TARGET_PEAK / peak), -1.0, 1.0)
+        return waveform
+    except Exception as e:
+        print(f"[tts] VoiceTut-TTS synthesis failed, falling back: {type(e).__name__}: {e}")
+        return None
+
 
 
 def _get_tashkeel_model():
@@ -170,6 +276,7 @@ def _add_tashkeel(text: str) -> str:
     except Exception as e:
         print(f"[tts] tashkeel failed, using plain text: {type(e).__name__}: {e}")
         return text
+
 
 
 # ── Sentence boundary helper (verbatim) ──────────────────────────────────────────────────
@@ -205,33 +312,41 @@ def _strip_openers(text: str) -> str:
 # ── Blocking synthesis helpers (run via asyncio.to_thread) ───────────────────────────────
 
 def _synthesize_mp3_blocking(text: str, language: Optional[str] = None) -> bytes:
-    """OmniVoice inference + LAME MP3 encode in one blocking call (one to_thread dispatch).
-    Returns a complete MP3 container — browser decodeAudioData requires this. `language` is
-    used ONLY to gate CATT tashkeel (Fusha-only) — it is never passed to OmniVoice itself, so
-    generation is unchanged from before this diacritization was added."""
+    """TTS inference + LAME MP3 encode in one blocking call (one to_thread dispatch). Returns
+    a complete MP3 container — browser decodeAudioData requires this. `language` is used to
+    gate CATT tashkeel (Fusha-only) and to pick the synthesis engine below; it is never passed
+    to OmniVoice itself for any non-Egyptian turn, so generation for Najdi/Fusha/English/mixed
+    is unchanged from before either diacritization or VoiceTut-TTS were added.
+
+    Egyptian-routed turns try up to THREE tiers in order, each an already-independently-
+    sensible fallback: (1) VoiceTut-TTS, ONLY if VOICETUT_ENABLED (the default Egyptian
+    engine — see the VOICETUT_ENABLED block above) — (2) OmniVoice's own Egyptian clone
+    prompt + native language="egyptian arabic" id if VoiceTut is disabled/unavailable/fails —
+    (3) the plain Saudi voice if the Egyptian clip itself is missing.
+    Every other language value keeps TODAY'S EXACT call: Saudi prompt, no language kwarg at all."""
     import lameenc
     if CATT_ENABLED and language in _TASHKEEL_LANGUAGES and not looks_najdi(text):
         text = _add_tashkeel(text)
     model = _get_model()
-    # OmniVoice.generate returns a list of float32 np.ndarray (T,) at 24 kHz.
-    # Egyptian-routed turns get the Egyptian clone prompt AND the OmniVoice-native language
-    # id — the clip pins timbre, the id pins per-word pronunciation (the old branch's fix
-    # for Saudi/Egyptian pronunciation mixing). Every other turn keeps today's EXACT call:
-    # Saudi prompt, no language kwarg at all ("egyptian arabic" is also never in
-    # _TASHKEEL_LANGUAGES, so CATT stays off for Egyptian).
+    waveform: Optional[np.ndarray] = None
     with _gen_lock:
-        if language == "egyptian arabic" and _egy_clone_prompt is not None:
-            audio = model.generate(
-                text=text,
-                voice_clone_prompt=_egy_clone_prompt,
-                language="egyptian arabic",
-            )
-        else:
-            audio = model.generate(
-                text=text,
-                voice_clone_prompt=_clone_prompt,
-            )
-    pcm_int16 = (np.clip(audio[0], -1.0, 1.0) * 32767).astype(np.int16)
+        if language == "egyptian arabic":
+            waveform = _synthesize_egyptian_voicetut(text)
+        if waveform is None:
+            # OmniVoice.generate returns a list of float32 np.ndarray (T,) at 24 kHz.
+            if language == "egyptian arabic" and _egy_clone_prompt is not None:
+                audio = model.generate(
+                    text=text,
+                    voice_clone_prompt=_egy_clone_prompt,
+                    language="egyptian arabic",
+                )
+            else:
+                audio = model.generate(
+                    text=text,
+                    voice_clone_prompt=_clone_prompt,
+                )
+            waveform = audio[0]
+    pcm_int16 = (np.clip(waveform, -1.0, 1.0) * 32767).astype(np.int16)
     enc = lameenc.Encoder()
     enc.set_bit_rate(64)
     enc.set_in_sample_rate(SAMPLE_RATE)

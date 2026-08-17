@@ -17,8 +17,10 @@ Browser (AudioWorklet, 512-sample Float32 @16 kHz)
   → faster-whisper large-v3 (int8_float16, lang detect + remap tables)
   → qwen3.5:27b via Ollama /api/chat (3-turn rolling history, streamed)
   → tts_omnivoice_v1: sentence flushing → CATT tashkeel (Fusha only)
-    → OmniVoice zero-shot clone (Saudi ref voice; Egyptian ref voice + language id
-      on Egyptian-routed turns only) → one MP3 per sentence
+    → Egyptian-routed turns: VoiceTut-TTS (default) → OmniVoice+Egyptian-clip →
+      OmniVoice+Saudi-clip, each a fallback for the one before
+      Najdi/Fusha/English/mixed: OmniVoice zero-shot clone (Saudi ref voice)
+      → one MP3 per sentence
   → Browser: ordered decode, gapless playback, barge-in pause/resume
 ```
 
@@ -39,13 +41,14 @@ Barge-in: playback pauses instantly on speech onset; the turn is cancelled only 
 | VAD | Silero VAD | server-side, per 512-sample chunk |
 | Denoise | ClearVoice FRCRN_SE_16K | ≤4 s clips only; under evaluation for removal |
 | STT | faster-whisper large-v3 | int8_float16 on CUDA |
-| LLM | qwen3.5:27b via Ollama | **locked** — a second model would OOM the GPU |
+| LLM | qwen3.5:27b via Ollama | **locked default** — a second model resident at once would OOM the GPU. `LLM_MODEL_OVERRIDE` env var (unset = today's exact behavior) swaps the live pipeline to a candidate model for deliberate, one-off local A/B tests — never `export` it, always pass inline on the invocation line. Live-test candidates so far: Fanar-2-27B-Instruct (`MODEL_CONFIGS["fanar-2"]`), prior generation Fanar-1-9B-Instruct (removed 2026-08-07 — instruction-following too weak, per owner's own live test). See `eval/BASELINES.md`. |
 | Diacritization | CATT tashkeel | Fusha replies only; `CATT_ENABLED=0` to disable |
-| TTS | k2-fsa/OmniVoice | zero-shot voice clone, 24 kHz, fp16 |
+| TTS (Najdi/Fusha/English/mixed) | k2-fsa/OmniVoice | zero-shot voice clone, 24 kHz, fp16 |
+| TTS (Egyptian, default) | VoiceTut-TTS (`mohammedaly22/VoiceTut-TTS`) | 2026-08-13, replaces OmniVoice for Egyptian — a fine-tune of THIS project's own OmniVoice base (confirmed via HF's `base_model:k2-fsa/OmniVoice` tag), zero new deps. Root cause this exists at all: OmniVoice's own training data is only ~23h Egyptian vs ~204h Najdi/~1484h MSA. Promoted to default after live-testing beat the two prior Egyptian candidates — Habibi-TTS and Lahgtna-OmniVoice, both fully removed (packages uninstalled, checkpoints deleted). Cleanest license/data story of any Egyptian candidate tried: Apache-2.0 confirmed with no discrepancy, ~380h disclosed Egyptian training audio. `VOICETUT_TTS_ENABLED=0` reverts to OmniVoice+Egyptian-clip. See `eval/BASELINES.md`. |
 | Audio encoding | lameenc (PCM → MP3) | complete MP3 per sentence (browser `decodeAudioData`) |
-| Python isolation | venv (no Docker — no sudo) | GPU works out of the box |
+| Python isolation | venv (no Docker — no sudo) | GPU works out of the box; managed with `uv`, not `pip` (pip is intentionally absent — see `requirements.txt`) |
 
-Env knobs: `LLM_NUM_CTX` (default 8192), `CATT_ENABLED` (default 1), `OMNIVOICE_MODEL`, `OMNIVOICE_DEVICE`.
+Env knobs: `LLM_NUM_CTX` (default 8192), `CATT_ENABLED` (default 1), `OMNIVOICE_MODEL`, `OMNIVOICE_DEVICE`, `VOICETUT_TTS_ENABLED` (default 1).
 
 ---
 
@@ -62,7 +65,9 @@ Env knobs: `LLM_NUM_CTX` (default 8192), `CATT_ENABLED` (default 1), `OMNIVOICE_
 6. `on_first_audio` fires exactly once before the first `ws.send_bytes`
 7. GPU inference wrapped in `asyncio.to_thread()` — never block the event loop
 8. Models loaded lazily via module-level cache + `threading.Lock`
-9. `language` gates CATT tashkeel (values `"standard arabic"`/`"najdi arabic"`/`"egyptian arabic"`) AND selects the voice: `"egyptian arabic"` turns use the Egyptian clone prompt with `language="egyptian arabic"` passed to `OmniVoice.generate()` (clip pins timbre, language id pins pronunciation); **every other value keeps the exact legacy call** — Saudi clone prompt, no `language` kwarg (pinned by `eval/test_tts_args.py`). Missing Egyptian clip → warn + Saudi fallback, never a startup failure. `generate()` is serialized behind `_gen_lock` (barge-in orphan-synthesis race)
+9. `language` gates CATT tashkeel (Fusha only) AND selects the voice/engine: `"egyptian arabic"` turns try, in order, VoiceTut-TTS (only if `VOICETUT_TTS_ENABLED=1` — the default Egyptian engine since 2026-08-13), then OmniVoice's Egyptian clone prompt + `language="egyptian arabic"` if VoiceTut is disabled/unavailable/fails for that sentence, then the Saudi clone prompt if the Egyptian clip is also missing; **every other value keeps the exact legacy call** — Saudi clone prompt via OmniVoice, no `language` kwarg (pinned by `eval/test_tts_args.py`). `generate()`/VoiceTut's `generate()` are both serialized behind the same `_gen_lock` (barge-in orphan-synthesis race; neither is documented thread-safe). VoiceTut-TTS is a fine-tune of THIS project's own OmniVoice base (confirmed via HF's `base_model:k2-fsa/OmniVoice` tag + `config.json`'s `model_type == "omnivoice"`) — Apache-2.0 confirmed in both the model card AND HF's structured license field (no discrepancy), ~380h disclosed Egyptian training audio.
+   **History** (full detail in `eval/BASELINES.md`): three prior Egyptian engines were tried and removed before VoiceTut-TTS became the default. Habibi-TTS (SWivid/Habibi-TTS, F5-TTS architecture) was the original default from 2026-07-30 — its EGY checkpoint license was stated Apache-2.0 in README prose but tagged `cc-by-nc-sa-4.0` at the HF-repo level, an unresolved discrepancy. Lahgtna-OmniVoice (`oddadmix/lahgtna-omnivoice-v2`) was an opt-in A/B candidate from the same date — training data entirely undisclosed, no license tag at all. EGTTS-V0.1 (`OmarSamir/EGTTS-V0.1`) was trialed 2026-08-11 and removed 2026-08-12 — explicitly non-commercial (CPML). Owner live-tested all of them by ear; none was judged satisfactory until VoiceTut-TTS. Habibi and Lahgtna were both **fully removed 2026-08-13** (code, packages, downloaded checkpoints) once VoiceTut-TTS was confirmed better — not left dormant.
+   **Egyptian tashkeel — tried twice, removed twice** (full detail in `eval/BASELINES.md`): CAMeL Tools' BERT-based Egyptian disambiguator was wired as an opt-in diacritizer (mirroring CATT's Fusha role) on 2026-08-10, found "not working perfectly" by ear, and fully removed the same day. Re-added 2026-08-13 for a second live test at the owner's explicit request (independent corroboration had emerged in the meantime — Lahgtna-OmniVoice's own v1→v3 model card documents the identical finding from a different angle, that diacritized Egyptian text "loses coherence and babbles"). The second live test also came back bad ("completely bad" per the owner), and it was fully removed again 2026-08-13. Current state: no diacritization step for Egyptian at all — the research conclusion behind both attempts (Egyptian colloquial mostly lacks the i'rab/case-ending ambiguity CATT exists to resolve for Fusha) has now been confirmed by ear twice; not planned to be tried a third time absent a genuinely different candidate.
 
 ## Project files
 
@@ -75,7 +80,7 @@ first_voice_test/
 ├── stt.py                 ← Silero VAD, FRCRN denoiser, faster-whisper
 ├── routing.py             ← language/dialect detection, text-acceptance policy
 ├── llm.py                 ← Ollama client, model config, prompt construction
-├── tts_omnivoice_v1.py    ← TTS module (OmniVoice + CATT; Saudi + Egyptian clone prompts)
+├── tts_omnivoice_v1.py    ← TTS module (OmniVoice + CATT + VoiceTut-TTS; Saudi + Egyptian voices)
 ├── static/index.html      ← browser client
 ├── static/review.html     ← /review dashboard (latency + transcripts table)
 ├── start_server.sh        ← starts Ollama (flash-attn, q8_0 KV) + the server
