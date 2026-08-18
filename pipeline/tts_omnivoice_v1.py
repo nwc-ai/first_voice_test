@@ -24,7 +24,7 @@ from typing import Any, AsyncIterator, Optional
 import numpy as np
 import torch
 
-from routing import looks_najdi  # per-sentence Najdi check for the CATT gate
+from .routing import looks_najdi  # per-sentence Najdi check for the CATT gate
 
 # CATT tashkeel (diacritization) — Fusha-only. CATT is an MSA-trained diacritizer; applying it
 # to Najdi text mis-vocalizes dialect words (e.g. مرة "very" comes back misread as the unrelated
@@ -65,7 +65,9 @@ def _expand_abbreviations(text: str) -> str:
 SAMPLE_RATE = 24000  # OmniVoice output sample rate
 
 # Reference clip + its exact transcript define the cloned voice (Saudi male).
-_REF_AUDIO = os.path.join(os.path.dirname(__file__), "voices", "silma-tts-saudi-24k.wav")
+# This module lives in pipeline/ — voices/ sits at the project root, one level up.
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_REF_AUDIO = os.path.join(_PROJECT_ROOT, "voices", "silma-tts-saudi-24k.wav")
 _REF_TEXT  = "الثقافة السعودية فيها عراقة وتاريخ عميق، وقيم إسلامية راسخة، وعادات وتقاليد قبلية أصيلة متوارثة."
 
 _MODEL_ID = os.environ.get("OMNIVOICE_MODEL", "k2-fsa/OmniVoice")

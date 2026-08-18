@@ -1,14 +1,14 @@
 """
-test_local.py — Full pipeline test for tts_omnivoice_v1.py
-==========================================================
+test_local.py — Full pipeline test for pipeline/tts_omnivoice_v1.py
+===================================================================
 No microphone needed. This script:
   1. Sends a hardcoded question to Ollama (qwen3.5:27b) as the LLM
-  2. Streams the LLM tokens through tts_omnivoice_v1.py
-  3. Saves each synthesized sentence as an MP3 file in ./test_output/
+  2. Streams the LLM tokens through pipeline/tts_omnivoice_v1.py
+  3. Saves each synthesized sentence as an MP3 file in <project root>/test_output/
   4. Prints timing info so you can see how fast each step is
 
 Run with:
-    /home/taha/first_voice_test/.venv/bin/python test_local.py
+    /home/taha/first_voice_test/.venv/bin/python /home/taha/first_voice_test/scripts/test_local.py
 """
 
 import asyncio
@@ -18,11 +18,13 @@ import time
 
 import httpx
 
-# Add project root to path so we can import tts_omnivoice_v1
-sys.path.insert(0, os.path.dirname(__file__))
-import tts_omnivoice_v1
+# This script lives in scripts/ — the project root (with the pipeline/ package)
+# is one level up.
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _PROJECT_ROOT)
+from pipeline import tts_omnivoice_v1
 
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "test_output")
+OUTPUT_DIR = os.path.join(_PROJECT_ROOT, "test_output")
 OLLAMA_URL = "http://localhost:11434/api/generate"
 MODEL = "qwen3.5:27b"
 

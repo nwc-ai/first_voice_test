@@ -1,6 +1,6 @@
 #!/bin/bash
 # Run this to start the voice server.
-# Usage: bash /home/taha/first_voice_test/start_server.sh
+# Usage: bash /home/taha/first_voice_test/scripts/start_server.sh
 
 VENV=/home/taha/first_voice_test/.venv/lib/python3.12/site-packages/nvidia
 OLLAMA_NEW=/home/taha/.ollama_bin_new
@@ -40,5 +40,5 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 exec /home/taha/first_voice_test/.venv/bin/python /home/taha/first_voice_test/server.py
 
-#LLM_NUM_CTX=16384 bash /home/taha/first_voice_test/start_server.sh
+#LLM_NUM_CTX=16384 bash /home/taha/first_voice_test/scripts/start_server.sh
 

@@ -12,7 +12,7 @@ from typing import Any, Optional
 
 import httpx
 
-from routing import (
+from .routing import (
     NAJDI_GLOSSARY,
     NAJDI_GRAMMAR_RULE,
     WANTS_ARABIC_RE,

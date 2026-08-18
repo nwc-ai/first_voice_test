@@ -1,11 +1,11 @@
 """
 server.py — Real-architecture voice pipeline for first_voice_test
 =================================================================
-Orchestration only — the pipeline pieces live in their own modules:
-  stt.py              Silero VAD, FRCRN denoiser, faster-whisper
-  routing.py          language/dialect detection, text-acceptance policy
-  llm.py              Ollama client, model config, prompt construction
-  tts_omnivoice_v1.py OmniVoice synthesis + CATT tashkeel
+Orchestration only — the pipeline pieces live in the pipeline/ package:
+  pipeline/stt.py              Silero VAD, FRCRN denoiser, faster-whisper
+  pipeline/routing.py          language/dialect detection, text-acceptance policy
+  pipeline/llm.py              Ollama client, model config, prompt construction
+  pipeline/tts_omnivoice_v1.py OmniVoice synthesis + CATT tashkeel
 
 Architecture:
   - AudioWorklet: continuous 512-sample Float32 chunks at 16kHz
@@ -14,7 +14,7 @@ Architecture:
   - asyncio.gather for true concurrency
 
 Run with:
-    bash /home/taha/first_voice_test/start_server.sh
+    bash /home/taha/first_voice_test/scripts/start_server.sh
 """
 
 import asyncio
@@ -60,10 +60,8 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 sys.path.insert(0, os.path.dirname(__file__))
-import llm
-import routing
-import stt
-import tts_omnivoice_v1  # type: ignore[import-untyped]  # in-process OmniVoice TTS
+from pipeline import llm, routing, stt
+from pipeline import tts_omnivoice_v1  # type: ignore[import-untyped]  # in-process OmniVoice TTS
 import time as _time
 import datetime
 

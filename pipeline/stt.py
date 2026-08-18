@@ -15,7 +15,7 @@ from typing import Any, Optional
 import numpy as np
 import torch
 
-from routing import ALLOWED_LANGS, ARABIC_SCRIPT_REMAP
+from .routing import ALLOWED_LANGS, ARABIC_SCRIPT_REMAP
 
 # VAD tuning (matches real architecture)
 MIN_SPEECH_CHUNKS       = 4   # 4 × 32 ms ≈ 128 ms to confirm speech onset

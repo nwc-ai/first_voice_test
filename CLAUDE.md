@@ -2,7 +2,7 @@
 
 ## What this project is
 
-A standalone testing ground for a local Arabic/English conversational voice pipeline, running entirely on the server's RTX 5090 GPU. The TTS module built here (`tts_omnivoice_v1.py`) is a drop-in replacement for the SILMA-based TTS backend (`voice/app/pipeline/tts.py`) inside the main `nwc-copilot` voice assistant project at `/home/taha/devproject`.
+A standalone testing ground for a local Arabic/English conversational voice pipeline, running entirely on the server's RTX 5090 GPU. The TTS module built here (`pipeline/tts_omnivoice_v1.py`) is a drop-in replacement for the SILMA-based TTS backend (`voice/app/pipeline/tts.py`) inside the main `nwc-copilot` voice assistant project at `/home/taha/devproject`.
 
 **Language scope:** English, Fusha (MSA), Najdi Arabic, and Arabic-English code-switching. Only these two Arabic dialects are supported — Hijazi and Gulf/Khaleeji were both removed; a request for either now falls through to Fusha.
 
@@ -29,7 +29,7 @@ Barge-in: playback pauses instantly on speech onset; the turn is cancelled only 
 
 - Machine: `devserver`, user `taha`, GPU **RTX 5090 32 GB**, CUDA 13.0
 - GitHub org: `nwc-ai` — **repo is public: never commit logs/transcripts**
-- Run with: `bash /home/taha/first_voice_test/start_server.sh` (starts Ollama if needed)
+- Run with: `bash /home/taha/first_voice_test/scripts/start_server.sh` (starts Ollama if needed)
 
 ## Tech stack
 
@@ -48,7 +48,7 @@ Env knobs: `LLM_NUM_CTX` (default 8192), `CATT_ENABLED` (default 1), `OMNIVOICE_
 
 ---
 
-## TTS module contract (`tts_omnivoice_v1.py`)
+## TTS module contract (`pipeline/tts_omnivoice_v1.py`)
 
 1. Public API:
    ```python
@@ -67,20 +67,22 @@ Env knobs: `LLM_NUM_CTX` (default 8192), `CATT_ENABLED` (default 1), `OMNIVOICE_
 
 ```
 first_voice_test/
-├── CLAUDE.md              ← you are here
+├── CLAUDE.md                       ← you are here
 ├── README.md
 ├── requirements.txt
-├── server.py              ← FastAPI app: WS orchestration only (models below do the work)
-├── stt.py                 ← Silero VAD, FRCRN denoiser, faster-whisper
-├── routing.py             ← language/dialect detection, text-acceptance policy
-├── llm.py                 ← Ollama client, model config, prompt construction
-├── tts_omnivoice_v1.py    ← TTS module (OmniVoice + CATT)
-├── static/index.html      ← browser client
-├── static/review.html     ← /review dashboard (latency + transcripts table)
-├── start_server.sh        ← starts Ollama (flash-attn, q8_0 KV) + the server
-├── test_local.py          ← no-mic pipeline test (LLM → TTS → MP3 files)
-├── voices/                ← Saudi reference clips for voice cloning
-└── logs/                  ← interactions.jsonl (gitignored — private)
+├── server.py                       ← entry point. FastAPI app: WS orchestration only
+├── pipeline/                       ← the pipeline package (models do the work)
+│   ├── stt.py                      ← Silero VAD, FRCRN denoiser, faster-whisper
+│   ├── routing.py                  ← language/dialect detection, text-acceptance policy
+│   ├── llm.py                      ← Ollama client, model config, prompt construction
+│   └── tts_omnivoice_v1.py         ← TTS module (OmniVoice + CATT)
+├── scripts/
+│   ├── start_server.sh             ← starts Ollama (flash-attn, q8_0 KV) + the server
+│   └── test_local.py               ← no-mic pipeline test (LLM → TTS → MP3 files)
+├── static/index.html               ← browser client
+├── static/review.html              ← /review dashboard (latency + transcripts table)
+├── voices/                         ← Saudi reference clips for voice cloning
+└── logs/                           ← interactions.jsonl (gitignored — private)
 ```
 
 ## Key decisions
@@ -88,7 +90,7 @@ first_voice_test/
 - **LLM locked to qwen3.5:27b** — model selector removed; two LLMs don't fit VRAM alongside the in-process stack.
 - **`num_predict: 300` stays** — very long answers may truncate mid-sentence; accepted tradeoff to keep voice replies bounded.
 - **CATT gated to Fusha and applied per-sentence on the reply text** — MSA-trained; it mis-vocalizes Najdi words.
-- **Najdi vs Fusha routing** is lexicon-based on normalized text (see `_NAJDI_MARKERS`/`looks_najdi` in `routing.py` and the MSA→Najdi glossary in the Najdi turn instruction).
+- **Najdi vs Fusha routing** is lexicon-based on normalized text (see `_NAJDI_MARKERS`/`looks_najdi` in `pipeline/routing.py` and the MSA→Najdi glossary in the Najdi turn instruction).
 - **MP3 format** — browser `decodeAudioData` needs complete containers, not raw PCM.
 - **Sentence-level synthesis** — balances first-audio latency vs audio completeness.
 - **No Docker** — no sudo; venv only.
