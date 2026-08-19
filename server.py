@@ -62,6 +62,7 @@ from fastapi.staticfiles import StaticFiles
 sys.path.insert(0, os.path.dirname(__file__))
 from pipeline import llm, routing, stt
 from pipeline import tts_omnivoice_v1  # type: ignore[import-untyped]  # in-process OmniVoice TTS
+from pipeline import tts_voicetut_v1   # type: ignore[import-untyped]  # Egyptian TTS (lazy-loaded)
 import time as _time
 import datetime
 
@@ -94,6 +95,13 @@ def _load_all_blocking():
     tts_omnivoice_v1.load_models()
     print("OmniVoice TTS ready.")
     stt.load_models_blocking()
+    if os.environ.get("VOICETUT_PRELOAD", "0") == "1":
+        # Default is LAZY (loaded on the first Egyptian turn): sessions that never
+        # speak Egyptian keep the exact pre-Egyptian memory profile, and startup
+        # can't OOM on the extra ~3 GB. Flip this on once free VRAM is measured.
+        print("Loading VoiceTut TTS (VOICETUT_PRELOAD=1)...")
+        tts_voicetut_v1.load_models()
+        print("VoiceTut TTS ready.")
 
 
 _models_ready = asyncio.Event()
@@ -149,6 +157,50 @@ async def get_logs() -> dict[str, Any]:
 
 async def _single_token(text: str):
     yield text
+
+
+def _visible_history(
+    history: list[dict[str, str]],
+    tts_language: Optional[str],
+    explicit: bool,
+) -> list[dict[str, str]]:
+    """Arabic dialect-history isolation (applies to ALL Arabic dialect pairs).
+
+    Each stored history entry carries a "tag": the tts_language its turn was
+    generated under ("najdi arabic" / "standard arabic" / "egyptian arabic", or
+    None for English and mixed turns). An Arabic turn's prompt sees only history
+    from the SAME dialect plus None-tagged (English/mixed) pairs — prior turns in
+    a DIFFERENT Arabic dialect are withheld so they can't contaminate the reply
+    dialect. Withheld, not deleted: switching back restores that context.
+
+    English/mixed turns (tts_language None) and explicit language/dialect
+    requests ("قلها بالمصري", "in English") see the FULL history — English↔Arabic
+    transitions behave exactly as before this feature, and restating a prior
+    answer in another dialect needs that answer visible.
+
+    Tags are always stripped from the returned messages (Ollama gets pure
+    {role, content}).
+    """
+    if tts_language is None or explicit:
+        return [{"role": m["role"], "content": m["content"]} for m in history]
+    return [
+        {"role": m["role"], "content": m["content"]}
+        for m in history
+        if m.get("tag") in (tts_language, None)
+    ]
+
+
+async def _pick_tts(tts_language: Optional[str]):
+    """Select the TTS module for this turn. Egyptian → VoiceTut (lazy-loaded);
+    everything else → the unchanged OmniVoice path. If VoiceTut can't load
+    (missing weights, OOM), fall back to OmniVoice for the turn — a reply in the
+    Saudi voice beats displayed text with no audio."""
+    if tts_language == "egyptian arabic":
+        ok = await asyncio.to_thread(tts_voicetut_v1.ensure_loaded)
+        if ok:
+            return tts_voicetut_v1
+        print("  [tts] VoiceTut unavailable — OmniVoice fallback for this turn")
+    return tts_omnivoice_v1
 
 
 # ── WebSocket endpoint ────────────────────────────────────────────────────────
@@ -402,13 +454,16 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.send_json({"event": "transcript", "text": text, "lang": lang})
                 print(f"LLM start: {text!r}")
 
-                turn_content, tts_language = llm.build_turn(text, lang)
-                # Full message list for /api/chat: system + rolling history + this wrapped turn.
+                turn_content, tts_language, explicit = llm.build_turn(text, lang)
+                # Full message list for /api/chat: system + the dialect-filtered
+                # view of the rolling history (see _visible_history) + this turn.
                 messages = (
                     [{"role": "system", "content": llm.SYSTEM_PROMPT}]
-                    + history
+                    + _visible_history(history, tts_language, explicit)
                     + [{"role": "user", "content": turn_content}]
                 )
+                # Engine dispatch: Egyptian → VoiceTut, everything else → OmniVoice.
+                tts_mod = await _pick_tts(tts_language)
 
                 # ── Timing & response collection ──────────────────────────────
                 t_llm_start      = _time.monotonic()
@@ -443,7 +498,7 @@ async def websocket_endpoint(ws: WebSocket):
                         await inner.aclose()
 
                 try:
-                    await tts_omnivoice_v1.stream_tts_to_ws(  # type: ignore[no-untyped-call]
+                    await tts_mod.stream_tts_to_ws(  # type: ignore[no-untyped-call]
                         token_gen=_collecting_token_gen(),
                         ws=ws,
                         cancel_event=cancel_event,
@@ -460,9 +515,14 @@ async def websocket_endpoint(ws: WebSocket):
                         # Guard: skip fallback if barge-in fired — the user already
                         # spoke again and hearing "I didn't catch that" over their
                         # next utterance is confusing.
-                        fallback = "I didn't catch that. Could you please repeat?" if lang != "ar" else "عذراً، لم أفهم. ممكن تعيد؟"
+                        if tts_language == "egyptian arabic":
+                            fallback = "معلش، مش سامعك كويس. ممكن تقول تاني؟"
+                        elif lang == "ar":
+                            fallback = "عذراً، لم أفهم. ممكن تعيد؟"
+                        else:
+                            fallback = "I didn't catch that. Could you please repeat?"
                         print(f"  [warn] empty LLM response — sending fallback")
-                        await tts_omnivoice_v1.stream_tts_to_ws(  # type: ignore[no-untyped-call]
+                        await tts_mod.stream_tts_to_ws(  # type: ignore[no-untyped-call]
                             token_gen=_single_token(fallback),
                             ws=ws,
                             cancel_event=cancel_event,
@@ -473,8 +533,11 @@ async def websocket_endpoint(ws: WebSocket):
                         # Commit the completed turn to rolling memory — CLEAN user text
                         # (not the wrapped prompt) so per-turn instructions never accumulate.
                         # Barge-in (cancelled, partial answer) is intentionally NOT stored.
-                        history.append({"role": "user", "content": text})
-                        history.append({"role": "assistant", "content": final_response})
+                        # "tag" = the route this reply was generated under; it drives the
+                        # dialect-history isolation in _visible_history and is stripped
+                        # before anything is sent to Ollama.
+                        history.append({"role": "user", "content": text, "tag": tts_language})
+                        history.append({"role": "assistant", "content": final_response, "tag": tts_language})
                         if len(history) >= llm.MAX_HISTORY_TURNS * 2:
                             del history[: len(history) - llm.MAX_HISTORY_TURNS * 2]
 
@@ -496,6 +559,7 @@ async def websocket_endpoint(ws: WebSocket):
                         "ts":           datetime.datetime.now().isoformat(timespec="seconds"),
                         "model":        active_model,
                         "lang":         lang,
+                        "route":        tts_language,   # dialect route actually used (None = English/mixed)
                         "transcript":   text,
                         "response":     "".join(response_tokens),
                         "latency": {

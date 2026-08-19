@@ -83,6 +83,111 @@ def looks_najdi(text: str) -> bool:
     return bool(_NAJDI_PHRASES_RE.search(norm))
 
 
+# ── Marker tiers for Arabic dialect routing (Najdi / Egyptian / Fusha) ────────
+# اللي/عشان/لسا/لسه/يلا are heavily used in BOTH Najdi and Egyptian (pan-dialectal).
+# They STAY in _NAJDI_MARKERS — looks_najdi() above is also the per-sentence CATT
+# gate inside the TTS module, and removing them would change protected behavior
+# (Najdi recall + tashkeel gating). For ROUTING they are non-decisive: only
+# exclusive evidence picks a dialect; shared markers alone keep today's Najdi
+# routing (see route_arabic below).
+_SHARED_MARKERS = {normalize_ar(w) for w in {"اللي", "عشان", "لسا", "لسه", "يلا"}}
+_NAJDI_EXCLUSIVE = _NAJDI_MARKERS - _SHARED_MARKERS   # derived — the literal set is untouched
+
+# Distinctly-Egyptian words only (normalized). Same philosophy as _NAJDI_MARKERS:
+# high-precision, exact-token. Negation morphology and demonstratives are the
+# strongest published Egyptian signals; discourse particles the noisiest.
+_EGY_EXCLUSIVE_MARKERS = {normalize_ar(w) for w in {
+    "دلوقتي", "دلوقت",                    # "now" — Najdi uses الحين
+    "النهارده", "النهاردة",               # "today" — stored with its ال built in
+    "امبارح",                             # "yesterday" — Najdi uses أمس/البارح
+    "ازاي", "ازيك",                       # "how / how are you" — Najdi uses كيف
+    "عايز", "عايزه", "عايزة", "عاوز", "عاوزه", "عاوزة",   # "want" — Najdi uses أبغى
+    "بتاع", "بتاعه", "بتاعة", "بتاعت",     # possessive "of/belonging to"
+    "كده", "كدا",                         # "like this" — Najdi uses كذا (different token)
+    "ده", "دي",                           # post-nominal demonstratives — Najdi uses هذا/ذا
+    "مش",                                 # negator — Najdi uses مو/مب, Fusha ليس
+    "فين",                                # "where" — Najdi uses وين
+    # Curated suffix-negation forms (a generic ما...ش regex would false-positive
+    # on MSA words like مندهش/مفتش — only these vetted forms match):
+    "مفيش", "مافيش", "معرفش", "ماعرفش", "مقدرش", "ماقدرش",
+    "محدش", "معنديش", "معندكش",
+
+    # Evaluated and REJECTED (do not add back without eval):
+    #   ليه    — real Gulf/Najdi usage ("ليه ما جيت؟"); would steal Gulf turns.
+    #            Present in EGYPTIAN_CARD as output vocabulary only.
+    #   ايه    — Gulf/Najdi إيه = "yes"; matched only via _EGY_PHRASES_RE contexts.
+    #   دول    — MSA دُوَل "countries" (الدول ال-strips to دول). Valid Egyptian, but
+    #            as a MARKER it misroutes MSA sentences about countries. Never on
+    #            any forbidden list either (hard user constraint).
+    #   جداً/جدا — valid Egyptian; never a marker, never forbidden (hard constraint).
+    #   بكره/برضه/ايوه/خالص/قوي/معلش/حاجة/كمان/منين — shared with Gulf/Hijazi or MSA.
+    #   عربية  — "car" collides with "Arabic"; طب — MSA "medicine"; يبقى — MSA "remains".
+    #   بص    — STT-confusable with بس; ه-future regex (هروح...) — too broad.
+}}
+# Multi-word Egyptian expressions — safe contexts for ايه.
+_EGY_PHRASES_RE = re.compile(
+    r"\bعامل ايه\b|\bعامله ايه\b|\bايه الاخبار\b|\bايه رايك\b",
+    re.UNICODE,
+)
+# ال-strip candidates match only ≥4-char markers: ألفين ("two thousand", common in
+# amounts) normalizes to الفين and would ال-strip to فين — an MSA/Najdi sentence
+# about money must not route Egyptian. The guard also structurally blocks strip
+# matches onto the short markers ده/دي/مش/كده.
+_EGY_STRIP_SAFE = {m for m in _EGY_EXCLUSIVE_MARKERS if len(m) >= 4}
+
+
+def looks_egyptian(text: str) -> bool:
+    """True if the text carries distinctly-Egyptian vocabulary. Same algorithm
+    family as looks_najdi: normalize → exact tokens → ال-strip → و/ف-deprefix →
+    phrases. Used ONLY for routing (route_arabic) — never for the CATT gate."""
+    norm = normalize_ar(text)
+    words = set(_AR_WORD_RE.findall(norm))
+    if words & _EGY_EXCLUSIVE_MARKERS:
+        return True
+    stripped = {w[2:] for w in words if w.startswith("ال") and len(w) > 4}
+    if stripped & _EGY_STRIP_SAFE:
+        return True
+    # و/ف conjunction-prefix strip (وفين، وعايز، فكده...). Remainder must be ≥3
+    # chars so a strip can never yield the 2-char demonstratives: Najdi ودي
+    # ("I'd like" — "ودي أشوف") must NOT become دي. بـ is deliberately NOT
+    # stripped: بدي is Levantine "I want", and ب+verb is dialect-ambiguous
+    # (Egyptian habitual بروح vs Gulf FUTURE بروح — same string, opposite signal).
+    deprefixed = {w[1:] for w in words if w[0] in "وف" and len(w) > 3}
+    if deprefixed & _EGY_EXCLUSIVE_MARKERS:
+        return True
+    return bool(_EGY_PHRASES_RE.search(norm))
+
+
+def looks_najdi_exclusive(text: str) -> bool:
+    """looks_najdi restricted to markers NOT shared with Egyptian. Same algorithm.
+    Used only for routing priority — looks_najdi itself stays the CATT gate and
+    the shared-tier fallback, unchanged."""
+    norm = normalize_ar(text)
+    words = set(_AR_WORD_RE.findall(norm))
+    stripped = {w[2:] for w in words if w.startswith("ال") and len(w) > 4}
+    if (words | stripped) & _NAJDI_EXCLUSIVE:
+        return True
+    return bool(_NAJDI_PHRASES_RE.search(norm))
+
+
+def route_arabic(text: str) -> str:
+    """Route a spoken-Arabic utterance to a reply dialect (tts_language value).
+
+    Priority: Najdi-exclusive > Egyptian-exclusive > shared-only (→ Najdi,
+    today's behavior) > Fusha. Shared markers never route to Egyptian; for any
+    input with zero Egyptian-exclusive evidence this returns exactly what
+    `"najdi arabic" if looks_najdi(text) else "standard arabic"` returned before
+    Egyptian existed (branch 1 ∪ branch 3 ≡ looks_najdi). Najdi wins conflicts
+    ("وش يعني دلوقتي؟" → Najdi) — protecting the established dialects comes first."""
+    if looks_najdi_exclusive(text):
+        return "najdi arabic"
+    if looks_egyptian(text):
+        return "egyptian arabic"
+    if looks_najdi(text):
+        return "najdi arabic"
+    return "standard arabic"
+
+
 # ── Language detection & acceptance policy (moved verbatim from server.py) ────
 
 ALLOWED_LANGS = {"ar", "en"}
@@ -117,13 +222,24 @@ WANTS_ENGLISH_RE = re.compile(
 )
 
 # Specific Arabic dialect requests, checked when the user asks for Arabic output.
-# First match wins; falls back to Fusha/MSA when no dialect is named. Only Najdi
-# and Fusha are supported dialects — a named request for any other dialect
-# (Gulf/Khaleeji, Hijazi, Egyptian, ...) simply doesn't match here and falls
+# First match wins; falls back to Fusha/MSA when no dialect is named. Najdi,
+# Egyptian and Fusha are the supported dialects — a named request for any other
+# dialect (Gulf/Khaleeji, Hijazi, ...) simply doesn't match here and falls
 # through to the default Fusha routing in build_turn.
+# The Egyptian pattern is deliberately TIGHT: this regex runs on every turn, and
+# "مصري/egyptian" is common CONTENT ("الاقتصاد المصري", "egyptian pyramids") — a
+# bare match would hijack those turns into explicit-dialect requests. Request
+# phrasings only.
 _DIALECT_PATTERNS: list[tuple[str, Any, str]] = [
     ("Najdi", re.compile(r"\bnajdi\b|نجدي|النجدية", re.IGNORECASE | re.UNICODE),
      "the Najdi dialect (use وش/إيش, أبغى, زين, الحين, ماله, يبيلك)"),
+    ("Egyptian", re.compile(
+        r"بالمصري|باللهجه\s+المصريه|باللهجة\s+المصرية"
+        r"|\b(in|into|to)\s+egyptian\s+arabic\b"
+        r"|\begyptian\s+dialect\b"
+        r"|speak\s+egyptian|reply\s+in\s+egyptian|answer\s+in\s+egyptian|say\s+it\s+in\s+egyptian",
+        re.IGNORECASE | re.UNICODE),
+     "Egyptian Arabic (Masri — use دلوقتي, عايز, إزاي, كده, مش)"),
     ("Fusha", re.compile(r"\bfus-?ha\b|\bmsa\b|modern\s+standard|classical\s+arabic|الفصحى|فصحى",
                          re.IGNORECASE | re.UNICODE),
      "Modern Standard Arabic (Fusha)"),
@@ -228,4 +344,30 @@ NAJDI_NO_OTHER_DIALECTS_RULE = (
     "Do NOT use باش (that is Moroccan Arabic for 'so that' — use عشان instead). "
     "Do NOT add ش to the end of ما for negation, e.g. ما فيش or ما تنفعش (that is "
     "Egyptian Arabic — Najdi negates with plain ما, e.g. ما في, ما ينفع)."
+)
+
+
+# ── Egyptian card for LLM turn instructions ──────────────────────────────────
+# Embedded per-turn on Egyptian-routed turns ONLY — Fusha/Najdi/English turns
+# never see it (zero token cost, zero cross-dialect prompt risk).
+# PINK-ELEPHANT RULE (see NAJDI_NO_OTHER_DIALECTS_RULE above for the measured
+# failure): every rule states Egyptian's own correct forms POSITIVELY; no other
+# dialect's tokens are ever named as forbidden. جداً/جدا is valid Egyptian and is
+# deliberately not discouraged anywhere; دول appears only as positive vocabulary.
+EGYPTIAN_CARD = (
+    "Use these Egyptian (Masri) word choices instead of their MSA equivalents: "
+    "دلوقتي (الآن)، النهارده (اليوم)، امبارح (أمس)، إزاي (كيف)، ايه (ماذا)، فين (أين)، "
+    "ليه (لماذا)، عايز/عايزة (أريد)، مش (ليس)، كده (هكذا)، ده/دي/دول (هذا/هذه/هؤلاء)، "
+    "اللي (الذي/التي)، برضه (أيضاً)، كمان (أيضاً)، معلش (لا بأس)، خالص (إطلاقاً)، "
+    "أوي (كثيراً)، بتاع (خاص بـ)، حاجة (شيء)، عشان (لأن/لكي)، لسه (ما زال). "
+    "These words are the same in Egyptian and MSA — use them as-is: "
+    "رقم، قراءة، معدل، ضغط، تدفق، خزان، عداد، محطة، خط، تنبيه، "
+    "مشكلة، انقطاع، تسريب، نظيف، سريع، شكراً، لا. "
+    "Grammar — write natural spoken Cairo Egyptian: "
+    "Negate verbs by wrapping them with ما...ش: ما عرفتش، مفيش، ما قدرتش. "
+    "Use مش before nouns, adjectives and future verbs: مش عارف، مش هروح. "
+    "Mark habitual/progressive present with the بـ prefix: بقول، بيشرح، بنروح — "
+    "this prefix is correct Egyptian. Mark future with هـ: هروح، هيبقى، هنشوف. "
+    "Put demonstratives AFTER the noun: الكتاب ده، الفكرة دي. "
+    "Use بتاع for possession: العداد بتاعك."
 )

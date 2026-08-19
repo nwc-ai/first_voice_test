@@ -41,4 +41,9 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 exec /home/taha/first_voice_test/.venv/bin/python /home/taha/first_voice_test/server.py
 
 #LLM_NUM_CTX=16384 bash /home/taha/first_voice_test/scripts/start_server.sh
+#
+# Fanar-2 A/B testing (opt-in; qwen3.5:27b is the default when LLM_MODEL is unset).
+# Restart Ollama first (kill the serve process — this script restarts it) so the
+# previously pinned 27B is released; two 27Bs don't fit in 32 GB:
+#LLM_MODEL='hf.co/mradermacher/Fanar-2-27B-Instruct-i1-GGUF:i1-Q4_K_M' bash /home/taha/first_voice_test/scripts/start_server.sh
 

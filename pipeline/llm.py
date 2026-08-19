@@ -13,12 +13,15 @@ from typing import Any, Optional
 import httpx
 
 from .routing import (
+    EGYPTIAN_CARD,
     NAJDI_GLOSSARY,
     NAJDI_GRAMMAR_RULE,
     WANTS_ARABIC_RE,
     WANTS_ENGLISH_RE,
+    looks_egyptian,
     looks_najdi,
     requested_dialect,
+    route_arabic,
 )
 
 OLLAMA_URL      = "http://localhost:11434/api/generate"   # used only for the startup warm-up
@@ -33,8 +36,14 @@ MAX_HISTORY_TURNS = 3   # rolling memory: keep only the last N user+assistant pa
 # warm-up and the chat requests so the model loads once at this size (no reload).
 LLM_NUM_CTX = int(os.environ.get("LLM_NUM_CTX", "8192"))
 
-MODEL = "qwen3.5:27b"   # the one and only LLM — warmed at startup so the first turn isn't a
-                        # cold load, and pinned in VRAM (a second model alongside it would OOM).
+# Default LLM — warmed at startup so the first turn isn't a cold load, and pinned
+# in VRAM (a second model alongside it would OOM). LLM_MODEL is an OPT-IN override
+# for live A/B testing (e.g. Fanar-2 27B); unset ⇒ behavior is byte-identical to
+# the hardcoded default. Switching models requires a restart (and restarting
+# Ollama, so the previously pinned 27B is released — two 27Bs don't fit):
+#   LLM_MODEL='hf.co/mradermacher/Fanar-2-27B-Instruct-i1-GGUF:i1-Q4_K_M' \
+#       bash scripts/start_server.sh
+MODEL = os.environ.get("LLM_MODEL", "qwen3.5:27b")
 
 SYSTEM_PROMPT = (
     "You are a voice assistant that supports Arabic dialects and English ONLY. "
@@ -105,6 +114,26 @@ MODEL_CONFIGS: dict[str, dict[str, Any]] = {
             "stop":             _STOP_SEQUENCES,
         },
     },
+    "fanar": {
+        # Fanar-2-27B-Instruct (Gemma-3-27B base, community GGUF) — opt-in A/B
+        # model via LLM_MODEL. think:False — Ollama recognizes the model's
+        # thinking capability and maps this onto the template's no_thinking
+        # empty-<think> prefill; strip_think_tokens (below) is the safety net if
+        # reasoning text still leaks into content. Sampling: Gemma-3-family
+        # defaults (top_p 0.95 / top_k 64) with temperature lowered for factual
+        # grounding, mirroring the qwen3.5 rationale. Tunable during A/B.
+        "extra":   {"think": False},
+        "options": {
+            "temperature":  0.6,
+            "top_p":        0.95,
+            "top_k":        64,
+            "num_predict":  300,
+            # MUST match the warm-up num_ctx or the model reloads at first chat
+            # (and risks a double-load OOM while pinned) — same lesson as qwen.
+            "num_ctx":      LLM_NUM_CTX,
+            "stop":         _STOP_SEQUENCES,
+        },
+    },
     "default": {
         "extra":   {},
         "options": {
@@ -131,30 +160,42 @@ def get_model_config(model_name: str) -> dict[str, Any]:
 
 # ── Per-turn language routing → LLM instruction + TTS language ────────────────
 
-def build_turn(text: str, lang: str) -> tuple[str, Optional[str]]:
+def build_turn(text: str, lang: str) -> tuple[str, Optional[str], bool]:
     """Decide this turn's reply-language instruction and TTS language.
 
-    Returns (turn_content, tts_language):
+    Returns (turn_content, tts_language, explicit):
       turn_content — the wrapped user message sent to the LLM (instruction + style
         rules + the raw text). Only the CLEAN text is stored in history, so these
         per-turn instructions never accumulate across turns.
-      tts_language — gates CATT tashkeel to Fusha (the TTS module re-checks each
-        synthesized sentence with the same Najdi detector, so a reply that comes
-        back Najdi is never MSA-diacritized regardless of this value).
+      tts_language — selects the TTS engine (Egyptian → VoiceTut, everything else
+        → OmniVoice) and gates CATT tashkeel to Fusha (the TTS module re-checks
+        each synthesized sentence with the same Najdi detector, so a reply that
+        comes back Najdi is never MSA-diacritized regardless of this value).
+      explicit — the user explicitly requested an output language/dialect this
+        turn ("بالمصري", "in English", ...). Used by server.py to bypass the
+        Arabic dialect-history isolation: restating a prior answer in another
+        dialect NEEDS that prior answer visible.
     """
-    # A named dialect (Najdi/Fusha) counts as an Arabic request on its own — even
-    # when "Arabic" isn't said, e.g. "in Najdi Arabic". Other named dialects
-    # (Gulf, Hijazi, ...) aren't recognized here and fall through to the
-    # lang-detected routing below (Fusha, unless Najdi markers are present).
+    # A named dialect (Najdi/Egyptian/Fusha) counts as an Arabic request on its
+    # own — even when "Arabic" isn't said, e.g. "in Najdi Arabic". Other named
+    # dialects (Gulf, Hijazi, ...) aren't recognized and fall through to the
+    # lang-detected routing below.
     req_name, req_phrase = requested_dialect(text)
     wants_arabic = req_name is not None or bool(WANTS_ARABIC_RE.search(text))
+    explicit = wants_arabic or bool(WANTS_ENGLISH_RE.search(text))
 
     if req_name == "Najdi":
         tts_language = "najdi arabic"
+    elif req_name == "Egyptian":
+        tts_language = "egyptian arabic"
     elif wants_arabic:
         tts_language = "standard arabic"   # Fusha, explicitly named or default
     elif lang == "ar":
-        tts_language = "najdi arabic" if looks_najdi(text) else "standard arabic"
+        # Tiered dialect router: Najdi-exclusive > Egyptian-exclusive >
+        # shared-markers(→Najdi, pre-Egyptian behavior) > Fusha. For any input
+        # with no Egyptian-exclusive evidence this returns exactly what the old
+        # `"najdi arabic" if looks_najdi(text) else "standard arabic"` returned.
+        tts_language = route_arabic(text)
     else:
         tts_language = None   # English or mixed AR+EN
     print(f"  [tts-lang] {tts_language}")
@@ -174,18 +215,35 @@ def build_turn(text: str, lang: str) -> tuple[str, Optional[str]]:
             "regardless of the language they wrote in. Reply ONLY in English."
         )
     elif lang == "mixed":
-        lang_instruction = (
-            "The user is mixing Arabic and English (code-switching). "
-            "Reply naturally in the SAME mix of Arabic and English they used. "
-            "For the Arabic parts, use Najdi if their Arabic carries Najdi markers, "
-            "otherwise use Fusha (Modern Standard Arabic). "
-            "Do NOT force a reply into all-Arabic or all-English."
-        )
+        if looks_egyptian(text) and not looks_najdi(text):
+            # Exclusive Egyptian evidence and zero Najdi evidence (shared markers
+            # included — any Najdi hint keeps the original instruction below).
+            lang_instruction = (
+                "The user is mixing Arabic and English (code-switching). "
+                "Reply naturally in the SAME mix of Arabic and English they used. "
+                "For the Arabic parts, use Egyptian Arabic (Masri) — their Arabic "
+                "carries Egyptian markers. "
+                "Do NOT force a reply into all-Arabic or all-English."
+            )
+        else:
+            lang_instruction = (
+                "The user is mixing Arabic and English (code-switching). "
+                "Reply naturally in the SAME mix of Arabic and English they used. "
+                "For the Arabic parts, use Najdi if their Arabic carries Najdi markers, "
+                "otherwise use Fusha (Modern Standard Arabic). "
+                "Do NOT force a reply into all-Arabic or all-English."
+            )
     elif lang == "ar":
-        if looks_najdi(text):
+        if tts_language == "najdi arabic":
             lang_instruction = (
                 "The user spoke Najdi Arabic. Reply ONLY in the Najdi dialect — "
                 "do not switch to Fusha/MSA and do not mix in other dialects."
+            )
+        elif tts_language == "egyptian arabic":
+            lang_instruction = (
+                "The user spoke Egyptian Arabic (اللهجة المصرية). Reply ONLY in "
+                "everyday spoken Egyptian Arabic — do not switch to Fusha/MSA and "
+                "do not mix in other dialects."
             )
         else:
             lang_instruction = (
@@ -203,6 +261,10 @@ def build_turn(text: str, lang: str) -> tuple[str, Optional[str]]:
     # its docstring in routing.py, it measurably increased the leak it targeted.
     if tts_language == "najdi arabic":
         lang_instruction += "\n" + NAJDI_GLOSSARY + "\n" + NAJDI_GRAMMAR_RULE
+    # Egyptian turns (detected or explicitly requested) get the Masri card —
+    # vocabulary + positively-phrased grammar. Never appended on any other route.
+    elif tts_language == "egyptian arabic":
+        lang_instruction += "\n" + EGYPTIAN_CARD
 
     # Per-turn wrapper: lang routing + style + anti-hallucination. This wraps ONLY
     # the current user message; the clean `text` is what gets stored in history,
@@ -218,17 +280,92 @@ def build_turn(text: str, lang: str) -> tuple[str, Optional[str]]:
         "No markdown.\n\n"
         f"User: {text}"
     )
-    return turn_content, tts_language
+    return turn_content, tts_language, explicit
 
 
 # ── LLM token generator ───────────────────────────────────────────────────────
+
+_THINK_OPEN  = "<think>"
+_THINK_CLOSE = "</think>"
+
+
+async def strip_think_tokens(token_gen: Any):
+    """Remove <think>...</think> spans from a token stream.
+
+    Safety net for Fanar-2 (Gemma-3 GGUF): its thinking delimiters are PLAIN TEXT,
+    not special tokens. think:False in the fanar config should suppress reasoning
+    at the template level; if it ever leaks anyway, this keeps reasoning text out
+    of the spoken reply. Tags may arrive split across tokens, so a small tail is
+    buffered until it can't be a tag prefix. Applied ONLY when "fanar" is in the
+    model name — the qwen path never goes through here.
+    """
+    buf = ""
+    thinking = False
+    try:
+        async for tok in token_gen:
+            buf += tok
+            out = ""
+            while True:
+                if thinking:
+                    idx = buf.find(_THINK_CLOSE)
+                    if idx == -1:
+                        # Discard thinking text, keep only a tail that could be
+                        # the start of the close tag.
+                        buf = buf[-(len(_THINK_CLOSE) - 1):] if buf else ""
+                        break
+                    buf = buf[idx + len(_THINK_CLOSE):]
+                    thinking = False
+                else:
+                    idx = buf.find(_THINK_OPEN)
+                    if idx == -1:
+                        # Emit everything except a tail that could be the start
+                        # of an open tag.
+                        keep = 0
+                        for k in range(min(len(_THINK_OPEN) - 1, len(buf)), 0, -1):
+                            if _THINK_OPEN.startswith(buf[-k:]):
+                                keep = k
+                                break
+                        out += buf[:len(buf) - keep]
+                        buf = buf[len(buf) - keep:]
+                        break
+                    out += buf[:idx]
+                    buf = buf[idx + len(_THINK_OPEN):]
+                    thinking = True
+            if out:
+                yield out
+        if buf and not thinking:
+            yield buf   # trailing partial-tag lookalike that never completed
+    finally:
+        aclose = getattr(token_gen, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
 
 async def ollama_chat_token_gen(
     messages: list[dict[str, str]],         # [system, ...history..., current user]
     model: str = MODEL,
     on_first_token: Optional[Any] = None,   # callable fired once on first token
 ):
-    """Stream a chat completion from Ollama's /api/chat (carries conversation history)."""
+    """Stream a chat completion, with the fanar think-stripper when applicable."""
+    inner = _ollama_chat_stream(messages, model, on_first_token)
+    if "fanar" in model.lower():
+        inner = strip_think_tokens(inner)
+    try:
+        async for token in inner:
+            yield token
+    finally:
+        # Propagate close so cancelling TTS tears down the httpx stream.
+        aclose = getattr(inner, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+
+async def _ollama_chat_stream(
+    messages: list[dict[str, str]],
+    model: str = MODEL,
+    on_first_token: Optional[Any] = None,
+):
+    """Raw streaming chat completion from Ollama's /api/chat (carries conversation history)."""
     cfg = get_model_config(model)
     payload: dict[str, Any] = {
         "model":      model,
