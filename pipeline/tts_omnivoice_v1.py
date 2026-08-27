@@ -45,22 +45,70 @@ _HEAD_PROBE_CHARS = 30  # leading text buffered before deciding whether to strip
 # ── Arabic abbreviation / glued-digit expander (verbatim from tts_silma_v1.py) ───────────
 # Spelled-out forms read better aloud; runs on each sentence before synthesis.
 _ABBREV_RULES: list[tuple[re.Pattern, str]] = [
+    # Emergency number 911 in ARABIC context must be read digit-by-digit — the
+    # model read it as a cardinal ("تسعمئة وأحد عشر") in live QA (owner fix
+    # 2026-08-24). Arabic-char lookbehind keeps English sentences untouched.
+    (re.compile(r'(?<=[؀-ۿ])(\s+)911\b', re.UNICODE), r'\1تسعة واحد واحد'),
     (re.compile(r'(\d)\s*هـ(?=[\s،,.:؟!]|$)', re.UNICODE), r'\1 هجري'),
     (re.compile(r'(\d)\s*م(?=[\s،,.:؟!]|$)', re.UNICODE), r'\1 ميلادي'),
-    (re.compile(r'ق\.?\s*م(?=[\s،,.:؟!]|$)', re.UNICODE), 'قبل الميلاد'),
+    # BC abbreviation — the dot is MANDATORY and a preceding Arabic letter is
+    # forbidden: with an optional dot (the original Silma-era rule) this matched
+    # the bare قم at the end of رقم/الرقم and spoke "الرقبل الميلاد" for
+    # "الرقم" (latent bug found 2026-08-24 via the digit-pipeline staging check).
+    (re.compile(r'(?<![؀-ۿ])ق\.\s*م(?=[\s،,.:؟!]|$)', re.UNICODE), 'قبل الميلاد'),
     (re.compile(r'(\d)\s*%', re.UNICODE), r'\1 بالمئة'),
+    # Symbol expansions (owner-approved 2026-08-27 — CATT deletes all of these):
+    (re.compile(r'([0-9٠-٩])\s*٪', re.UNICODE), r'\1 بالمئة'),       # Arabic percent sign
+    (re.compile(r'﷼', re.UNICODE), 'ريال'),                           # riyal sign
+    (re.compile(r'(?<=[\s0-9٠-٩])\+(?=[\s0-9٠-٩])', re.UNICODE), 'زائد'),
+    (re.compile(r'(?<=[\s0-9٠-٩])=(?=[\s0-9٠-٩])', re.UNICODE), 'يساوي'),
     (re.compile(r'\bد\.\s+', re.UNICODE), 'دكتور '),
     (re.compile(r'\bأ\.\s+', re.UNICODE), 'أستاذ '),
     (re.compile(r'\bإلخ\b', re.UNICODE), 'وما إلى ذلك'),
-    # Separate digits glued to Arabic letters (e.g. "و2013" → "و 2013").
-    (re.compile(r'([؀-ۿ])(\d)', re.UNICODE), r'\1 \2'),
-    (re.compile(r'(\d)([؀-ۿ])', re.UNICODE), r'\1 \2'),
+    # Separate digits glued to Arabic LETTERS (e.g. "و2013" → "و 2013"). The class
+    # excludes the eastern digits ٠-٩ (same Unicode block as the letters) — with
+    # the raw block, ٥٠ was split into "٥ ٠" because ٥ matches \d and ٠ matched
+    # the "letter" side (latent bug found 2026-08-27).
+    (re.compile(r'([؀-ٟ٪-ۿ])(\d)', re.UNICODE), r'\1 \2'),
+    (re.compile(r'(\d)([؀-ٟ٪-ۿ])', re.UNICODE), r'\1 \2'),
 ]
 
 def _expand_abbreviations(text: str) -> str:
     for pattern, replacement in _ABBREV_RULES:
         text = pattern.sub(replacement, text)
     return text
+
+
+# ── Arabic number verbalization (owner-approved 2026-08-24) ───────────────────────────────
+# Digits in Arabic sentences are verbalized to words before synthesis: CATT deletes
+# raw digits outright (verified), and the voice model improvises unreliable readings
+# for those that survive. INTEGERS ONLY — num2words' Arabic decimals are broken
+# ("3.5" → "ثلاثة , خمسون"), so decimals/times stay as digits and survive via the
+# CATT digit-guard instead. Runs AFTER _expand_abbreviations (so the 911
+# digit-by-digit rule and %/هـ expansions win first) and only on sentences that
+# contain Arabic characters — English sentences keep their digits. Synthesis-time
+# only: the DISPLAYED text keeps the digits (better for meter readings on screen).
+_ARABIC_CHAR_RE = re.compile(r"[؀-ۿ]")
+_EASTERN_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+# Standalone integers only: a following ./,/: blocks the match ONLY when another
+# digit comes after it (a true decimal/time like 3.5 or 10:30) — a sentence-final
+# "8192." is still an integer and must convert.
+_INT_RUN_RE = re.compile(r"(?<![\d.,:])\d+(?!\d)(?![.,:]\d)")
+
+
+def _digits_to_arabic_words(text: str) -> str:
+    if not _ARABIC_CHAR_RE.search(text):
+        return text
+    text = text.translate(_EASTERN_DIGITS)
+
+    def _one(m: re.Match) -> str:
+        try:
+            from num2words import num2words
+            return num2words(int(m.group(0)), lang="ar")
+        except Exception:
+            return m.group(0)   # leave digits — the CATT digit-guard keeps them alive
+
+    return _INT_RUN_RE.sub(_one, text)
 
 SAMPLE_RATE = 24000  # OmniVoice output sample rate
 
@@ -121,12 +169,100 @@ def _get_tashkeel_model():
         return _tashkeel_model
 
 
+# CATT DELETES Latin-script words from its output (verified 2026-08-20: "Hydrate",
+# "WaterMinder", "NWC" all vanished) AND raw digits (verified 2026-08-24: "911",
+# "60", "123" all vanished — numbers in Fusha replies were silently dropped from
+# the audio). Sentences containing either are diacritized SEGMENT-WISE
+# (owner-approved): Arabic runs go through CATT, Latin/digit runs are preserved
+# verbatim. Integers are normally verbalized to Arabic words BEFORE this point
+# (_digits_to_arabic_words) — the digit guard here is the safety net for shapes
+# the verbalizer skips (decimals, times). Pure-Arabic sentences never enter this
+# path — they keep the original single do_tashkeel call, byte-identical to before.
+# The third alternative protects PUNCTUATION (owner-approved 2026-08-27): CATT
+# deletes it everywhere — every mid-sentence ، pause cue was being stripped from
+# Fusha prosody. With punctuation protected, nearly every sentence takes the
+# segment-wise path (the single-call pure-Arabic path only fires for punctless
+# fragments) and CATT diacritizes clause-by-clause between the marks.
+_PROTECTED_RUN_RE = re.compile(
+    r"([A-Za-z][A-Za-z0-9'&._\-]*(?:[ \t]+[A-Za-z][A-Za-z0-9'&._\-]*)*"
+    r"|[0-9٠-٩]+(?:[.,:][0-9٠-٩]+)*"
+    r"|[.،؛:؟!«»\"'()\[\]…]+)"
+)
+_SEG_EDGES_RE = re.compile(r"^(\s*)(.*?)(\s*)$", re.DOTALL)
+_AR_LETTER_RE = re.compile(r"[ء-ي]")
+
+
+def _tashkeel_mixed(text: str) -> str:
+    model = _get_tashkeel_model()
+    parts = _PROTECTED_RUN_RE.split(text)   # odd indices = captured Latin/digit runs
+    out: list[str] = []
+    for i, part in enumerate(parts):
+        if not part:
+            continue
+        if i % 2 == 1:
+            out.append(part)            # Latin/digit run — verbatim, CATT never sees it
+            continue
+        edges = _SEG_EDGES_RE.match(part)
+        prefix, core, suffix = edges.group(1), edges.group(2), edges.group(3)  # type: ignore[union-attr]
+        # CATT trims edge whitespace from its output — without keeping the edges
+        # ourselves, the diacritized Arabic would glue onto the neighbouring
+        # English word. Cores with <2 Arabic letters (stray punctuation or a lone
+        # conjunction between two English words) pass through untouched.
+        if len(_AR_LETTER_RE.findall(core)) >= 2:
+            core = model.do_tashkeel(core, verbose=False)
+        out.append(prefix + core + suffix)
+    return "".join(out)
+
+
+# ── Pausal-form (waqf) restoration (owner-approved 2026-08-22) ────────────────
+# CATT writes the FULL grammatical case ending on the sentence-final word
+# (الْإِسْلَامِ، شَهْرِيٍّ) and deletes the sentence-final punctuation. Spoken MSA reads
+# the last word before a pause in PAUSAL form — the final short vowel/tanwīn is
+# silent — so OmniVoice pronouncing the written ending was audible as an extra
+# vowel at sentence ends (live QA finding). Strip that final mark only (shadda
+# kept: الْحَجِّ → الْحَجّ; tanwīn-fath before a final alif drops but the alif stays:
+# بَرًّا → بَرّا) and re-append the sentence's original trailing ./؟ so the
+# pause/question prosody cue survives. Mid-sentence tashkeel is untouched.
+# The final combining-mark cluster (optionally followed by a bare alif, as in
+# tanwīn-fath spellings like بَرًّا). Shadda and a vowel mark can combine in
+# EITHER Unicode order (both render identically), so the cluster is filtered
+# char-by-char instead of end-anchored: vowels/tanwīn drop, shadda/sukūn stay.
+_FINAL_CLUSTER_RE = re.compile(r"([ً-ْ]+)(ا?)$")
+_VOWEL_MARKS = set("ًٌٍَُِ")   # tanwīn + short vowels
+_TRAILING_PUNCT_RE = re.compile(r"([.،؟!:؛]+)\s*$")
+
+
+def _restore_pausal_form(original: str, diacritized: str) -> str:
+    # Trailing punctuation may now SURVIVE CATT (protected runs) — peel it first
+    # so the pausal strip still reaches the final word, then reattach.
+    pm = _TRAILING_PUNCT_RE.search(diacritized)
+    if pm:
+        body, tail = diacritized[:pm.start()], pm.group(1)
+    else:
+        body, tail = diacritized, ""
+    m = _FINAL_CLUSTER_RE.search(body)
+    if m:
+        kept = "".join(c for c in m.group(1) if c not in _VOWEL_MARKS)
+        body = body[:m.start()] + kept + m.group(2)
+    if not tail:
+        p = _TRAILING_PUNCT_RE.search(original)
+        if p:
+            tail = p.group(1)
+    return body + tail
+
+
 def _add_tashkeel(text: str) -> str:
     """Diacritize Arabic text via CATT for pronunciation precision. CATT is a third-party ONNX
     model, not internal code — falls back to the plain (undiacritized) text on any error rather
-    than let a tashkeel hiccup break a turn's audio."""
+    than let a tashkeel hiccup break a turn's audio. Sentences containing Latin words or digit
+    runs are diacritized segment-wise (_tashkeel_mixed) so CATT cannot delete them; the
+    result is then put in pausal form with its punctuation restored (_restore_pausal_form)."""
     try:
-        return _get_tashkeel_model().do_tashkeel(text, verbose=False)
+        if not _PROTECTED_RUN_RE.search(text):
+            diacritized = _get_tashkeel_model().do_tashkeel(text, verbose=False)
+        else:
+            diacritized = _tashkeel_mixed(text)
+        return _restore_pausal_form(text, diacritized)
     except Exception as e:
         print(f"[tts] tashkeel failed, using plain text: {type(e).__name__}: {e}")
         return text
@@ -227,7 +363,8 @@ async def stream_tts_to_ws(
             if cancel_event.is_set():                               # (b)
                 continue   # keep draining so the producer's sentinel is reached
             try:
-                audio_bytes = await _synthesize_mp3(_expand_abbreviations(sentence), language)
+                audio_bytes = await _synthesize_mp3(
+                    _digits_to_arabic_words(_expand_abbreviations(sentence)), language)
             except Exception as e:
                 print(f"[tts] synthesis failed, skipping sentence: {type(e).__name__}: {e}")
                 continue

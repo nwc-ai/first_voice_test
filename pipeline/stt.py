@@ -211,6 +211,17 @@ _AR_INITIAL_PROMPT = (
     "وهل في تسريب أو انقطاع في الخط أو الخزان، والمعدل زين ولا فيه تنبيه."
 )
 
+# English decoding bias: proper nouns the user says constantly that Whisper mangles
+# without context — live logs show "Najdi" transcribed as "Najiti", "90", and "HD",
+# and "Hajj season" as "harsh season", in English sentences. faster-whisper's
+# hotwords are a soft decoding hint, applied ONLY to English decodes (and the
+# English candidate of the dual-decode tiebreak below) — the Arabic path keeps its
+# _AR_INITIAL_PROMPT behavior byte-identical (protected Najdi Arabic STT).
+# Scope rule: each word here was OBSERVED misheard live first — no speculative
+# domain lists (a genuine "harsh season" now tips slightly toward "Hajj season";
+# acceptable in this domain, but that cost scales with every word added).
+_EN_HOTWORDS = "Najdi, Najdi dialect, Najdi Arabic, Hajj, Hajj season"
+
 # Above this confidence, trust Whisper's "this sounds like Urdu/Farsi/..." guess as
 # genuinely-Arabic-misheard and force it straight to Arabic (the remap's original
 # purpose: real Najdi/Gulf speech does get misheard as Urdu). Below it, the guess
@@ -245,7 +256,8 @@ def transcribe_blocking(audio: Any) -> tuple[str, str]:
     if lang in ARABIC_SCRIPT_REMAP and lang_prob < _AR_REMAP_HIGH_CONFIDENCE:
         print(f"  whisper: ambiguous {lang} ({lang_prob:.2f}) — dual-decode tiebreak")
         ar_kwargs = dict(_TRANSCRIBE_KWARGS, initial_prompt=_AR_INITIAL_PROMPT)
-        en_text, en_conf = _decode_candidate(audio, "en", _TRANSCRIBE_KWARGS)
+        en_kwargs = dict(_TRANSCRIBE_KWARGS, hotwords=_EN_HOTWORDS)
+        en_text, en_conf = _decode_candidate(audio, "en", en_kwargs)
         ar_text, ar_conf = _decode_candidate(audio, "ar", ar_kwargs)
         print(f"  whisper: tiebreak en_conf={en_conf:.2f} ar_conf={ar_conf:.2f}")
         if max(en_conf, ar_conf) < WORD_CONF_THRESHOLD:
@@ -267,6 +279,8 @@ def transcribe_blocking(audio: Any) -> tuple[str, str]:
     kwargs = dict(_TRANSCRIBE_KWARGS)
     if lang == "ar":
         kwargs["initial_prompt"] = _AR_INITIAL_PROMPT
+    elif lang == "en":
+        kwargs["hotwords"] = _EN_HOTWORDS
     segments, _info = _whisper_model.transcribe(audio, language=lang, **kwargs)
     segments = list(segments)
     all_words: list[Any] = [w for s in segments for w in (s.words or [])]

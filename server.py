@@ -95,13 +95,18 @@ def _load_all_blocking():
     tts_omnivoice_v1.load_models()
     print("OmniVoice TTS ready.")
     stt.load_models_blocking()
-    if os.environ.get("VOICETUT_PRELOAD", "0") == "1":
-        # Default is LAZY (loaded on the first Egyptian turn): sessions that never
-        # speak Egyptian keep the exact pre-Egyptian memory profile, and startup
-        # can't OOM on the extra ~3 GB. Flip this on once free VRAM is measured.
-        print("Loading VoiceTut TTS (VOICETUT_PRELOAD=1)...")
-        tts_voicetut_v1.load_models()
-        print("VoiceTut TTS ready.")
+    if os.environ.get("VOICETUT_PRELOAD", "1") == "1":
+        # Preload by default (owner decision 2026-08-20): the 2026-08-19 live
+        # session proved the ~3 GB fits alongside the pinned 27B + whisper +
+        # FRCRN + OmniVoice, and preloading removes the first-Egyptian-turn load
+        # hitch. VOICETUT_PRELOAD=0 reverts to lazy loading if VRAM gets tight
+        # (bigger quants, larger LLM_NUM_CTX).
+        # ensure_loaded (non-throwing), NOT load_models: unlike OmniVoice, a
+        # VoiceTut failure must never block startup — Egyptian turns just fall
+        # back to OmniVoice (failure is logged by ensure_loaded itself).
+        print("Loading VoiceTut TTS (preload default; VOICETUT_PRELOAD=0 for lazy)...")
+        if tts_voicetut_v1.ensure_loaded():
+            print("VoiceTut TTS ready.")
 
 
 _models_ready = asyncio.Event()
@@ -162,9 +167,9 @@ async def _single_token(text: str):
 def _visible_history(
     history: list[dict[str, str]],
     tts_language: Optional[str],
-    explicit: bool,
 ) -> list[dict[str, str]]:
-    """Arabic dialect-history isolation (applies to ALL Arabic dialect pairs).
+    """Arabic dialect-history isolation — ALL Arabic pairs, NO exceptions
+    (owner decision 2026-08-21, superseding the earlier explicit-request bypass).
 
     Each stored history entry carries a "tag": the tts_language its turn was
     generated under ("najdi arabic" / "standard arabic" / "egyptian arabic", or
@@ -173,15 +178,21 @@ def _visible_history(
     a DIFFERENT Arabic dialect are withheld so they can't contaminate the reply
     dialect. Withheld, not deleted: switching back restores that context.
 
-    English/mixed turns (tts_language None) and explicit language/dialect
-    requests ("قلها بالمصري", "in English") see the FULL history — English↔Arabic
-    transitions behave exactly as before this feature, and restating a prior
-    answer in another dialect needs that answer visible.
+    The original design let explicit requests ("قلها بالمصري") see the FULL
+    history so a prior answer could be restated in the new dialect. Live Fanar
+    testing (2026-08-21) proved that bypass was the contamination vector: the
+    model COPIED the visible other-dialect answer (structure and dialect words)
+    instead of generating fresh. Nothing bypasses anymore. Consequences, both
+    intentional: (a) re-asking the same question in another Arabic dialect now
+    yields a fresh, dialect-pure answer; (b) a bare "say that in X" right after
+    an answer in a DIFFERENT Arabic dialect loses its referent — the user re-asks
+    the full question. English answers stay visible to every turn (tag None), so
+    "tell me that in <dialect>" after an ENGLISH answer still works.
 
     Tags are always stripped from the returned messages (Ollama gets pure
     {role, content}).
     """
-    if tts_language is None or explicit:
+    if tts_language is None:
         return [{"role": m["role"], "content": m["content"]} for m in history]
     return [
         {"role": m["role"], "content": m["content"]}
@@ -198,6 +209,7 @@ async def _pick_tts(tts_language: Optional[str]):
     if tts_language == "egyptian arabic":
         ok = await asyncio.to_thread(tts_voicetut_v1.ensure_loaded)
         if ok:
+            print("  [tts] engine: voicetut (Egyptian)")
             return tts_voicetut_v1
         print("  [tts] VoiceTut unavailable — OmniVoice fallback for this turn")
     return tts_omnivoice_v1
@@ -258,7 +270,7 @@ async def websocket_endpoint(ws: WebSocket):
         asyncio.create_task(_close_old())
     ws = _LockedWS(ws)  # all subsequent sends are serialized
     active_model = llm.MODEL
-    print(f"Browser connected. Model: {active_model}  TTS: omnivoice")
+    print(f"Browser connected. Model: {active_model}  TTS: per-turn (omnivoice / voicetut for Egyptian)")
 
     # Keepalive starts BEFORE the model-loading wait: a cold start takes minutes
     # and the browser watchdog reconnects after 10 s of silence — pings must
@@ -454,12 +466,15 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.send_json({"event": "transcript", "text": text, "lang": lang})
                 print(f"LLM start: {text!r}")
 
-                turn_content, tts_language, explicit = llm.build_turn(text, lang)
+                # _explicit no longer gates history (owner decision 2026-08-21 —
+                # the bypass was the cross-dialect contamination vector); kept in
+                # build_turn's return for observability and possible future use.
+                turn_content, tts_language, _explicit = llm.build_turn(text, lang)
                 # Full message list for /api/chat: system + the dialect-filtered
                 # view of the rolling history (see _visible_history) + this turn.
                 messages = (
-                    [{"role": "system", "content": llm.SYSTEM_PROMPT}]
-                    + _visible_history(history, tts_language, explicit)
+                    [{"role": "system", "content": llm.ACTIVE_SYSTEM_PROMPT}]
+                    + _visible_history(history, tts_language)
                     + [{"role": "user", "content": turn_content}]
                 )
                 # Engine dispatch: Egyptian → VoiceTut, everything else → OmniVoice.
@@ -485,6 +500,7 @@ async def websocket_endpoint(ws: WebSocket):
                         llm.ollama_chat_token_gen(
                             messages, active_model,
                             on_first_token=_on_first_token_cb,
+                            route=tts_language,   # enables fanar-only dialect guards
                         )
                     )
                     try:

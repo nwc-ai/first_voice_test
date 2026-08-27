@@ -45,20 +45,114 @@ _HEAD_PROBE_CHARS = 30  # leading text buffered before deciding whether to strip
 
 # ── Arabic abbreviation / glued-digit expander (verbatim from tts_omnivoice_v1.py) ───────
 _ABBREV_RULES: list[tuple[re.Pattern, str]] = [
+    # Emergency number 911 must be read digit-by-digit, not as a cardinal
+    # (owner fix 2026-08-24; same rule as the OmniVoice module).
+    (re.compile(r'(?<=[؀-ۿ])(\s+)911\b', re.UNICODE), r'\1تسعة واحد واحد'),
     (re.compile(r'(\d)\s*هـ(?=[\s،,.:؟!]|$)', re.UNICODE), r'\1 هجري'),
     (re.compile(r'(\d)\s*م(?=[\s،,.:؟!]|$)', re.UNICODE), r'\1 ميلادي'),
-    (re.compile(r'ق\.?\s*م(?=[\s،,.:؟!]|$)', re.UNICODE), 'قبل الميلاد'),
+    # Dot mandatory + no preceding Arabic letter — the dotless variant matched the
+    # قم inside رقم/الرقم and corrupted the audio (same fix as the OmniVoice module).
+    (re.compile(r'(?<![؀-ۿ])ق\.\s*م(?=[\s،,.:؟!]|$)', re.UNICODE), 'قبل الميلاد'),
     (re.compile(r'(\d)\s*%', re.UNICODE), r'\1 بالمئة'),
+    # Symbol expansions (owner-approved 2026-08-27; same rules as the OmniVoice module):
+    (re.compile(r'([0-9٠-٩])\s*٪', re.UNICODE), r'\1 بالمئة'),       # Arabic percent sign
+    (re.compile(r'﷼', re.UNICODE), 'ريال'),                           # riyal sign
+    (re.compile(r'(?<=[\s0-9٠-٩])\+(?=[\s0-9٠-٩])', re.UNICODE), 'زائد'),
+    (re.compile(r'(?<=[\s0-9٠-٩])=(?=[\s0-9٠-٩])', re.UNICODE), 'يساوي'),
     (re.compile(r'\bد\.\s+', re.UNICODE), 'دكتور '),
     (re.compile(r'\bأ\.\s+', re.UNICODE), 'أستاذ '),
     (re.compile(r'\bإلخ\b', re.UNICODE), 'وما إلى ذلك'),
-    # Separate digits glued to Arabic letters (e.g. "و2013" → "و 2013").
-    (re.compile(r'([؀-ۿ])(\d)', re.UNICODE), r'\1 \2'),
-    (re.compile(r'(\d)([؀-ۿ])', re.UNICODE), r'\1 \2'),
+    # Separate digits glued to Arabic LETTERS (e.g. "و2013" → "و 2013"). Class
+    # excludes eastern digits ٠-٩ so ٥٠ isn't split into "٥ ٠" (same latent-bug
+    # fix as the OmniVoice module, 2026-08-27).
+    (re.compile(r'([؀-ٟ٪-ۿ])(\d)', re.UNICODE), r'\1 \2'),
+    (re.compile(r'(\d)([؀-ٟ٪-ۿ])', re.UNICODE), r'\1 \2'),
 ]
 
 def _expand_abbreviations(text: str) -> str:
     for pattern, replacement in _ABBREV_RULES:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+# ── Arabic number verbalization (owner-approved 2026-08-24; same design as the
+# OmniVoice module) ────────────────────────────────────────────────────────────
+# INTEGERS ONLY (num2words' Arabic decimals are broken); runs after
+# _expand_abbreviations so the 911 digit-by-digit rule wins first; synthesis-time
+# only — displayed text keeps the digits. num2words produces MSA number words;
+# if they sound too formal on the Egyptian voice, colloquialize the divergent
+# ones (ثلاثة→تلاتة، اثنين→اتنين، ثمانية→تمانية) as pronunciation fixes later.
+_ARABIC_CHAR_RE = re.compile(r"[؀-ۿ]")
+_EASTERN_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+# Standalone integers only (same rule as the OmniVoice module): ./,/: blocks the
+# match only when another digit follows (true decimals/times stay digits).
+_INT_RUN_RE = re.compile(r"(?<![\d.,:])\d+(?!\d)(?![.,:]\d)")
+
+
+def _digits_to_arabic_words(text: str) -> str:
+    if not _ARABIC_CHAR_RE.search(text):
+        return text
+    text = text.translate(_EASTERN_DIGITS)
+
+    def _one(m: re.Match) -> str:
+        try:
+            from num2words import num2words
+            return num2words(int(m.group(0)), lang="ar")
+        except Exception:
+            return m.group(0)
+
+    return _INT_RUN_RE.sub(_one, text)
+
+
+# ── Egyptian pronunciation fixes (synthesis-time ONLY) ────────────────────────────────────
+# VoiceTut mispronounced these exact words in live voice testing (2026-08-20); the
+# hand-diacritized forms force the intended reading. Applied only to the text sent
+# to synthesis — the display text stays undiacritized (same precedent as
+# _expand_abbreviations). Exact-token matches (\b-bounded, so prefixed forms like
+# والمشي/بالمشي do NOT match — add those only if live testing shows they also
+# mispronounce). This module has NO CATT by design (MSA-trained, wrong for
+# Egyptian) — targeted per-word fixes like these are the Egyptian alternative.
+_EGY_PRONUNCIATION_FIXES: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\bالمشي\b", re.UNICODE), "اَلْمَشْي"),
+    (re.compile(r"\bمشاهدة\b", re.UNICODE), "مُشَاهَدَة"),
+    (re.compile(r"\bالتنبؤ\b", re.UNICODE), "اَلتَّنَبُّؤ"),
+    # QA report 2026-08-21 (Leen) — proposed diacritizations, PENDING native-speaker
+    # confirmation; edit here if any are corrected. بعرفة/ويضمنوا are the prefixed
+    # forms actually observed in live replies (exact-token matching needs them).
+    (re.compile(r"\bالهجري\b", re.UNICODE), "الهِجْرِيّ"),
+    (re.compile(r"\bعرفة\b", re.UNICODE), "عَرَفَة"),
+    (re.compile(r"\bبعرفة\b", re.UNICODE), "بِعَرَفَة"),
+    (re.compile(r"\bشهرية\b", re.UNICODE), "شَهْرِيَّة"),
+    (re.compile(r"\bيضمنوا\b", re.UNICODE), "يَضْمَنُوا"),
+    (re.compile(r"\bويضمنوا\b", re.UNICODE), "وَيَضْمَنُوا"),
+    # مخبريا with tanween before or on the alef, or bare (lookahead instead of a
+    # trailing \b — the tanween mark breaks word-boundary matching):
+    (re.compile(r"\bمخبريً?اً?(?=[\s،,.:؟!)\"]|$)", re.UNICODE), "مَخْبَرِيًّا"),
+    # Owner fixes 2026-08-24 (live listening):
+    # يبلغهم was pronounced يَبْلُغ "reaches" instead of يِبَلَّغ "reports/informs".
+    # Only the pronoun-suffixed forms are mapped — bare يبلغ is a REAL homograph
+    # (يَبْلُغ المبلغ "the amount reaches..." is legitimate billing language) and
+    # must never be blind-replaced.
+    (re.compile(r"\bويبلغهم\b", re.UNICODE), "وِيبَلَّغْهُم"),
+    (re.compile(r"\bيبلغهم\b", re.UNICODE), "يِبَلَّغْهُم"),
+    # بيرفعوا came out with a doubled ر (بيرّفعوا) — sukūn on ر forces single:
+    (re.compile(r"\bوبيرفعوا\b", re.UNICODE), "وبِيِرْفَعُوا"),
+    (re.compile(r"\bبيرفعوا\b", re.UNICODE), "بِيِرْفَعُوا"),
+    # برا is ambiguous: Egyptian بَرَّا "outside" vs MSA-adverb بَرًّا "by land"
+    # (QA flagged it; native sign-off still pending). Owner decision 2026-08-22:
+    # context-aware, ordered rules — a travel word (سافر/سفر stem, incl. يسافروا/
+    # السفر/للسفر/مسافرين) DIRECTLY before it, or the برا وبحرا pair, means
+    # "by land" (tanween); every other occurrence is the everyday Egyptian
+    # "outside". Once a match is diacritized, the inserted harakat break the
+    # letter adjacency so the fallback rule cannot re-match it.
+    (re.compile(r"\b(\w*سا?فر\w*\s+)بر[اأ]\b", re.UNICODE), r"\1بَرًّا"),
+    (re.compile(r"\bبر[اأ](?=\s*وبحر)", re.UNICODE), "بَرًّا"),
+    (re.compile(r"\bبر[اأ]\b", re.UNICODE), "بَرَّا"),
+]
+
+
+def _apply_pronunciation_fixes(text: str) -> str:
+    for pattern, replacement in _EGY_PRONUNCIATION_FIXES:
         text = pattern.sub(replacement, text)
     return text
 
@@ -83,6 +177,13 @@ _EGY_REPAIR_MAP = {
     "الذي": "اللي", "التي": "اللي", "الذين": "اللي",
     "تمشى": "تمشي",
     "تأكل": "تاكل",
+    # Dialect-bleed repair (live voice testing 2026-08-20): وايد is Gulf/Najdi
+    # "a lot/very" and must never surface in Egyptian output. Caught here so it
+    # is fixed in BOTH display and audio, before TTS.
+    "وايد": "كتير", "ووايد": "وكتير",
+    # Reverse-direction leak observed 2026-08-21: Najdi يبيلك inside an Egyptian
+    # reply.
+    "يبيلك": "محتاج",
 }
 _WORD_SPLIT_RE = re.compile(r"(\W+)", re.UNICODE)  # keeps separators as list items
 
@@ -251,7 +352,9 @@ async def stream_tts_to_ws(
             if cancel_event.is_set():                               # (b)
                 continue   # keep draining so the producer's sentinel is reached
             try:
-                audio_bytes = await _synthesize_mp3(_expand_abbreviations(sentence), language)
+                audio_bytes = await _synthesize_mp3(
+                    _digits_to_arabic_words(
+                        _expand_abbreviations(_apply_pronunciation_fixes(sentence))), language)
             except Exception as e:
                 print(f"[tts-voicetut] synthesis failed, skipping sentence: {type(e).__name__}: {e}")
                 continue
