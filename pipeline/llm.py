@@ -21,6 +21,7 @@ from .routing import (
     WANTS_ENGLISH_RE,
     looks_egyptian,
     looks_najdi,
+    reply_has_egyptian_signals,
     requested_dialect,
     route_arabic,
 )
@@ -111,8 +112,34 @@ FANAR_ARABIC_NOTE = (
     "user's question. If you are restating information given earlier in a DIFFERENT "
     "Arabic dialect, translate every single word into the requested dialect — do not "
     "copy dialect-specific words from the earlier text. Keep English product names, "
-    "brand names, and technical acronyms in Latin script (iOS, Google Play, WiFi) — "
-    "do not transliterate them into Arabic letters."
+    "brand names, and technical acronyms in Latin script (iOS, Google Play, WiFi, "
+    "Uber, Careem) — do not transliterate them into Arabic letters."
+)
+
+# Condensed MSA count-grammar note (owner-approved 2026-08-31, fanar-only): the
+# deterministic number tables can't see the counted noun's gender or case — only
+# the model can. Appended together with FANAR_ARABIC_NOTE on Arabic turns; the
+# tables remain the backstop for any digits the model still emits.
+FANAR_NUMBERS_NOTE = (
+    "Write numbers as Arabic words, not digits. In Fusha apply the count rules: "
+    "for 3-10 the number takes the OPPOSITE gender of the counted noun and the noun "
+    "is plural genitive (ثلاثةُ رجالٍ، ثلاثُ ساعاتٍ); for 11-99 the noun is singular "
+    "accusative (عشرون يوماً، خمسةَ عشرَ عداداً); after مئة/ألف the noun is singular "
+    "genitive (مئةُ ريالٍ); decline the tens by role (كل ستين يوماً، بعد عشرين دقيقةً). "
+    "On Najdi or Egyptian turns use that dialect's everyday spoken number words with "
+    "no case endings."
+)
+
+# Fanar-only, Najdi-route only (QA 2026-09-14, owner: Fanar exhibited this): Fanar
+# sometimes defaults to a non-answer (ما أدري / لا أدري) on Najdi turns while
+# answering the SAME question substantively in Fusha/Egyptian. Behavioral, so a
+# prompt is the right lever (compliance-dependent, not a hard guarantee). qwen
+# untouched — this is gated on _IS_FANAR AND the Najdi route below.
+FANAR_NAJDI_NOTE = (
+    "Answer the question substantively in Najdi — the dialect changes only the "
+    "phrasing and vocabulary, never whether you answer. Do not fall back to "
+    "'ما أدري' or 'ما أعرف' for something you would answer in Fusha; only say you "
+    "don't know if the information is genuinely unavailable."
 )
 
 # What server.py sends as the system message. Byte-identical to SYSTEM_PROMPT on
@@ -216,10 +243,11 @@ def build_turn(text: str, lang: str) -> tuple[str, Optional[str], bool]:
         → OmniVoice) and gates CATT tashkeel to Fusha (the TTS module re-checks
         each synthesized sentence with the same Najdi detector, so a reply that
         comes back Najdi is never MSA-diacritized regardless of this value).
-      explicit — the user explicitly requested an output language/dialect this
-        turn ("بالمصري", "in English", ...). Used by server.py to bypass the
-        Arabic dialect-history isolation: restating a prior answer in another
-        dialect NEEDS that prior answer visible.
+      explicit — True if the user explicitly named an output language/dialect
+        this turn ("بالمصري", "in English", ...). NOTE: no longer gates history —
+        the explicit-request bypass was removed (owner decision 2026-08-21; it was
+        the cross-dialect contamination vector). Kept for observability and
+        possible future use — server.py currently discards it.
     """
     # A named dialect (Najdi/Egyptian/Fusha) counts as an Arabic request on its
     # own — even when "Arabic" isn't said, e.g. "in Najdi Arabic". Other named
@@ -311,10 +339,13 @@ def build_turn(text: str, lang: str) -> tuple[str, Optional[str], bool]:
     elif tts_language == "egyptian arabic":
         lang_instruction += "\n" + EGYPTIAN_CARD
 
-    # Fanar-only behavior note on Arabic turns (see FANAR_ARABIC_NOTE). qwen's
-    # prompts stay byte-identical — _IS_FANAR is False when LLM_MODEL is unset.
+    # Fanar-only behavior notes on Arabic turns (see FANAR_ARABIC_NOTE and
+    # FANAR_NUMBERS_NOTE). qwen's prompts stay byte-identical — _IS_FANAR is
+    # False when LLM_MODEL is unset.
     if _IS_FANAR and tts_language is not None:
-        lang_instruction += "\n" + FANAR_ARABIC_NOTE
+        lang_instruction += "\n" + FANAR_ARABIC_NOTE + "\n" + FANAR_NUMBERS_NOTE
+        if tts_language == "najdi arabic":
+            lang_instruction += "\n" + FANAR_NAJDI_NOTE
 
     # Per-turn wrapper: lang routing + style + anti-hallucination. This wraps ONLY
     # the current user message; the clean `text` is what gets stored in history,
@@ -353,14 +384,80 @@ FANAR_ARABIC_REPAIRS: dict[str, str] = {
     "الملكة": "المملكة", "للملكة": "للمملكة", "والملكة": "والمملكة", "بالملكة": "بالمملكة",
     # Owner fix 2026-08-24: الستينيات is the wrong form of the word — use الستينات.
     "الستينيات": "الستينات", "والستينيات": "والستينات", "بالستينيات": "بالستينات",
+    # Owner fix 2026-08-27: المياة is never correct spelling (المياه).
+    "المياة": "المياه", "بالمياة": "بالمياه", "والمياة": "والمياه", "للمياة": "للمياه",
+    # Owner fix 2026-08-28: أوبر is unambiguous — always the brand (كريم is NOT
+    # safe standalone: common word + name; handled only in the أوبر pair phrases).
+    "أوبر": "Uber",
+    # Owner fix 2026-09-09: سيليزية is a Fanar coinage for "Celsius" — not a real
+    # Arabic word; the standard is مئوية. Single observed repair (invented words
+    # can't be caught in general).
+    "سيليزية": "مئوية", "سيليزي": "مئوي", "سيلزية": "مئوية",
 }
+
+# Phrase-level repairs (multi-word — the word filter can't touch these because the
+# first word alone is a legitimate different word). Owner fix 2026-08-27:
+# "دعوة قضائية" (a judicial INVITATION) is always the دعوى (lawsuit) error.
+FANAR_PHRASE_REPAIRS: dict[str, str] = {
+    "دعوة قضائية": "دعوى قضائية",
+    # علي-for-على, OBSERVED collocations only (QA issue 6, owner decision
+    # 2026-08-27): a blanket علي→على would corrupt the name علي (Ali) and the
+    # legitimate عليّ "on me". Add further bigrams only as observed.
+    "علي صيانة": "على صيانة", "علي صيانه": "على صيانه", "علي طول": "على طول",
+    # Owner list 2026-08-28:
+    "الموسم الحج": "موسم الحج",                       # word-order error
+    "أوبر وكريم": "Uber و Careem", "أوبر أو كريم": "Uber أو Careem",
+}
+
+# Najdi-route regex repairs (context-sensitive — the exact-word map can't carry
+# lookarounds). بالميه leaking into Najdi is repaired to بالمويه EXCEPT directly
+# after a digit, where بالميه is the colloquial PERCENT idiom (e.g. "50 بالميه");
+# word-numeral percents (خمسين بالميه) are an accepted residual risk — fanar
+# habitually writes بالمئة for percent on Najdi turns.
+def _harakat_tolerant(s: str) -> str:
+    """Regex source matching `s` even when the model wrote it with diacritics —
+    each non-space char may be followed by harakat; spaces flex. Fixes the
+    slip-class bug (a model writing 'دَعوة'/'بِالميه' escaped the plain filters)
+    consistently across repair_phrases and repair_regexes (2026-09-09)."""
+    out = []
+    for ch in s:
+        out.append(r"\s+" if ch == " " else re.escape(ch) + r"[ً-ْٰ]*")
+    return "".join(out)
+
+
+FANAR_NAJDI_REGEX_REPAIRS: list[tuple[Any, str]] = [
+    (re.compile(r"(?<![\d٠-٩]\s)(?<![ء-ي])" + _harakat_tolerant("بالميه") + r"(?![ء-ي])",
+                re.UNICODE), "بالمويه"),
+]
+
+
+async def repair_regexes(token_gen: Any, rules: list, holdback: int = 16):
+    """Regex repairs on a token stream (rolling buffer, like repair_phrases, for
+    patterns that need surrounding context)."""
+    buf = ""
+    try:
+        async for tok in token_gen:
+            buf += tok
+            for pattern, repl in rules:
+                buf = pattern.sub(repl, buf)
+            if len(buf) > holdback:
+                yield buf[:-holdback]
+                buf = buf[-holdback:]
+        if buf:
+            for pattern, repl in rules:
+                buf = pattern.sub(repl, buf)
+            yield buf
+    finally:
+        aclose = getattr(token_gen, "aclose", None)
+        if aclose is not None:
+            await aclose()
 
 # Najdi-route-only repairs: Egyptian tokens observed leaking into Najdi replies
 # (2026-08-21 logs + QA issue 3). Closed-class function words that are never
 # valid Najdi, plus the exact بـ-prefixed verb forms seen live and the canonical
 # examples from NAJDI_GRAMMAR_RULE (exact tokens — zero collision risk).
 FANAR_NAJDI_REPAIRS: dict[str, str] = {
-    "دلوقتي": "الحين", "دلوقت": "الحين", "دلوقتِ": "الحين",
+    "دلوقتي": "الحين", "دلوقت": "الحين",   # (diacritized forms now match via mark-stripped lookup)
     "النهارده": "اليوم", "النهاردة": "اليوم", "امبارح": "أمس",
     "كده": "كذا", "كدا": "كذا",
     "ازاي": "كيف", "إزاي": "كيف", "ازيك": "كيف الحال", "إزيك": "كيف الحال",
@@ -372,28 +469,170 @@ FANAR_NAJDI_REPAIRS: dict[str, str] = {
     "بيسجل": "يسجل", "بيبعتلك": "يبعتلك", "بيتتبع": "يتتبع", "بيكافئك": "يكافئك",
     "بيحاولون": "يحاولون", "بيحصل": "يحصل", "بيكون": "يكون",
     "بيروح": "يروح", "بتقول": "تقول", "بنعرف": "نعرف", "بيصير": "يصير",
+    "بيسوونها": "يسوونها", "بيسوون": "يسوون",   # observed 2026-08-27
+    # Owner list 2026-08-28: صج out of the model's OUTPUT (stays a routing marker
+    # for user input); بتدور = another observed بـ-prefix leak.
+    "صج": "فعلاً", "بتدور": "تدور",
+    # Egyptian water word leaking into Najdi (QA issue 8) — Najdi says المويه.
+    # بالميه is handled by FANAR_NAJDI_REGEX_REPAIRS (needs the digit guard);
+    # bare ميه deliberately EXCLUDED (colloquial "hundred" homograph).
+    "الميه": "المويه", "والميه": "والمويه", "للميه": "للمويه",
 }
 
-_WORD_SPLIT_RE = re.compile(r"(\W+)", re.UNICODE)
+# Harakat are NOT \w in Python's re — a naive (\W+) splitter breaks a diacritized
+# word into fragments ("مِش" → "م","ش") so repair keys silently miss whenever the
+# model writes diacritics (latent gap found 2026-08-31). The splitter below keeps
+# marks attached to their word, and lookups match on the mark-stripped form.
+_WORD_SPLIT_RE = re.compile(r"([^\wً-ْٰ]+)", re.UNICODE)
+_HARAKAT_RE = re.compile(r"[ً-ْٰ]")
 
 
 async def repair_words(token_gen: Any, mapping: dict[str, str]):
     """Apply an exact whole-word repair map to a token stream. Words can be split
     across tokens, so the last (possibly incomplete) word is held back until its
-    boundary arrives. Same mechanism as the Egyptian repairs in tts_voicetut_v1."""
+    boundary arrives. Lookup ignores diacritics; unmapped words keep theirs."""
     pending = ""
     try:
         async for tok in token_gen:
             pending += tok
             parts = _WORD_SPLIT_RE.split(pending)
             pending = parts.pop() if parts else ""
-            out = "".join(mapping.get(p, p) for p in parts)
+            out = "".join(mapping.get(_HARAKAT_RE.sub("", p), p) for p in parts)
             if out:
                 yield out
         if pending:
-            yield mapping.get(pending, pending)
+            yield mapping.get(_HARAKAT_RE.sub("", pending), pending)
     finally:
         aclose = getattr(token_gen, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+
+async def repair_phrases(token_gen: Any, mapping: dict[str, str]):
+    """Multi-word repairs on a token stream (rolling buffer with holdback so a
+    phrase split across tokens is still caught). Diacritic-tolerant: keys match
+    even if the model diacritized the phrase (slip-class fix 2026-09-09)."""
+    rules = [(re.compile(_harakat_tolerant(k)), v) for k, v in mapping.items()]
+    hold = 3 * max(len(k) for k in mapping)   # a diacritized match can run ~3× longer
+    buf = ""
+    try:
+        async for tok in token_gen:
+            buf += tok
+            for pat, v in rules:
+                buf = pat.sub(v, buf)
+            if len(buf) > hold:
+                yield buf[:-hold]
+                buf = buf[-hold:]
+        if buf:
+            for pat, v in rules:
+                buf = pat.sub(v, buf)
+            yield buf
+    finally:
+        aclose = getattr(token_gen, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+
+# ── Fanar leading-question-echo stripper (owner-approved 2026-08-27) ──────────
+# Fanar habitually opens replies by restating the user's question as a first
+# sentence ending in a question mark. Deterministic rule per the owner's spec:
+# if the FIRST sentence terminator in the reply is ؟/? — drop that sentence
+# (from display, TTS and stored history alike, since this runs upstream of all
+# three). If the first terminator is ./! the reply passes through untouched.
+# An echo-ONLY reply strips to empty, which triggers server.py's existing
+# empty-response fallback instead of leaving silence. Cost: the first visible
+# text is held until the first sentence boundary (TTS flushing already waited
+# for that boundary anyway, so first-audio timing is unchanged).
+_SENTENCE_END_CHARS = ".!؟?"
+_LEADING_Q_MAX_CHARS = 200   # no terminator by here → not an echo, stop holding
+
+
+async def strip_leading_question(token_gen: Any):
+    buf = ""
+    decided = False
+    try:
+        async for tok in token_gen:
+            if decided:
+                yield tok
+                continue
+            buf += tok
+            idx = next((i for i, c in enumerate(buf) if c in _SENTENCE_END_CHARS), None)
+            if idx is not None:
+                decided = True
+                # a "first sentence" longer than the cap isn't a question echo,
+                # whatever it ends with — user questions are short
+                if buf[idx] in "؟?" and idx < _LEADING_Q_MAX_CHARS:
+                    rest = buf[idx + 1:].lstrip()
+                    print("  [echo-guard] dropped leading question sentence")
+                    if rest:
+                        yield rest
+                else:
+                    yield buf
+                buf = ""
+            elif len(buf) >= _LEADING_Q_MAX_CHARS:
+                decided = True
+                yield buf
+                buf = ""
+        if buf:
+            yield buf   # stream ended with no terminator — pass through
+    finally:
+        aclose = getattr(token_gen, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+
+# ── Fanar Egyptian drift-retry (owner-approved 2026-08-27) ────────────────────
+# Live sessions showed ~1/3 of Egyptian-routed Fanar replies drifting to pure
+# Fusha. Buffer the first ~160 chars; if they carry ZERO Egyptian signals
+# (routing.reply_has_egyptian_signals — a reply-oriented set, broader than the
+# routing markers), abort and regenerate ONCE with a reinforced final user
+# message. The retry streams unchecked (no loops). Costs: Egyptian first-audio
+# waits for the probe; a drifted turn pays one extra generation.
+_EGY_DRIFT_PROBE_CHARS = 160
+_EGY_RETRY_NOTE = (
+    "\n(Reminder: write EVERY sentence of the reply in everyday spoken Egyptian "
+    "Arabic — Masri — not formal Fusha.)"
+)
+
+
+async def _with_egy_drift_retry(make_stream: Any, messages: list[dict[str, str]]):
+    first = make_stream(messages)
+    buf: list[str] = []
+    buflen = 0
+    exhausted = False
+    try:
+        while buflen < _EGY_DRIFT_PROBE_CHARS:
+            try:
+                tok = await first.__anext__()
+            except StopAsyncIteration:
+                exhausted = True
+                break
+            buf.append(tok)
+            buflen += len(tok)
+
+        probe_text = "".join(buf)
+        # Blind-spot guard (2026-08-31): a leading question-echo carries Egyptian
+        # words translated from the user's request — judge drift on the text
+        # AFTER it when enough follows (the echo stripper removes it downstream).
+        qpos = probe_text.find("؟")
+        if qpos != -1 and len(probe_text) - qpos > 40:
+            probe_text = probe_text[qpos + 1:]
+        if not reply_has_egyptian_signals(probe_text):
+            await first.aclose()
+            print("  [egy-guard] reply drifted to Fusha — regenerating once")
+            retry_msgs = [dict(m) for m in messages]
+            retry_msgs[-1]["content"] += _EGY_RETRY_NOTE
+            async for tok in make_stream(retry_msgs):
+                yield tok
+            return
+
+        for tok in buf:
+            yield tok
+        if not exhausted:
+            async for tok in first:
+                yield tok
+    finally:
+        aclose = getattr(first, "aclose", None)
         if aclose is not None:
             await aclose()
 
@@ -506,12 +745,20 @@ async def ollama_chat_token_gen(
                                             # fanar-only Najdi dialect guard below
 ):
     """Stream a chat completion, with the fanar output guards when applicable."""
-    inner = _ollama_chat_stream(messages, model, on_first_token)
-    if "fanar" in model.lower():
+    is_fanar = "fanar" in model.lower()
+    if is_fanar and route == "egyptian arabic":
+        inner = _with_egy_drift_retry(
+            lambda msgs: _ollama_chat_stream(msgs, model, on_first_token), messages)
+    else:
+        inner = _ollama_chat_stream(messages, model, on_first_token)
+    if is_fanar:
         inner = strip_markdown_tokens(strip_think_tokens(inner))
+        inner = strip_leading_question(inner)
+        inner = repair_phrases(inner, FANAR_PHRASE_REPAIRS)
         inner = repair_words(inner, FANAR_ARABIC_REPAIRS)
         if route == "najdi arabic":
             inner = repair_words(inner, FANAR_NAJDI_REPAIRS)
+            inner = repair_regexes(inner, FANAR_NAJDI_REGEX_REPAIRS)
     try:
         async for token in inner:
             yield token

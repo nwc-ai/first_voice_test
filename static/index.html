@@ -296,6 +296,17 @@ function handleMessage(event) {
     setStatus('يستمع...', 'listening');
     return;
   }
+  if (msg.event === 'error') {
+    // Server-side fatal (e.g. models failed to load — CUDA OOM on the shared
+    // GPU). Reconnecting won't help until the server restarts, so stop the
+    // retry loop, re-enable the button, and show the message.
+    wantReconnect       = false;
+    serverReady         = false;
+    connectBtn.disabled = false;
+    connectBtn.className = '';
+    setStatus(msg.text || '⚠️ خطأ في الخادم', '');
+    return;
+  }
   if (msg.event === 'speech_start') {
     // PAUSE playback — don't destroy it. If STT then rejects the utterance
     // (cough, noise, echo), the server sends `speech_rejected` and we resume

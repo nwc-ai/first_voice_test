@@ -31,7 +31,7 @@ import asyncio
 import os
 import re
 import threading
-from typing import Any, AsyncIterator, Optional
+from typing import AsyncIterator, Optional
 
 import numpy as np
 import torch
@@ -49,7 +49,10 @@ _ABBREV_RULES: list[tuple[re.Pattern, str]] = [
     # (owner fix 2026-08-24; same rule as the OmniVoice module).
     (re.compile(r'(?<=[؀-ۿ])(\s+)911\b', re.UNICODE), r'\1تسعة واحد واحد'),
     (re.compile(r'(\d)\s*هـ(?=[\s،,.:؟!]|$)', re.UNICODE), r'\1 هجري'),
-    (re.compile(r'(\d)\s*م(?=[\s،,.:؟!]|$)', re.UNICODE), r'\1 ميلادي'),
+    # 4-digit = year, 1-3-digit = meters (same latent-bug fix as the OmniVoice
+    # module, 2026-08-31):
+    (re.compile(r'(?<!\d)(\d{4})\s*م(?=[\s،,.:؟!]|$)', re.UNICODE), r'\1 ميلادي'),
+    (re.compile(r'(?<!\d)(\d{1,3})\s*م(?=[\s،,.:؟!]|$)', re.UNICODE), r'\1 متر'),
     # Dot mandatory + no preceding Arabic letter — the dotless variant matched the
     # قم inside رقم/الرقم and corrupted the audio (same fix as the OmniVoice module).
     (re.compile(r'(?<![؀-ۿ])ق\.\s*م(?=[\s،,.:؟!]|$)', re.UNICODE), 'قبل الميلاد'),
@@ -59,6 +62,13 @@ _ABBREV_RULES: list[tuple[re.Pattern, str]] = [
     (re.compile(r'﷼', re.UNICODE), 'ريال'),                           # riyal sign
     (re.compile(r'(?<=[\s0-9٠-٩])\+(?=[\s0-9٠-٩])', re.UNICODE), 'زائد'),
     (re.compile(r'(?<=[\s0-9٠-٩])=(?=[\s0-9٠-٩])', re.UNICODE), 'يساوي'),
+    # Multiply/divide (2026-09-09; same as OmniVoice): 4 × 7 → أربعة في سبعة.
+    (re.compile(r'(?<=[\s0-9٠-٩])[×✕✖⋅](?=[\s0-9٠-٩])', re.UNICODE), 'في'),
+    (re.compile(r'(?<=[\s0-9٠-٩])[÷](?=[\s0-9٠-٩])', re.UNICODE), 'على'),
+    # Ranges (digit-dash-digit → إلى) and minus (dash before a digit → ناقص),
+    # same as the OmniVoice module (2026-09-09):
+    (re.compile(r'(?<=[0-9٠-٩])[-–—](?=[0-9٠-٩])', re.UNICODE), ' إلى '),
+    (re.compile(r'(?<![0-9٠-٩])[-–—]\s*(?=[0-9٠-٩])', re.UNICODE), 'ناقص '),
     (re.compile(r'\bد\.\s+', re.UNICODE), 'دكتور '),
     (re.compile(r'\bأ\.\s+', re.UNICODE), 'أستاذ '),
     (re.compile(r'\bإلخ\b', re.UNICODE), 'وما إلى ذلك'),
@@ -75,33 +85,46 @@ def _expand_abbreviations(text: str) -> str:
     return text
 
 
-# ── Arabic number verbalization (owner-approved 2026-08-24; same design as the
-# OmniVoice module) ────────────────────────────────────────────────────────────
-# INTEGERS ONLY (num2words' Arabic decimals are broken); runs after
-# _expand_abbreviations so the 911 digit-by-digit rule wins first; synthesis-time
-# only — displayed text keeps the digits. num2words produces MSA number words;
-# if they sound too formal on the Egyptian voice, colloquialize the divergent
-# ones (ثلاثة→تلاتة، اثنين→اتنين، ثمانية→تمانية) as pronunciation fixes later.
+# ── Arabic number verbalization (dialect tables 2026-08-31; same design as the
+# OmniVoice module, fixed to the EGYPTIAN table) ───────────────────────────────
+# Colloquial Egyptian number words (تَلَاتَة، حِدَاشَر، تَلَاتِين، مِيَّة) from
+# pipeline/arabic_numbers — invariable, no iʿrāb, per the owner's grammar block.
+# Decimals → «N فَاصْلَة digits», times → «H وِM»; >999,999 stays digits.
+# Synthesis-time only — displayed text keeps the digits.
+from .arabic_numbers import (date_to_words, decimal_to_words, digit_string_to_words,
+                             int_to_words, strip_redundant_number_parenthetical, time_to_words)
+
 _ARABIC_CHAR_RE = re.compile(r"[؀-ۿ]")
 _EASTERN_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
-# Standalone integers only (same rule as the OmniVoice module): ./,/: blocks the
-# match only when another digit follows (true decimals/times stay digits).
+# sentence-final "10:30." / "3.5." still convert (see the OmniVoice module note):
+_TIME_RE    = re.compile(r"(?<![\d.,:])(\d{1,2}):(\d{2})(?::(\d{2}))?(?!\d)(?![.,:]\d)")
+_DATE_RE    = re.compile(r"(?<![\d.,:/])(\d{1,2})/(\d{1,2})/(\d{4})(?![\d/])")   # D/M/YYYY
+_DECIMAL_RE = re.compile(r"(?<![\d.,:])(\d+)\.(\d+)(?!\d)(?![.,:]\d)")
+_PHONE_RE   = re.compile(r"(?<![\d.,:])(0\d+|\d{10,})(?![\d.,:])")   # digit-by-digit
 _INT_RUN_RE = re.compile(r"(?<![\d.,:])\d+(?!\d)(?![.,:]\d)")
 
 
-def _digits_to_arabic_words(text: str) -> str:
+def _digits_to_arabic_words(text: str, dialect: str = "egyptian") -> str:
     if not _ARABIC_CHAR_RE.search(text):
         return text
     text = text.translate(_EASTERN_DIGITS)
+    text = strip_redundant_number_parenthetical(text)   # drop "168 (مائة...)" twin
 
-    def _one(m: re.Match) -> str:
-        try:
-            from num2words import num2words
-            return num2words(int(m.group(0)), lang="ar")
-        except Exception:
-            return m.group(0)
+    def _sub(fn):
+        def inner(m: re.Match) -> str:
+            try:
+                out = fn(m)
+            except Exception:
+                out = None
+            return out if out is not None else m.group(0)
+        return inner
 
-    return _INT_RUN_RE.sub(_one, text)
+    text = _TIME_RE.sub(_sub(lambda m: time_to_words(m.group(1), m.group(2), dialect, m.group(3))), text)
+    text = _DATE_RE.sub(_sub(lambda m: date_to_words(m.group(1), m.group(2), m.group(3), dialect)), text)
+    text = _DECIMAL_RE.sub(_sub(lambda m: decimal_to_words(m.group(1), m.group(2), dialect)), text)
+    text = _PHONE_RE.sub(_sub(lambda m: digit_string_to_words(m.group(0), dialect)), text)
+    text = _INT_RUN_RE.sub(_sub(lambda m: int_to_words(int(m.group(0)), dialect)), text)
+    return text
 
 
 # ── Egyptian pronunciation fixes (synthesis-time ONLY) ────────────────────────────────────
@@ -138,6 +161,44 @@ _EGY_PRONUNCIATION_FIXES: list[tuple[re.Pattern, str]] = [
     # بيرفعوا came out with a doubled ر (بيرّفعوا) — sukūn on ر forces single:
     (re.compile(r"\bوبيرفعوا\b", re.UNICODE), "وبِيِرْفَعُوا"),
     (re.compile(r"\bبيرفعوا\b", re.UNICODE), "بِيِرْفَعُوا"),
+    # Owner list 2026-08-28 — "all dialects" entries (mirrors the OmniVoice
+    # module's new _PRONUNCIATION_FIXES) + Egyptian-specific المنطقة/الملوثات.
+    # تتبع is collocation-scoped (verb reading تتبع التعليمات must stay).
+    (re.compile(r"\bالتفاصيل المدخلة\b", re.UNICODE), "التَّفَاصِيل الْمُدْخَلَة"),
+    (re.compile(r"\bمستندات\b", re.UNICODE), "مُسْتَنَدَات"),
+    (re.compile(r"\bتسرب\b", re.UNICODE), "تَسَرُّب"),
+    (re.compile(r"\bخطرة\b", re.UNICODE), "خَطِرَة"),
+    (re.compile(r"\bخاصةً?(?=[\s،,.:؟!]|$)", re.UNICODE), "خَاصَّةً"),
+    (re.compile(r"\bالحجاج\b", re.UNICODE), "الْحُجَّاج"),
+    (re.compile(r"\bخزان\b", re.UNICODE), "خَزَّان"),
+    (re.compile(r"\bالخزان\b", re.UNICODE), "الْخَزَّان"),
+    (re.compile(r"\bتتبع(?=\s+استهلاك)", re.UNICODE), "تَتَبُّع"),
+    # NWC acronym → letter names in Arabic context (same measured fix as the
+    # OmniVoice module, 2026-08-31; synthesis-only, display keeps "NWC"):
+    (re.compile(r"(?<=[؀-ۿ])([\s(«\"']{1,4})NWC\b", re.UNICODE), r"\1إن دبليو سي"),
+    # Sentence-initial NWC caught via Arabic-after (2026-09-09; same as OmniVoice):
+    (re.compile(r"\bNWC\b(?=[\s)»\"'،.:]{0,4}[؀-ۿ])", re.UNICODE), "إن دبليو سي"),
+    (re.compile(r"\bالمنطقة\b", re.UNICODE), "الْمِنْطَقَة"),
+    (re.compile(r"\bالملوثات\b", re.UNICODE), "الْمُلَوِّثَات"),
+    # QA report 2026-08-27 (Leen), owner-approved same day:
+    (re.compile(r"\bالحرجة\b", re.UNICODE), "الحَرِجَة"),
+    (re.compile(r"\bالوثائق\b", re.UNICODE), "الوَثَائِق"),
+    # Water-word colloquialization was REVERTED 2026-09-14 (owner decision): the
+    # colloquial الميه/ميه collided with مية (100) and mispronounced, so Egyptian
+    # water now stays المياه (formal, unambiguous) — the 2026-08-27 مياه→الميه
+    # rules were removed. جدة/العمرة diacritization added below instead.
+    (re.compile(r"\bجدة\b", re.UNICODE), "جِدَّة"),          # the city (not the grandmother)
+    (re.compile(r"\bالعمرة\b", re.UNICODE), "الْعُمْرَة"),
+    (re.compile(r"\bبيعتبر\b", re.UNICODE), "بِيِعْتَبِر"),   # QA issue 3 — stress/vowels
+    # Reverse backstop (QA 2026-09-14): if the model still emits the colloquial
+    # الميه/ميه (ه-ending water), force المياه/مياه to avoid the 100-collision.
+    # مية (ة-ending 100) is a different token and is NEVER touched.
+    (re.compile(r"\bالميه\b", re.UNICODE), "المياه"),
+    (re.compile(r"\bميه\b", re.UNICODE), "مياه"),
+    # Tanween-not-spoken TRIAL (QA issue 5): phonetic respelling forces the -an
+    # sound for this one observed frozen adverb; extend word-by-word only after
+    # Leen confirms it sounds right.
+    (re.compile(r"\bحالً?اً?(?=[\s،,.:؟!]|$)", re.UNICODE), "حَالَن"),
     # برا is ambiguous: Egyptian بَرَّا "outside" vs MSA-adverb بَرًّا "by land"
     # (QA flagged it; native sign-off still pending). Owner decision 2026-08-22:
     # context-aware, ordered rules — a travel word (سافر/سفر stem, incl. يسافروا/
@@ -184,25 +245,31 @@ _EGY_REPAIR_MAP = {
     # Reverse-direction leak observed 2026-08-21: Najdi يبيلك inside an Egyptian
     # reply.
     "يبيلك": "محتاج",
+    # Owner list 2026-08-28 — model spelling slips (fixed in display AND audio):
+    "حئوق": "حقوق",
+    "بيأخدوا": "بيخدوا",
 }
-_WORD_SPLIT_RE = re.compile(r"(\W+)", re.UNICODE)  # keeps separators as list items
+# Harakat kept attached to words; lookup on the mark-stripped form (same
+# diacritic-tolerance fix as llm.repair_words, 2026-08-31).
+_WORD_SPLIT_RE = re.compile(r"([^\wً-ْٰ]+)", re.UNICODE)
+_HARAKAT_RE = re.compile(r"[ً-ْٰ]")
 
 
 async def _egyptianize_tokens(token_gen: AsyncIterator[str]):
     """Apply _EGY_REPAIR_MAP word-by-word to a token stream. Words can be split
     across tokens, so the last (possibly incomplete) word is held back until its
-    boundary arrives."""
+    boundary arrives. Lookup ignores diacritics; unmapped words keep theirs."""
     pending = ""
     try:
         async for tok in token_gen:
             pending += tok
             parts = _WORD_SPLIT_RE.split(pending)
             pending = parts.pop() if parts else ""   # possibly-incomplete tail word
-            out = "".join(_EGY_REPAIR_MAP.get(p, p) for p in parts)
+            out = "".join(_EGY_REPAIR_MAP.get(_HARAKAT_RE.sub("", p), p) for p in parts)
             if out:
                 yield out
         if pending:
-            yield _EGY_REPAIR_MAP.get(pending, pending)
+            yield _EGY_REPAIR_MAP.get(_HARAKAT_RE.sub("", pending), pending)
     finally:
         aclose = getattr(token_gen, "aclose", None)
         if aclose is not None:

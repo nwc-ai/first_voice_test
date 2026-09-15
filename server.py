@@ -5,7 +5,9 @@ Orchestration only — the pipeline pieces live in the pipeline/ package:
   pipeline/stt.py              Silero VAD, FRCRN denoiser, faster-whisper
   pipeline/routing.py          language/dialect detection, text-acceptance policy
   pipeline/llm.py              Ollama client, model config, prompt construction
-  pipeline/tts_omnivoice_v1.py OmniVoice synthesis + CATT tashkeel
+  pipeline/arabic_numbers.py   dialect-aware number verbalization
+  pipeline/tts_omnivoice_v1.py OmniVoice synthesis + CATT tashkeel (Fusha/Najdi/En)
+  pipeline/tts_voicetut_v1.py  VoiceTut synthesis (Egyptian, no CATT)
 
 Architecture:
   - AudioWorklet: continuous 512-sample Float32 chunks at 16kHz
@@ -88,9 +90,87 @@ _active_ws_task: Optional[asyncio.Task] = None
 _active_ws_ref:  Optional[Any]          = None   # raw WebSocket for the close-4001 signal
 
 
+# ── Startup: GPU pre-flight ─────────────────────────────────────────────────
+# This box is a SHARED GPU (a production app + other users' jobs). A tenant
+# holding the card is the common failure, and without a check it surfaces as a
+# cryptic CUDA OOM part-way through model loading (happened 2026-09-14: another
+# user's sglang server at --mem-fraction-static 0.88 left 1.3 GB free). The
+# pre-flight turns that into one clear, actionable message before we load a byte.
+# GPU_PREFLIGHT=0 skips it; GPU_MIN_FREE_GB overrides the required-free threshold.
+GPU_PREFLIGHT = os.environ.get("GPU_PREFLIGHT", "1") == "1"
+
+
+def _gpu_processes() -> str:
+    """Best-effort per-process VRAM breakdown via nvidia-smi, so a contention
+    failure names WHO is holding the card (the diagnosis that otherwise takes
+    several manual steps). Returns a note if nvidia-smi isn't available."""
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory",
+             "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        return out or "(no compute processes reported)"
+    except Exception:
+        return "(nvidia-smi unavailable)"
+
+
+def _llm_already_resident() -> bool:
+    """True if the target LLM is already loaded in Ollama (pinned from a prior
+    run). Then the pre-flight only needs room for our in-process models, not the
+    ~16 GB LLM on top — otherwise a normal server restart (Ollama left running)
+    would false-alarm. Best-effort: any failure → assume NOT resident (stricter)."""
+    try:
+        import httpx
+        base = llm.MODEL.split(":")[0]
+        data = httpx.get("http://localhost:11434/api/ps", timeout=3).json()
+        return any(base in m.get("name", "") for m in data.get("models", []))
+    except Exception:
+        return False
+
+
+def _required_free_gb() -> float:
+    """VRAM the stack needs free right now. GPU_MIN_FREE_GB overrides it outright.
+    Otherwise: our in-process models (whisper + OmniVoice + VoiceTut + scratch)
+    ≈ 9 GB, plus the 27B LLM (~15 GB) UNLESS it's already pinned in Ollama."""
+    override = os.environ.get("GPU_MIN_FREE_GB")
+    if override:
+        return float(override)
+    base = 9.0
+    return base if _llm_already_resident() else base + 15.0
+
+
+def _gpu_preflight() -> None:
+    """Fail fast with a clear message if the GPU can't fit the stack, instead of
+    a cryptic OOM mid-load. Raises RuntimeError (caught by _load_and_signal, which
+    records it and lets the WS handler report it to the browser)."""
+    if not GPU_PREFLIGHT:
+        return
+    if not torch.cuda.is_available():
+        print("[preflight] CUDA not available — skipping VRAM check.")
+        return
+    free_bytes, total_bytes = torch.cuda.mem_get_info()   # device 0 (OMNIVOICE_DEVICE default)
+    free_gb, total_gb = free_bytes / 1e9, total_bytes / 1e9
+    need_gb = _required_free_gb()
+    print(f"[preflight] GPU free {free_gb:.1f} GB / {total_gb:.1f} GB (need ~{need_gb:.0f} GB)")
+    if free_gb >= need_gb:
+        return
+    raise RuntimeError(
+        f"GPU pre-flight failed: only {free_gb:.1f} GB free of {total_gb:.1f} GB, "
+        f"need ~{need_gb:.0f} GB (whisper + OmniVoice + VoiceTut"
+        f"{'' if _llm_already_resident() else ' + the 27B LLM'}).\n"
+        f"Another process is almost certainly holding the card. GPU processes now:\n"
+        f"{_gpu_processes()}\n"
+        f"Free VRAM (or ask the other tenant to lower their reservation) and restart. "
+        f"Bypass: GPU_PREFLIGHT=0   |   change threshold: GPU_MIN_FREE_GB=<n>"
+    )
+
+
 # ── Startup: load all models ──────────────────────────────────────────────────
 
 def _load_all_blocking():
+    _gpu_preflight()   # fail fast with a clear message before grabbing any VRAM
     print("Loading OmniVoice TTS...")
     tts_omnivoice_v1.load_models()
     print("OmniVoice TTS ready.")
@@ -110,15 +190,30 @@ def _load_all_blocking():
 
 
 _models_ready = asyncio.Event()
+_load_error: Optional[str] = None   # set if startup model-loading failed (e.g. CUDA OOM);
+                                     # read by the WS handler so it reports instead of hanging
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     async def _load_and_signal():
-        await asyncio.to_thread(_load_all_blocking)
-        await llm.warm_llm()       # pin the 27B before announcing 'ready' — no cold first turn
-        _models_ready.set()
-        print("All models loaded — server ready.")
+        global _load_error
+        try:
+            await asyncio.to_thread(_load_all_blocking)
+            await llm.warm_llm()   # pin the 27B before announcing 'ready' — no cold first turn
+            _models_ready.set()
+            print("All models loaded — server ready.")
+        except Exception as e:
+            # Without this, a load failure (most often CUDA OOM when another
+            # process is hogging the shared GPU) becomes an unretrieved task
+            # exception, _models_ready is never set, and EVERY WebSocket then
+            # hangs forever at _models_ready.wait() (the confusing CancelledError
+            # spam). Record it, wake the waiters, let the WS handler report it.
+            _load_error = f"{type(e).__name__}: {e}"
+            print(f"\n*** MODEL LOAD FAILED — server cannot serve turns ***\n"
+                  f"{_load_error}\n"
+                  f"(most often CUDA OOM on the shared GPU — free VRAM and restart)\n")
+            _models_ready.set()
 
     asyncio.create_task(_load_and_signal())
     yield  # server binds immediately — page loads while models warm up
@@ -294,8 +389,19 @@ async def websocket_endpoint(ws: WebSocket):
         if not _models_ready.is_set():
             await ws.send_json({"event": "loading", "text": "جاري تحميل النماذج..."})
             await _models_ready.wait()
+        if _load_error is not None:
+            # Startup failed (e.g. CUDA OOM) — report it instead of announcing
+            # 'ready' and then erroring on every turn. Needs a server restart.
+            await ws.send_json({"event": "error",
+                                "text": "تعذّر تحميل النماذج على الخادم. أعد المحاولة بعد إعادة التشغيل."})
+            keepalive_task.cancel()
+            print(f"Rejected connection — models failed to load ({_load_error}).")
+            return
         await ws.send_json({"event": "ready"})
-    except Exception:
+    except (Exception, asyncio.CancelledError):
+        # CancelledError is a BaseException (not Exception) — without catching it
+        # here, a disconnect/supersede DURING the load wait escapes as a noisy
+        # ASGI traceback instead of this one clean line.
         keepalive_task.cancel()
         print("Browser disconnected during model load.")
         return
@@ -531,9 +637,13 @@ async def websocket_endpoint(ws: WebSocket):
                         # Guard: skip fallback if barge-in fired — the user already
                         # spoke again and hearing "I didn't catch that" over their
                         # next utterance is confusing.
+                        # Fallback language follows the ROUTE first (2026-08-31):
+                        # an English transcript can carry an Arabic-routed turn
+                        # ("tell me that in Najdi") — the apology must match the
+                        # voice the user expects, not the transcript language.
                         if tts_language == "egyptian arabic":
                             fallback = "معلش، مش سامعك كويس. ممكن تقول تاني؟"
-                        elif lang == "ar":
+                        elif tts_language in ("najdi arabic", "standard arabic") or lang == "ar":
                             fallback = "عذراً، لم أفهم. ممكن تعيد؟"
                         else:
                             fallback = "I didn't catch that. Could you please repeat?"

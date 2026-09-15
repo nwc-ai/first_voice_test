@@ -3,7 +3,7 @@
 # In-process TTS using k2-fsa/OmniVoice (omnilingual zero-shot voice cloning, 24 kHz).
 #
 # Public API is identical to the previous Silma module (drop-in for server.py):
-#   await stream_tts_to_ws(token_gen, ws, cancel_event, on_first_audio=None)
+#   await stream_tts_to_ws(token_gen, ws, cancel_event, on_first_audio=None, language=None)
 #
 # Structure, sentence-flushing, abbreviation/opener handling, MP3 encoding, the
 # sentence-queue + background synth worker, the on_first_audio / tts_end protocol,
@@ -12,14 +12,15 @@
 # are OmniVoice-specific.
 #
 # OmniVoice is a zero-shot voice-cloner: it needs a short reference clip + its
-# transcript to define the voice. We reuse the Saudi reference clip.
+# transcript to define the voice. Two clips are used (see _clone_for): a default
+# clip for Najdi/English/mixed and a dedicated ج-dense clip for the Fusha route.
 # =========================================================================================
 
 import asyncio
 import os
 import re
 import threading
-from typing import Any, AsyncIterator, Optional
+from typing import AsyncIterator, Optional
 
 import numpy as np
 import torch
@@ -50,7 +51,13 @@ _ABBREV_RULES: list[tuple[re.Pattern, str]] = [
     # 2026-08-24). Arabic-char lookbehind keeps English sentences untouched.
     (re.compile(r'(?<=[؀-ۿ])(\s+)911\b', re.UNICODE), r'\1تسعة واحد واحد'),
     (re.compile(r'(\d)\s*هـ(?=[\s،,.:؟!]|$)', re.UNICODE), r'\1 هجري'),
-    (re.compile(r'(\d)\s*م(?=[\s،,.:؟!]|$)', re.UNICODE), r'\1 ميلادي'),
+    # م after a number: 4-digit numbers are YEARS (2026 م → ميلادي); 1-3-digit
+    # numbers in this domain are METERS (عمق 3 م، أنبوب 500 م → متر). The
+    # Silma-era rule said ميلادي for ANY digit — "500 م" was spoken as "500
+    # Gregorian" (latent bug found 2026-08-31). Residual: a rare historical
+    # 3-digit year ("عام 630 م") now says متر — accepted for the water domain.
+    (re.compile(r'(?<!\d)(\d{4})\s*م(?=[\s،,.:؟!]|$)', re.UNICODE), r'\1 ميلادي'),
+    (re.compile(r'(?<!\d)(\d{1,3})\s*م(?=[\s،,.:؟!]|$)', re.UNICODE), r'\1 متر'),
     # BC abbreviation — the dot is MANDATORY and a preceding Arabic letter is
     # forbidden: with an optional dot (the original Silma-era rule) this matched
     # the bare قم at the end of رقم/الرقم and spoke "الرقبل الميلاد" for
@@ -62,6 +69,16 @@ _ABBREV_RULES: list[tuple[re.Pattern, str]] = [
     (re.compile(r'﷼', re.UNICODE), 'ريال'),                           # riyal sign
     (re.compile(r'(?<=[\s0-9٠-٩])\+(?=[\s0-9٠-٩])', re.UNICODE), 'زائد'),
     (re.compile(r'(?<=[\s0-9٠-٩])=(?=[\s0-9٠-٩])', re.UNICODE), 'يساوي'),
+    # Multiply/divide so equations read naturally (2026-09-09): "4 × 7 = 28" →
+    # "أربعة في سبعة يساوي ثمانية وعشرون".
+    (re.compile(r'(?<=[\s0-9٠-٩])[×✕✖⋅](?=[\s0-9٠-٩])', re.UNICODE), 'في'),
+    (re.compile(r'(?<=[\s0-9٠-٩])[÷](?=[\s0-9٠-٩])', re.UNICODE), 'على'),
+    # Number ranges & minus (2026-09-09). A dash DIRECTLY between digits (no
+    # spaces) is a range → إلى (60-70 → 60 إلى 70). A dash before a digit that is
+    # NOT preceded by a digit is a minus → ناقص (temperature -5, subtraction
+    # 10 - 3); a bare CATT would delete the dash and lose the sign/relation.
+    (re.compile(r'(?<=[0-9٠-٩])[-–—](?=[0-9٠-٩])', re.UNICODE), ' إلى '),
+    (re.compile(r'(?<![0-9٠-٩])[-–—]\s*(?=[0-9٠-٩])', re.UNICODE), 'ناقص '),
     (re.compile(r'\bد\.\s+', re.UNICODE), 'دكتور '),
     (re.compile(r'\bأ\.\s+', re.UNICODE), 'أستاذ '),
     (re.compile(r'\bإلخ\b', re.UNICODE), 'وما إلى ذلك'),
@@ -79,44 +96,86 @@ def _expand_abbreviations(text: str) -> str:
     return text
 
 
-# ── Arabic number verbalization (owner-approved 2026-08-24) ───────────────────────────────
+# ── Arabic number verbalization (owner-approved 2026-08-24; dialect tables 2026-08-31) ───
 # Digits in Arabic sentences are verbalized to words before synthesis: CATT deletes
 # raw digits outright (verified), and the voice model improvises unreliable readings
-# for those that survive. INTEGERS ONLY — num2words' Arabic decimals are broken
-# ("3.5" → "ثلاثة , خمسون"), so decimals/times stay as digits and survive via the
-# CATT digit-guard instead. Runs AFTER _expand_abbreviations (so the 911
-# digit-by-digit rule and %/هـ expansions win first) and only on sentences that
-# contain Arabic characters — English sentences keep their digits. Synthesis-time
-# only: the DISPLAYED text keeps the digits (better for meter readings on screen).
+# for those that survive. Uses the in-house dialect tables (pipeline/arabic_numbers —
+# replaced num2words): Najdi turns get colloquial forms (ثَلَاث، خَمْسْطَعَش، ثَلَاثِين),
+# everything else MSA nominative (case/polarity live in the fanar prompt note —
+# deterministic code can't see the counted noun). Decimals → «N فاصلة digits» and
+# times → «H وM» (owner decisions); numbers > 999,999 stay digits and survive via
+# the CATT digit-guard. Runs AFTER _expand_abbreviations (911/%/هـ rules win first)
+# and only on sentences containing Arabic characters. Synthesis-time only — the
+# DISPLAYED text keeps the digits (better for meter readings on screen).
+from .arabic_numbers import (date_to_words, decimal_to_words, digit_string_to_words,
+                             int_to_words, strip_redundant_number_parenthetical, time_to_words)
+
 _ARABIC_CHAR_RE = re.compile(r"[؀-ۿ]")
 _EASTERN_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
-# Standalone integers only: a following ./,/: blocks the match ONLY when another
-# digit comes after it (a true decimal/time like 3.5 or 10:30) — a sentence-final
-# "8192." is still an integer and must convert.
+# trailing ./,/: blocks a match ONLY when another digit follows — a sentence-final
+# "10:30." is still a time (same trap as the sentence-final-integer bug).
+# Optional :SS captures clock times with seconds (10:30:45).
+_TIME_RE    = re.compile(r"(?<![\d.,:])(\d{1,2}):(\d{2})(?::(\d{2}))?(?!\d)(?![.,:]\d)")
+# Dates D/M/YYYY → spoken as a date (day + month name + year), so they aren't
+# read as three bare numbers in a row. Runs before the integer rule.
+_DATE_RE    = re.compile(r"(?<![\d.,:/])(\d{1,2})/(\d{1,2})/(\d{4})(?![\d/])")
+_DECIMAL_RE = re.compile(r"(?<![\d.,:])(\d+)\.(\d+)(?!\d)(?![.,:]\d)")
+# Phone/account/reference numbers → read digit-by-digit (like 911), NOT as a
+# cardinal: a leading zero (KSA 05…) or a run of 10+ digits is never a spoken
+# count. Runs after time/decimal, before the integer rule.
+_PHONE_RE   = re.compile(r"(?<![\d.,:])(0\d+|\d{10,})(?![\d.,:])")
+# Standalone integers: a following ./,/: blocks the match ONLY when another digit
+# comes after it — a sentence-final "8192." is still an integer and must convert.
 _INT_RUN_RE = re.compile(r"(?<![\d.,:])\d+(?!\d)(?![.,:]\d)")
 
 
-def _digits_to_arabic_words(text: str) -> str:
+def _digits_to_arabic_words(text: str, dialect: str = "msa") -> str:
     if not _ARABIC_CHAR_RE.search(text):
         return text
     text = text.translate(_EASTERN_DIGITS)
+    text = strip_redundant_number_parenthetical(text)   # drop "168 (مائة...)" twin
 
-    def _one(m: re.Match) -> str:
-        try:
-            from num2words import num2words
-            return num2words(int(m.group(0)), lang="ar")
-        except Exception:
-            return m.group(0)   # leave digits — the CATT digit-guard keeps them alive
+    def _sub(fn):
+        def inner(m: re.Match) -> str:
+            try:
+                out = fn(m)
+            except Exception:
+                out = None
+            return out if out is not None else m.group(0)
+        return inner
 
-    return _INT_RUN_RE.sub(_one, text)
+    text = _TIME_RE.sub(_sub(lambda m: time_to_words(m.group(1), m.group(2), dialect, m.group(3))), text)
+    text = _DATE_RE.sub(_sub(lambda m: date_to_words(m.group(1), m.group(2), m.group(3), dialect)), text)
+    text = _DECIMAL_RE.sub(_sub(lambda m: decimal_to_words(m.group(1), m.group(2), dialect)), text)
+    text = _PHONE_RE.sub(_sub(lambda m: digit_string_to_words(m.group(0), dialect)), text)
+    text = _INT_RUN_RE.sub(_sub(lambda m: int_to_words(int(m.group(0)), dialect)), text)
+    return text
 
 SAMPLE_RATE = 24000  # OmniVoice output sample rate
 
-# Reference clip + its exact transcript define the cloned voice (Saudi male).
+# Reference clip + its exact transcript define the cloned voice.
 # This module lives in pipeline/ — voices/ sits at the project root, one level up.
+# Two voices: the default clip serves Najdi, English and mixed; a dedicated Fusha
+# clip serves the "standard arabic" route. The Fusha clip was recorded ج-dense
+# (جسم/حج) to bias OmniVoice toward ج=/dʒ/ ("j" not "g"). The default clip was
+# re-recorded in a Najdi customer-service register with broad consonant coverage
+# (ج ق ص ض ط ح غ) and a clean terminal fall (owner; latest clip
+# omnivoice-tts-najdi-24k-v3, 2026-09-15). Each _REF_TEXT MUST exactly
+# transcribe its clip.
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_REF_AUDIO = os.path.join(_PROJECT_ROOT, "voices", "silma-tts-saudi-24k.wav")
-_REF_TEXT  = "الثقافة السعودية فيها عراقة وتاريخ عميق، وقيم إسلامية راسخة، وعادات وتقاليد قبلية أصيلة متوارثة."
+_REF_AUDIO = os.path.join(_PROJECT_ROOT, "voices", "omnivoice-tts-najdi-24k-v3.wav")
+_REF_TEXT  = "إذا تبون نجهز لكم الجدول اليوم، بنراجع الطلب بدقة ونوضح كل التفاصيل، ونبلغكم على طول أول ما يكون جاهز، ونحرص على راحتكم وثقتكم فينا. شكراً لكم."
+# Previous default refs, kept in voices/ for A/B revert — DO NOT DELETE:
+#   v2 — same customer-service ref text as v3 above (only the recording differs):
+# _REF_AUDIO = os.path.join(_PROJECT_ROOT, "voices", "omnivoice-tts-najdi-24k-v2.wav")
+#   original Saudi-derived clip (its own, different ref text):
+# _REF_AUDIO = os.path.join(_PROJECT_ROOT, "voices", "omnivoice-tts-najdi-24k.wav")
+# _REF_TEXT  = "الثقافة السعودية فيها عراقة وتاريخ عميق، وقيم إسلامية راسخة، وعادات وتقاليد قبلية أصيلة متوارثة."
+
+_FUSHA_REF_AUDIO = os.path.join(_PROJECT_ROOT, "voices", "omnivoice-tts-fusha-24k-v3.wav")
+# DIACRITIZED — must match the recorded clip verbatim (owner confirmed 2026-09-10
+# the diacritized text was the one read); a ref_text/audio mismatch degrades cloning.
+_FUSHA_REF_TEXT  = "فِي الحَجِّ يُجْهِدُ الحَاجُّ جِسْمَهُ بِخُشُوع، وَيُؤَدِّي فَرِيضَةَ اللهِ بِذِكْرٍ وَإِخْلَاصٍ وَثَبَات؛ فَيَجْتَمِعُ الحُجَّاجُ صَادِقِين، يَرْجُونَ المَغْفِرَةَ العَظِيمَة."
 
 _MODEL_ID = os.environ.get("OMNIVOICE_MODEL", "k2-fsa/OmniVoice")
 _DEVICE   = os.environ.get("OMNIVOICE_DEVICE", "cuda:0")
@@ -124,9 +183,10 @@ _DEVICE   = os.environ.get("OMNIVOICE_DEVICE", "cuda:0")
 # ── Lazy model singleton ──────────────────────────────────────────────────────────────────
 _model = None
 _model_lock = threading.Lock()
-_clone_prompt = None   # reusable VoiceClonePrompt — built once with the model; passing the
-                       # raw ref WAV per sentence made OmniVoice re-load/re-tokenize the
-                       # reference clip on EVERY sentence (needless first-audio latency).
+_clone_prompt = None   # reusable VoiceClonePrompt (Saudi/default) — built once with the model;
+                       # passing the raw ref WAV per sentence made OmniVoice re-load/re-tokenize
+                       # the reference clip on EVERY sentence (needless first-audio latency).
+_fusha_clone_prompt = None   # dedicated Fusha voice; falls back to _clone_prompt if the clip is absent
 
 # ── Lazy tashkeel model singleton (same shape as _model/_model_lock above) ────────────────
 _tashkeel_model = None
@@ -139,7 +199,7 @@ def load_models():
     if not os.path.exists(_REF_AUDIO):
         raise FileNotFoundError(
             f"OmniVoice reference audio not found: {_REF_AUDIO}\n"
-            f"Place the Saudi reference WAV at that path before starting the server."
+            f"Place the default (Najdi) reference WAV at that path before starting the server."
         )
     _get_model()
     if CATT_ENABLED:
@@ -151,13 +211,24 @@ def load_models():
 
 
 def _get_model():
-    global _model, _clone_prompt
+    global _model, _clone_prompt, _fusha_clone_prompt
     with _model_lock:
         if _model is None:
             from omnivoice import OmniVoice  # type: ignore[import-untyped]
             _model = OmniVoice.from_pretrained(_MODEL_ID, device_map=_DEVICE, dtype=torch.float16)
             _clone_prompt = _model.create_voice_clone_prompt(_REF_AUDIO, _REF_TEXT)
+            if os.path.exists(_FUSHA_REF_AUDIO):
+                _fusha_clone_prompt = _model.create_voice_clone_prompt(_FUSHA_REF_AUDIO, _FUSHA_REF_TEXT)
+            else:
+                print(f"[tts] Fusha ref clip not found ({_FUSHA_REF_AUDIO}) — Fusha uses the default (Najdi) voice")
+                _fusha_clone_prompt = _clone_prompt
         return _model
+
+
+def _clone_for(language: Optional[str]):
+    """Fusha ('standard arabic') → dedicated Fusha voice; Najdi/English/mixed →
+    the default (Najdi) voice."""
+    return _fusha_clone_prompt if language == "standard arabic" else _clone_prompt
 
 
 def _get_tashkeel_model():
@@ -298,21 +369,81 @@ def _strip_openers(text: str) -> str:
     return _OPENER_RE.sub('', text, count=1).lstrip()
 
 
+# ── Pronunciation fixes (synthesis-time only; owner-approved 2026-08-28) ─────────────────
+# Same mechanism as the Egyptian module's _EGY_PRONUNCIATION_FIXES: exact-word hand
+# diacritization for words the voice mispronounces. Applied BEFORE the CATT gate —
+# on Fusha, CATT re-diacritizes and its output wins (behavior unchanged); on Najdi
+# and mixed sentences (no CATT) these are the only diacritics the model ever gets.
+# Display text stays undiacritized. Homograph policy as everywhere: تسرب's rare
+# past-verb reading is an accepted risk (the noun dominates this domain); تتبع is
+# collocation-scoped because the verb reading (تتبع التعليمات) is common.
+_PRONUNCIATION_FIXES: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\bالتفاصيل المدخلة\b", re.UNICODE), "التَّفَاصِيل الْمُدْخَلَة"),
+    (re.compile(r"\bمستندات\b", re.UNICODE), "مُسْتَنَدَات"),
+    (re.compile(r"\bتسرب\b", re.UNICODE), "تَسَرُّب"),
+    (re.compile(r"\bخطرة\b", re.UNICODE), "خَطِرَة"),
+    (re.compile(r"\bخاصةً?(?=[\s،,.:؟!]|$)", re.UNICODE), "خَاصَّةً"),
+    (re.compile(r"\bالحجاج\b", re.UNICODE), "الْحُجَّاج"),
+    (re.compile(r"\bخزان\b", re.UNICODE), "خَزَّان"),
+    (re.compile(r"\bالخزان\b", re.UNICODE), "الْخَزَّان"),
+    (re.compile(r"\bالمتحف\b", re.UNICODE), "الْمَتْحَف"),
+    (re.compile(r"\bعدادك\b", re.UNICODE), "عَدَّادَك"),
+    (re.compile(r"\bتلاحظ\b", re.UNICODE), "تُلَاحِظ"),
+    (re.compile(r"\bتتبع(?=\s+استهلاك)", re.UNICODE), "تَتَبُّع"),
+    # NWC acronym (owner report 2026-08-31): OmniVoice SKIPS all-caps acronyms in
+    # (diacritized) Arabic context — measured: bare NWC added +0.05s vs baseline
+    # (silent), letter names +0.79s (spoken). Standard TTS treatment: letter-name
+    # expansion, synthesis-only, display keeps "NWC". The Arabic-char lookbehind
+    # keeps ENGLISH sentences untouched (there the model can say the letters).
+    (re.compile(r"(?<=[؀-ۿ])([\s(«\"']{1,4})NWC\b", re.UNICODE), r"\1إن دبليو سي"),
+    # Sentence-initial "NWC مسؤولة…" has no Arabic BEFORE it — catch it by Arabic
+    # AFTER instead (2026-09-09), so a reply that opens with the acronym doesn't
+    # lose it. English sentences ("contact NWC support") have Latin after → safe.
+    (re.compile(r"\bNWC\b(?=[\s)»\"'،.:]{0,4}[؀-ۿ])", re.UNICODE), "إن دبليو سي"),
+    # Proper/religious nouns (QA 2026-09-14). On Najdi (no CATT) these stick; on
+    # Fusha CATT overwrites them, so جدة is re-fixed post-CATT (_POST_CATT_FIXES).
+    # العمرة is already correct from CATT on Fusha; this entry serves Najdi.
+    (re.compile(r"\bجدة\b", re.UNICODE), "جِدَّة"),            # the city (not the grandmother)
+    (re.compile(r"\bالعمرة\b", re.UNICODE), "الْعُمْرَة"),
+]
+
+# Applied AFTER CATT (Fusha): CATT reads bare جدة as جَدَّة ("grandmother") — verified
+# 2026-09-14 that it OVERWRITES any supplied diacritics — so the only way to force the
+# city reading جِدَّة is to correct the ج vowel on CATT's own output. Only the ج vowel
+# differs (fatha→kasra); trailing case ending is preserved. Homograph note: also
+# converts the rare grandmother جَدّة — accepted for the Hajj/utility domain.
+_POST_CATT_FIXES: list[tuple[re.Pattern, str]] = [
+    # ج + (any/no vowel) → kasra, ONLY when the next letter is a shadda'd د (the
+    # جدة skeleton). Combining-mark-order-robust (shadda/vowel in either order).
+    # جديد/جدير (no shadda on د) are never matched; already-correct جِدّ is idempotent.
+    (re.compile(r"ج[ً-ْ]?(?=د[ً-ْ]*ّ)", re.UNICODE), "جِ"),
+]
+
+
+def _apply_pronunciation_fixes(text: str) -> str:
+    for pattern, replacement in _PRONUNCIATION_FIXES:
+        text = pattern.sub(replacement, text)
+    return text
+
+
 # ── Blocking synthesis helpers (run via asyncio.to_thread) ───────────────────────────────
 
 def _synthesize_mp3_blocking(text: str, language: Optional[str] = None) -> bytes:
     """OmniVoice inference + LAME MP3 encode in one blocking call (one to_thread dispatch).
-    Returns a complete MP3 container — browser decodeAudioData requires this. `language` is
-    used ONLY to gate CATT tashkeel (Fusha-only) — it is never passed to OmniVoice itself, so
-    generation is unchanged from before this diacritization was added."""
+    Returns a complete MP3 container — browser decodeAudioData requires this. `language` (a)
+    gates CATT tashkeel (Fusha-only), and (b) selects the voice-clone prompt (Fusha vs Saudi);
+    it is still never passed to OmniVoice's generate() itself."""
     import lameenc
+    text = _apply_pronunciation_fixes(text)
     if CATT_ENABLED and language in _TASHKEEL_LANGUAGES and not looks_najdi(text):
         text = _add_tashkeel(text)
+        for pattern, replacement in _POST_CATT_FIXES:   # correct words CATT reliably mis-vowels
+            text = pattern.sub(replacement, text)
     model = _get_model()
     # OmniVoice.generate returns a list of float32 np.ndarray (T,) at 24 kHz.
     audio = model.generate(
         text=text,
-        voice_clone_prompt=_clone_prompt,
+        voice_clone_prompt=_clone_for(language),
     )
     pcm_int16 = (np.clip(audio[0], -1.0, 1.0) * 32767).astype(np.int16)
     enc = lameenc.Encoder()
@@ -363,8 +494,11 @@ async def stream_tts_to_ws(
             if cancel_event.is_set():                               # (b)
                 continue   # keep draining so the producer's sentinel is reached
             try:
+                # Najdi turns get colloquial number words; Fusha/English/mixed get MSA.
+                _num_dialect = "najdi" if language == "najdi arabic" else "msa"
                 audio_bytes = await _synthesize_mp3(
-                    _digits_to_arabic_words(_expand_abbreviations(sentence)), language)
+                    _digits_to_arabic_words(_expand_abbreviations(sentence), _num_dialect),
+                    language)
             except Exception as e:
                 print(f"[tts] synthesis failed, skipping sentence: {type(e).__name__}: {e}")
                 continue

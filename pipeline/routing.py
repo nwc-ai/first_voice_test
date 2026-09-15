@@ -158,6 +158,25 @@ def looks_egyptian(text: str) -> bool:
     return bool(_EGY_PHRASES_RE.search(norm))
 
 
+# Output-drift signal set (owner-approved 2026-08-27, used ONLY by the fanar
+# Egyptian-drift retry in llm.py — NEVER by route_arabic). Detecting whether a
+# REPLY is Masri at all is a different problem from routing user input: shared
+# and common colloquial words are valid evidence of Egyptian register here even
+# though they must never DECIDE input routing. A missing signal on a genuinely
+# Egyptian reply only costs one unnecessary retry; a false signal only skips a
+# retry — both fail soft.
+_EGY_REPLY_SIGNALS = _EGY_EXCLUSIVE_MARKERS | {normalize_ar(w) for w in {
+    "اللي", "عشان", "لسه", "زي", "كمان", "حاجة", "طيب", "اوي", "ايه", "ليه",
+}}
+
+
+def reply_has_egyptian_signals(text: str) -> bool:
+    """True if the text carries ANY Egyptian-register evidence (see above)."""
+    norm = normalize_ar(text)
+    words = set(_AR_WORD_RE.findall(norm))
+    return bool(words & _EGY_REPLY_SIGNALS)
+
+
 def looks_najdi_exclusive(text: str) -> bool:
     """looks_najdi restricted to markers NOT shared with Egyptian. Same algorithm.
     Used only for routing priority — looks_najdi itself stays the CATT gate and
@@ -359,7 +378,7 @@ EGYPTIAN_CARD = (
     "دلوقتي (الآن)، النهارده (اليوم)، امبارح (أمس)، إزاي (كيف)، ايه (ماذا)، فين (أين)، "
     "ليه (لماذا)، عايز/عايزة (أريد)، مش (ليس)، كده (هكذا)، ده/دي/دول (هذا/هذه/هؤلاء)، "
     "اللي (الذي/التي)، برضه (أيضاً)، كمان (أيضاً)، معلش (لا بأس)، خالص (إطلاقاً)، "
-    "أوي (كثيراً)، بتاع (خاص بـ)، حاجة (شيء)، عشان (لأن/لكي)، لسه (ما زال). "
+    "أوي (كثيراً)، بتاع (خاص بـ)، حاجة (شيء)، المياه (الماء — لا تكتبها الميه)، عشان (لأن/لكي)، لسه (ما زال). "
     "These words are the same in Egyptian and MSA — use them as-is: "
     "رقم، قراءة، معدل، ضغط، تدفق، خزان، عداد، محطة، خط، تنبيه، "
     "مشكلة، انقطاع، تسريب، نظيف، سريع، شكراً، لا. "

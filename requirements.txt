@@ -8,8 +8,8 @@ faster-whisper==1.1.1
 clearvoice==0.1.2
 omnivoice==0.1.5        # TTS (in-process). Pulls transformers>=5.3 → installs
                         # transformers 5.x; faster-whisper + clearvoice run fine on it (verified).
-num2words==0.5.14       # Arabic number verbalization before TTS (integers only — its Arabic
-                        # decimals are broken; decimals survive via the CATT digit-guard).
+# (num2words was used briefly for number verbalization, replaced 2026-08-31 by the
+#  in-house dialect tables in pipeline/arabic_numbers.py — no dependency needed.)
 catt-tashkeel==1.0.2    # Arabic diacritization (tashkeel) for Fusha replies only, before
                         # synthesis. CATT_ENABLED=1 by default — see tts_omnivoice_v1.py.
                         # Gated to Fusha only (Najdi excluded: CATT is MSA-trained and mangles
