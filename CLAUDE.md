@@ -22,7 +22,7 @@ Browser (AudioWorklet, 512-sample Float32 @16 kHz)
     LLM_MODEL env = opt-in Fanar-2 override for A/B)
   → TTS split by route:
       Fusha/Najdi/English → tts_omnivoice_v1: sentence flushing → CATT tashkeel
-        (Fusha only) → OmniVoice zero-shot clone (Saudi ref) → one MP3/sentence
+        (Fusha only) → OmniVoice zero-shot clone (Fusha/Najdi ref clips) → one MP3/sentence
       Egyptian → tts_voicetut_v1: same scaffold, VoiceTut checkpoint (Egyptian-
         tuned OmniVoice), Egyptian ref voice, NO CATT, lexical repairs (EGY_REPAIRS)
   → Browser: ordered decode, gapless playback, barge-in pause/resume
@@ -83,6 +83,7 @@ first_voice_test/
 │   ├── stt.py                      ← Silero VAD, FRCRN denoiser, faster-whisper
 │   ├── routing.py                  ← language/dialect detection (incl. Egyptian tiers), text-acceptance policy
 │   ├── llm.py                      ← Ollama client, model config (qwen + fanar), prompt construction
+│   ├── arabic_numbers.py           ← dialect number/date/time verbalization tables (MSA/Najdi/Egyptian)
 │   ├── tts_omnivoice_v1.py         ← TTS: Fusha/Najdi/English (OmniVoice + CATT) — PROTECTED
 │   └── tts_voicetut_v1.py          ← TTS: Egyptian only (VoiceTut, no CATT, EGY_REPAIRS filter)
 ├── scripts/
@@ -92,7 +93,7 @@ first_voice_test/
 │   └── fixtures_routing_baseline.json ← pre-Egyptian build_turn/looks_najdi snapshot (60 rows)
 ├── static/index.html               ← browser client
 ├── static/review.html              ← /review dashboard (latency + transcripts table)
-├── voices/                         ← Saudi reference clips for voice cloning
+├── voices/                         ← reference clips for voice cloning (Najdi default + Fusha; older versions kept for A/B revert)
 └── logs/                           ← interactions.jsonl (gitignored — private)
 ```
 
@@ -113,7 +114,7 @@ first_voice_test/
 - **Egyptian routing is tiered** (`route_arabic`): Najdi-exclusive markers win, then Egyptian-exclusive (مش/ده/دي/عايز/دلوقتي/النهارده/كده/فين/بتاع/curated م…ش forms), then shared markers (اللي/عشان/لسه/يلا — pan-dialectal, NEVER decisive) keep the pre-Egyptian Najdi behavior, else Fusha. `_NAJDI_MARKERS`/`looks_najdi` are byte-identical to pre-Egyptian (they also back the CATT gate). ليه is glossary-only, not a marker; دول and جداً are markers/forbidden NOWHERE (user constraints).
 - **EGYPTIAN_CARD is per-turn, Egyptian turns only** — the shared SYSTEM_PROMPT is untouched. The card names only Egyptian's own correct forms (pink-elephant lesson: naming forbidden other-dialect tokens measurably increases leaks — see NAJDI_NO_OTHER_DIALECTS_RULE).
 - **Arabic dialect-history isolation** (`_visible_history` in server.py, ALL Arabic pairs incl. Fusha↔Najdi — owner's decision 2026-08-18): each history pair is tagged with its reply route; an Arabic turn's prompt sees only same-dialect + English/mixed pairs. Withheld, never deleted; English↔Arabic behavior unchanged. **NO exceptions (owner decision 2026-08-21)**: the original explicit-request bypass ("قلها بالمصري" saw full history) was removed after live Fanar testing proved it was the cross-dialect contamination vector — the model copied the visible other-dialect answer instead of generating fresh. Known accepted cost: a bare "say that in X" right after an answer in a different Arabic dialect loses its referent (re-ask the full question); after an ENGLISH answer it still works (English pairs are always visible).
-- **Two OmniVoice reference voices** (owner decision 2026-09-10): the `standard arabic` (Fusha) route uses a dedicated clip `voices/omnivoice-tts-fusha-24k-v3.wav` (recorded ج-dense to bias ج=/dʒ/ "j" not "g" — the جسم→"gesm"/حج→"Hagg" class, the one text-immune lever being tried); Najdi, English and mixed use the default clip `voices/omnivoice-tts-najdi-24k-v2.wav` (owner re-recording 2026-09-14 — a Najdi customer-service utterance with broad consonant coverage ج/ق/ص/ض/ط/ح/غ and a deliberate terminal fall so cloned sentence-endings don't trail; replaced the original Saudi-derived clip). NOTE: this default clip also drives English + mixed timbre — re-audit those, not just Najdi, when it changes. `_clone_for(language)` selects; each `_REF_TEXT` must EXACTLY transcribe its clip. Missing Fusha clip → falls back to the default (Najdi) voice with a log line. Experiment, judged A/B by ear.
+- **Two OmniVoice reference voices** (owner decision 2026-09-10): the `standard arabic` (Fusha) route uses a dedicated clip `voices/omnivoice-tts-fusha-24k-v3.wav` (recorded ج-dense to bias ج=/dʒ/ "j" not "g" — the جسم→"gesm"/حج→"Hagg" class, the one text-immune lever being tried); Najdi, English and mixed use the default clip `voices/omnivoice-tts-najdi-24k-v3.wav` (owner re-recording, latest 2026-09-15 — a Najdi customer-service utterance with broad consonant coverage ج/ق/ص/ض/ط/ح/غ and a deliberate terminal fall so cloned sentence-endings don't trail; iterated from v2, both replacing the original Saudi-derived clip; earlier clips kept in voices/ for A/B revert, and the v3/v2 ref text is identical). NOTE: this default clip also drives English + mixed timbre — re-audit those, not just Najdi, when it changes. `_clone_for(language)` selects; each `_REF_TEXT` must EXACTLY transcribe its clip. Missing Fusha clip → falls back to the default (Najdi) voice with a log line. Experiment, judged A/B by ear.
 - **Egyptian TTS is a separate module** (`tts_voicetut_v1.py`, scaffold copied from the OmniVoice module — same precedent as Silma→OmniVoice). Preloaded at startup by default (owner decision 2026-08-20, live-proven to fit; `VOICETUT_PRELOAD=0` reverts to lazy) via non-throwing `ensure_loaded()` — a VoiceTut failure never blocks startup; on load failure Egyptian falls back to OmniVoice. Never modify `tts_omnivoice_v1.py` for Egyptian needs.
 - **Fanar-2 A/B**: `LLM_MODEL` env override; `MODEL_CONFIGS["fanar"]` (think:False + `strip_think_tokens` safety net, fanar-only). Local model: `hf.co/mradermacher/Fanar-2-27B-Instruct-i1-GGUF:i1-Q4_K_M`.
 - **Fanar-only output guards** (QA 2026-08-21, owner directive: fix Fanar without touching qwen): everything is gated on "fanar" in the model name — `FANAR_ARABIC_NOTE` (per-turn, Arabic routes: answer directly, translate cross-dialect restatements fully, keep brands in Latin script), `FANAR_ARABIC_REPAIRS` (الملكة→المملكة dropped-letter fix, any route) and `FANAR_NAJDI_REPAIRS` (Egyptian tokens leaking into Najdi replies: دلوقتي/ده/دي/كده/عايز/observed بـ-verbs → Najdi forms) applied to the token stream BEFORE display/TTS/history. Homographs deliberately NOT repaired (قوي، بقى، دول، جداً — would corrupt valid text); no generic بـ-prefix regex (بيتنا/بيانات collisions). Named-banned-word prompts remain forbidden (measured pink-elephant backfire). `scripts/test_routing.py` refuses to run with `LLM_MODEL` set (it validates the qwen default path).
